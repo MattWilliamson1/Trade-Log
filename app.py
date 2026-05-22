@@ -3701,9 +3701,11 @@ if page == "📋  Trading Log":
         valid_non_group_rows = []
 
         if not _positions_view:
-            # Resolve pending reset BEFORE the widget is instantiated.
+            # Resolve pending selection changes BEFORE the widget is instantiated.
             if st.session_state.pop("_reset_table_sel", False):
                 st.session_state["trade_table"] = {"selection": {"rows": [], "columns": []}}
+            if st.session_state.pop("_select_all_pending", False):
+                st.session_state["trade_table"] = {"selection": {"rows": list(range(len(display))), "columns": []}}
 
             event = st.dataframe(styled, width='stretch', hide_index=True,
                                  on_select="rerun", selection_mode="multi-row",
@@ -3734,7 +3736,7 @@ if page == "📋  Trading Log":
                 + (f"  ·  {len(selected_rows)} selected" if selected_rows else "")
             )
             if _cap_c2.button("☑  Select All", key="select_all_btn", help="Select all visible rows"):
-                st.session_state["trade_table"] = {"selection": {"rows": list(range(len(display))), "columns": []}}
+                st.session_state["_select_all_pending"] = True
                 st.rerun()
             if selected_rows and _cap_c3.button("✕  Clear", key="clear_sel_btn", help="Clear selection"):
                 st.session_state["_reset_table_sel"] = True
