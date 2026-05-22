@@ -1,0 +1,60 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download uv binaries
+        shell: pwsh
+        run: |
+          $uvDir = "dist\Trade Log\_uv"
+          New-Item -ItemType Directory -Force $uvDir | Out-Null
+          $zipPath = "$env:TEMP\uv.zip"
+          Invoke-WebRequest -Uri "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip" `
+            -OutFile $zipPath -UseBasicParsing
+          Expand-Archive -Path $zipPath -DestinationPath $uvDir -Force
+          Remove-Item $zipPath
+          Write-Host "uv binaries downloaded:"
+          Get-ChildItem $uvDir | Select-Object Name, Length
+
+      - name: Build zip
+        shell: pwsh
+        run: python build_windows_distribution.py
+
+      - name: Find zip path
+        id: zip
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem "dist\*.zip" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          echo "path=$($f.FullName)" >> $env:GITHUB_OUTPUT
+          echo "name=$($f.Name)"     >> $env:GITHUB_OUTPUT
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Trade Log — Latest"
+          body: |
+            ## Latest build
+
+            **Download the zip below**, extract it, and double-click
+            `INSTALL - Double-Click This First.bat`.
+
+            > This release is updated automatically every time an update is pushed.
+          files: ${{ steps.zip.outputs.path }}
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

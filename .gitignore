@@ -13,6 +13,9 @@ dist/
 build/
 *.spec
 
+# ── Installer assets are tracked in installer/ — keep uv binaries out of git ──
+installer/_uv/
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc

@@ -31,10 +31,11 @@ import zipfile
 from datetime import date
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).parent
-DIST_SRC   = SCRIPT_DIR / "dist" / "Trade Log"
+SCRIPT_DIR   = Path(__file__).parent
+INSTALLER    = SCRIPT_DIR / "installer"        # tracked installer assets
+UV_DIR       = SCRIPT_DIR / "dist" / "Trade Log" / "_uv"   # uv binaries (local only)
 
-# Files copied from the project root (not from dist/)
+# Files copied from the project root
 ROOT_FILES = [
     "app.py",
     "db.py",
@@ -42,23 +43,23 @@ ROOT_FILES = [
     "requirements.txt",
 ]
 
-# Files that live only in dist/Trade Log/
-DIST_FILES = [
+# Flat files from installer/
+INSTALLER_FILES = [
     "launch.vbs",
     "INSTALL - Double-Click This First.bat",
     "PLEASE_READ_THIS_FIRST.txt",
     "DIAGNOSE - Run If Trade Log Won't Open.bat",
 ]
 
-# Folders copied recursively from dist/Trade Log/
-DIST_FOLDERS = [
+# Folders copied recursively from installer/
+INSTALLER_FOLDERS = [
     ".streamlit",
-    "_uv",
 ]
 
 
 def build() -> None:
-    output  = SCRIPT_DIR / "dist" / f"Trade Log {date.today().strftime('%#m-%#d-%Y')}.zip"
+    output = SCRIPT_DIR / "dist" / f"Trade Log {date.today().strftime('%#m-%#d-%Y')}.zip"
+    output.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("  Trade Log — Windows Distribution Builder")
@@ -79,9 +80,9 @@ def build() -> None:
                 missing.append(name)
                 print(f"  ! {name} — NOT FOUND (skipped)")
 
-        # ── Dist-only flat files ─────────────────────────────────────────────
-        for name in DIST_FILES:
-            src = DIST_SRC / name
+        # ── Installer flat files ─────────────────────────────────────────────
+        for name in INSTALLER_FILES:
+            src = INSTALLER / name
             if src.exists():
                 zf.write(src, f"Trade Log/{name}")
                 print(f"  + {name}")
@@ -89,18 +90,29 @@ def build() -> None:
                 missing.append(name)
                 print(f"  ! {name} — NOT FOUND (skipped)")
 
-        # ── Dist folders (recursive) ─────────────────────────────────────────
-        for folder in DIST_FOLDERS:
-            folder_path = DIST_SRC / folder
+        # ── Installer folders (recursive) ────────────────────────────────────
+        for folder in INSTALLER_FOLDERS:
+            folder_path = INSTALLER / folder
             if not folder_path.exists():
                 missing.append(folder)
                 print(f"  ! {folder}/ — NOT FOUND (skipped)")
                 continue
             for file in sorted(folder_path.rglob("*")):
                 if file.is_file():
-                    arc = "Trade Log/" + file.relative_to(DIST_SRC).as_posix()
+                    arc = "Trade Log/" + file.relative_to(INSTALLER).as_posix()
                     zf.write(file, arc)
                     print(f"  + {arc}")
+
+        # ── uv binaries ──────────────────────────────────────────────────────
+        if UV_DIR.exists():
+            for file in sorted(UV_DIR.rglob("*")):
+                if file.is_file():
+                    arc = "Trade Log/_uv/" + file.name
+                    zf.write(file, arc)
+                    print(f"  + {arc}")
+        else:
+            missing.append("_uv/")
+            print(f"  ! _uv/ — NOT FOUND (uv.exe will be downloaded at install time)")
 
     size_kb = output.stat().st_size // 1024
     print()

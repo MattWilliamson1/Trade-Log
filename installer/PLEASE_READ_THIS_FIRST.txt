@@ -1,0 +1,94 @@
+Welcome to Trade Log! Thanks for joining.
+
+════════════════════════════════════════════════════════════
+  STEP 1 — EXTRACT THE ZIP (do this first!)
+════════════════════════════════════════════════════════════
+
+Before you do anything else, make sure you have EXTRACTED
+the zip file. Do NOT try to run anything from inside the zip.
+
+How to extract:
+  • Right-click the "Trade Log.zip" file
+  • Choose "Extract All..."
+  • Click Extract
+  • Open the "Trade Log" folder that appears
+
+════════════════════════════════════════════════════════════
+  STEP 2 — INSTALL (one time only)
+════════════════════════════════════════════════════════════
+
+Double-click:  INSTALL - Double-Click This First.bat
+
+You may see a blue or grey Windows warning that says
+"Windows protected your PC" or "Unknown publisher."
+
+  → Click "More info"  then  "Run anyway"
+
+This warning appears because the file was downloaded from
+the internet. It is safe to proceed.
+
+A black window will appear showing progress. It will:
+  • Download a small setup tool
+  • Install Python (the engine Trade Log runs on)
+  • Install Trade Log and its components
+  • Create a "Trade Log" shortcut on your Desktop
+
+This takes 2–5 minutes depending on your internet speed.
+Do not close the window while it is running.
+
+When it says "All done!" you can close it.
+
+════════════════════════════════════════════════════════════
+  STEP 3 — LAUNCH (every time after that)
+════════════════════════════════════════════════════════════
+
+Double-click the "Trade Log" icon on your Desktop.
+
+Your browser will open automatically to the app.
+No terminal window. No fuss.
+
+If you accidentally close the browser, just double-click
+the Desktop icon again.
+
+════════════════════════════════════════════════════════════
+  USING THE APP
+════════════════════════════════════════════════════════════
+
+SETTINGS:
+
+  Account & Equity — Enter your current balance manually,
+  or link to IBKR to pull it automatically. This is used
+  for position sizing and risk calculations. Hit Save.
+
+  Alert Thresholds — Set yellow/red warning levels for
+  position size and stop distance. Hit Save.
+
+  Email (optional) — Gmail users: go to
+  myaccount.google.com/apppasswords, create an app password
+  called "Mail", paste the 16-character key into the
+  SMTP Password field. Host: smtp.gmail.com, Port: 587.
+  Hit Save and send a test email.
+
+  App Mode — Leave on "Safe" mode unless you are comfortable
+  with live broker connectivity.
+
+  Commissions — Set your broker's fee defaults.
+
+TAGS:
+
+  Add any categories you want to filter by later —
+  strategy names, watchlists, setups, etc. Think ahead:
+  "How will I want to slice and look at my trades?"
+
+TRADING LOG:
+
+  Click "Add Trade" and fill in the fields.
+  Green fields are required. Others are recommended.
+  You can also import trades from a CSV file
+  (see the sample tradeImport.csv in the folder).
+
+════════════════════════════════════════════════════════════
+  NEED HELP?
+════════════════════════════════════════════════════════════
+
+Reach out and we'll sort it out together.
