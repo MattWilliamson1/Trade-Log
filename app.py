@@ -5013,10 +5013,10 @@ elif page == "📈  Equity Curve":
                             "Contributions ($)":  "${:,.2f}",
                             "Withdrawals ($)":    "${:,.2f}",
                         })
-                        .applymap(
-                            lambda v: "color: #2ecc71" if isinstance(v, str) and v.startswith("$+") or
-                                      (isinstance(v, str) and "%" in v and v.startswith("+")) else
-                                      "color: #e74c3c" if isinstance(v, str) and "-" in v else "",
+                        .map(
+                            lambda v: "color: #2ecc71" if isinstance(v, str) and (
+                                v.startswith("+") or v.startswith("$+")
+                            ) else "color: #e74c3c" if isinstance(v, str) and "-" in v else "",
                             subset=["Daily Change ($)", "Daily Return (%)", "Cum. TWR (%)"],
                         ),
                     width='stretch', hide_index=True,
