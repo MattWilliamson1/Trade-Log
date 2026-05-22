@@ -4867,6 +4867,7 @@ elif page == "📈  Equity Curve":
             _period_ret[0] = 0.0  # first entry is the baseline
             _ec_df["twr_pct"] = (pd.Series(_period_ret + 1).cumprod() - 1) * 100
 
+            # ── Controls row 1: benchmarks + view ────────────────────────────
             _ctrl_l, _ctrl_r = st.columns([2, 1])
             with _ctrl_l:
                 bench_options       = ["SPY", "QQQ", "IWM", "LQD", "JNK"]
@@ -4878,91 +4879,148 @@ elif page == "📈  Equity Curve":
                     horizontal=True, key="ec_view_mode",
                 )
 
-            _show_twr = (_ec_view == "% Return (TWR)")
-            _ec_start_str = str(_ec_df["date"].iloc[0].date())
-            _ec_start_bal = float(_ec_df["balance"].iloc[0])
+            # ── Controls row 2: date range ────────────────────────────────────
+            _dr_min = _ec_df["date"].min().date()
+            _dr_max = _ec_df["date"].max().date()
+            _dr_l, _dr_r = st.columns(2)
+            _ec_date_from = _dr_l.date_input(
+                "From", value=_dr_min, min_value=_dr_min, max_value=_dr_max, key="ec_dr_from"
+            )
+            _ec_date_to = _dr_r.date_input(
+                "To", value=_dr_max, min_value=_dr_min, max_value=_dr_max, key="ec_dr_to"
+            )
 
-            if selected_benchmarks:
-                fetch_benchmark_data(selected_benchmarks, _ec_start_str)
+            # Filter to selected range (TWR already computed on full dataset above)
+            _ec_plot_df = _ec_df[
+                (_ec_df["date"] >= pd.Timestamp(_ec_date_from)) &
+                (_ec_df["date"] <= pd.Timestamp(_ec_date_to))
+            ].copy()
 
-            _ma_days = 20
-            if _show_twr:
-                _plot_series = _ec_df["twr_pct"]
+            if _ec_plot_df.empty:
+                st.warning("No entries in the selected date range.")
             else:
-                _plot_series = _ec_df["balance"]
-            _eq_indexed = pd.Series(_plot_series.values, index=_ec_df["date"])
-            _ma20_vals  = _eq_indexed.rolling(f"{_ma_days}D", min_periods=1).mean()
-            _ec_df["MA20"] = _ma20_vals.values
+                _show_twr = (_ec_view == "% Return (TWR)")
+                _ec_start_str = str(_ec_plot_df["date"].iloc[0].date())
+                _ec_start_bal = float(_ec_plot_df["balance"].iloc[0])
 
-            fig = go.Figure()
-            fig.add_scatter(
-                x=_ec_df["date"], y=_plot_series,
-                mode="lines+markers", name="Portfolio",
-                line=dict(color="#2ecc71", width=2, shape="spline", smoothing=1.2),
-                marker=dict(size=5),
-            )
-            fig.add_scatter(
-                x=_ec_df["date"], y=_ec_df["MA20"],
-                mode="lines", name="20-Day MA",
-                line=dict(color="#f39c12", width=1.5, dash="dot", shape="spline"),
-            )
-            if len(_ec_df) >= 2:
-                fig.add_annotation(
-                    x=_ec_df["date"].iloc[-1], y=_ec_df["MA20"].iloc[-1],
-                    text="MA20", showarrow=False, xanchor="left", yanchor="middle",
-                    font=dict(color="#f39c12", size=11), xshift=6,
+                if selected_benchmarks:
+                    fetch_benchmark_data(selected_benchmarks, _ec_start_str)
+
+                _ma_days = 20
+                if _show_twr:
+                    _plot_series = _ec_plot_df["twr_pct"]
+                else:
+                    _plot_series = _ec_plot_df["balance"]
+                _eq_indexed = pd.Series(_plot_series.values, index=_ec_plot_df["date"])
+                _ma20_vals  = _eq_indexed.rolling(f"{_ma_days}D", min_periods=1).mean()
+                _ec_plot_df["MA20"] = _ma20_vals.values
+
+                fig = go.Figure()
+                fig.add_scatter(
+                    x=_ec_plot_df["date"], y=_plot_series,
+                    mode="lines+markers", name="Portfolio",
+                    line=dict(color="#2ecc71", width=2, shape="spline", smoothing=1.2),
+                    marker=dict(size=5),
                 )
-
-            for bench in selected_benchmarks:
-                bs = load_benchmark_series(bench, _ec_start_str, _ec_start_bal)
-                if not bs.empty:
-                    if _show_twr:
-                        # Express benchmark as % return from its first value
-                        bs = (bs / bs.iloc[0] - 1) * 100
-                    fig.add_scatter(
-                        x=bs.index, y=bs.values, mode="lines", name=bench,
-                        line=dict(shape="spline", smoothing=0.8),
+                fig.add_scatter(
+                    x=_ec_plot_df["date"], y=_ec_plot_df["MA20"],
+                    mode="lines", name="20-Day MA",
+                    line=dict(color="#f39c12", width=1.5, dash="dot", shape="spline"),
+                )
+                if len(_ec_plot_df) >= 2:
+                    fig.add_annotation(
+                        x=_ec_plot_df["date"].iloc[-1], y=_ec_plot_df["MA20"].iloc[-1],
+                        text="MA20", showarrow=False, xanchor="left", yanchor="middle",
+                        font=dict(color="#f39c12", size=11), xshift=6,
                     )
 
-            if _show_twr:
-                _ytitle   = "Return (%)"
-                _yprefix  = ""
-                _ysuffix  = "%"
-                _yformat  = ".2f"
-                _ec_title = "Equity Curve — Time-Weighted Return"
-            else:
-                _ytitle   = "Portfolio Value ($)"
-                _yprefix  = "$"
-                _ysuffix  = ""
-                _yformat  = ",.0f"
-                _ec_title = "Equity Curve"
+                for bench in selected_benchmarks:
+                    bs = load_benchmark_series(bench, _ec_start_str, _ec_start_bal)
+                    if not bs.empty:
+                        if _show_twr:
+                            bs = (bs / bs.iloc[0] - 1) * 100
+                        fig.add_scatter(
+                            x=bs.index, y=bs.values, mode="lines", name=bench,
+                            line=dict(shape="spline", smoothing=0.8),
+                        )
 
-            fig.update_layout(
-                title=_ec_title, xaxis_title="Date",
-                yaxis_title=_ytitle, hovermode="x unified",
-                yaxis_tickprefix=_yprefix, yaxis_ticksuffix=_ysuffix,
-                yaxis_tickformat=_yformat,
-                paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                font=dict(color="#c8cfe0"),
-                xaxis=dict(gridcolor="#2e3a50"),
-                yaxis=dict(gridcolor="#2e3a50"),
-            )
-            st.plotly_chart(fig, width='stretch')
+                if _show_twr:
+                    _ytitle   = "Return (%)"
+                    _yprefix  = ""
+                    _ysuffix  = "%"
+                    _yformat  = ".2f"
+                    _ec_title = "Equity Curve — Time-Weighted Return"
+                else:
+                    _ytitle   = "Portfolio Value ($)"
+                    _yprefix  = "$"
+                    _ysuffix  = ""
+                    _yformat  = ",.0f"
+                    _ec_title = "Equity Curve"
 
-            # Summary stats
-            _first_bal = float(_ec_df["balance"].iloc[0])
-            _last_bal  = float(_ec_df["balance"].iloc[-1])
-            _net_contribs = float(_ec_df["contributions"].sum() - _ec_df["withdrawals"].sum())
-            _gain = _last_bal - _first_bal - _net_contribs
-            _twr_total = float(_ec_df["twr_pct"].iloc[-1])
-            _peak_twr  = float(_ec_df["twr_pct"].max())
-            _trough_twr = float(_ec_df.loc[_ec_df["twr_pct"].idxmax():, "twr_pct"].min())
-            _max_dd = _peak_twr - _trough_twr
-            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
-            _sm1.metric("Current Balance", f"${_last_bal:,.2f}")
-            _sm2.metric("TWR", f"{_twr_total:+.2f}%")
-            _sm3.metric("Net Contributions", f"${_net_contribs:,.2f}")
-            _sm4.metric("Max Drawdown (TWR)", f"{_max_dd:.2f}%")
+                fig.update_layout(
+                    title=_ec_title, xaxis_title="Date",
+                    yaxis_title=_ytitle, hovermode="x unified",
+                    yaxis_tickprefix=_yprefix, yaxis_ticksuffix=_ysuffix,
+                    yaxis_tickformat=_yformat,
+                    paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
+                    font=dict(color="#c8cfe0"),
+                    xaxis=dict(gridcolor="#2e3a50"),
+                    yaxis=dict(gridcolor="#2e3a50"),
+                )
+                st.plotly_chart(fig, width='stretch')
+
+                # ── Summary stats ─────────────────────────────────────────────
+                _first_bal    = float(_ec_plot_df["balance"].iloc[0])
+                _last_bal     = float(_ec_plot_df["balance"].iloc[-1])
+                _net_contribs = float(_ec_plot_df["contributions"].sum() - _ec_plot_df["withdrawals"].sum())
+                _twr_total    = float(_ec_plot_df["twr_pct"].iloc[-1])
+                _peak_twr     = float(_ec_plot_df["twr_pct"].max())
+                _trough_twr   = float(_ec_plot_df.loc[_ec_plot_df["twr_pct"].idxmax():, "twr_pct"].min())
+                _max_dd       = _peak_twr - _trough_twr
+                _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+                _sm1.metric("Current Balance", f"${_last_bal:,.2f}")
+                _sm2.metric("TWR", f"{_twr_total:+.2f}%")
+                _sm3.metric("Net Contributions", f"${_net_contribs:,.2f}")
+                _sm4.metric("Max Drawdown (TWR)", f"{_max_dd:.2f}%")
+
+                # ── Daily balance table ───────────────────────────────────────
+                st.markdown("#### Daily Balances")
+                _tbl = _ec_plot_df[["date", "balance", "contributions", "withdrawals", "twr_pct"]].copy()
+                _tbl["Daily Change ($)"] = _tbl["balance"].diff().fillna(0.0)
+                _tbl["Daily Return (%)"] = (
+                    (_tbl["balance"] / (_tbl["balance"].shift(1)
+                     + _tbl["contributions"] - _tbl["withdrawals"]) - 1) * 100
+                ).fillna(0.0)
+                _tbl = _tbl.rename(columns={
+                    "date":          "Date",
+                    "balance":       "Balance ($)",
+                    "contributions": "Contributions ($)",
+                    "withdrawals":   "Withdrawals ($)",
+                    "twr_pct":       "Cum. TWR (%)",
+                })
+                _tbl["Date"] = _tbl["Date"].dt.strftime("%Y-%m-%d")
+                _tbl = _tbl[[
+                    "Date", "Balance ($)", "Daily Change ($)", "Daily Return (%)",
+                    "Cum. TWR (%)", "Contributions ($)", "Withdrawals ($)"
+                ]].sort_values("Date", ascending=False).reset_index(drop=True)
+                st.dataframe(
+                    _tbl.style
+                        .format({
+                            "Balance ($)":        "${:,.2f}",
+                            "Daily Change ($)":   "${:+,.2f}",
+                            "Daily Return (%)":   "{:+.2f}%",
+                            "Cum. TWR (%)":       "{:+.2f}%",
+                            "Contributions ($)":  "${:,.2f}",
+                            "Withdrawals ($)":    "${:,.2f}",
+                        })
+                        .applymap(
+                            lambda v: "color: #2ecc71" if isinstance(v, str) and v.startswith("$+") or
+                                      (isinstance(v, str) and "%" in v and v.startswith("+")) else
+                                      "color: #e74c3c" if isinstance(v, str) and "-" in v else "",
+                            subset=["Daily Change ($)", "Daily Return (%)", "Cum. TWR (%)"],
+                        ),
+                    width='stretch', hide_index=True,
+                )
 
     # ── Manual Entry tab ──────────────────────────────────────────────────────
     with _ec_tab_entry:
