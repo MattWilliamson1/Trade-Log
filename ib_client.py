@@ -110,12 +110,27 @@ class IBClient:
                 sym = getattr(t.contract, 'symbol', None)
             if sym is None:
                 continue
-            price      = t.last if t.last and t.last > 0 else t.close
-            prev_close = t.close
-            result[sym] = {
-                "price":      float(price)      if price      else None,
-                "prev_close": float(prev_close) if prev_close else None,
-            }
+
+            import math as _math
+
+            def _valid(v):
+                try:
+                    return v is not None and not _math.isnan(float(v)) and float(v) > 0
+                except (TypeError, ValueError):
+                    return False
+
+            # Priority: last trade → close → bid/ask midpoint
+            if _valid(t.last):
+                price = float(t.last)
+            elif _valid(t.close):
+                price = float(t.close)
+            elif _valid(t.bid) and _valid(t.ask):
+                price = (float(t.bid) + float(t.ask)) / 2
+            else:
+                price = None
+
+            prev_close = float(t.close) if _valid(t.close) else None
+            result[sym] = {"price": price, "prev_close": prev_close}
         return result
 
     # ── Account summary ────────────────────────────────────────────────────────

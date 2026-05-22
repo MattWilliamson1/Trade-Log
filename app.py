@@ -1,3 +1,4 @@
+import re
 import uuid
 import smtplib
 import concurrent.futures
@@ -71,7 +72,7 @@ ALL_COLS = [
     "Opening Stop", "Current Stop",
     "Days in Trade", "Ann. P&L",
     "Entry Value", "Current Value", "% of Account",
-    "Realized P&L $", "Realized P&L %", "Acct P&L %",
+    "Realized P&L $", "Realized P&L %", "Unrealized P&L %", "Unrealized Ann. Return %", "Acct P&L %",
     "Day's Change", "Day Change %", "Day P&L", "Day P&L %",
     "Locked-in Profit", "Open Risk", "Opening Risk",
     "Stop Dist $", "Stop Dist %", "Stop Dist ATR",
@@ -244,11 +245,20 @@ def _yf_get_live_data(symbols: tuple) -> dict:
     return result
 
 
+_OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def _is_occ_symbol(s: str) -> bool:
+    return bool(_OCC_RE.match(s))
+
+
 def get_live_data(symbols: tuple) -> dict:
     """Live price fetcher: tries IB first (if configured), falls back to Yahoo Finance.
 
     IB connections are throttled via session_state: at most one socket open per 60s
     per unique symbol set, so rapid Streamlit reruns skip the IB round-trip entirely.
+    OCC option symbols (e.g. SPY260619C00605000) are stripped before the Yahoo fallback
+    because Yahoo Finance cannot price them.
     """
     if not symbols:
         return {}
@@ -263,14 +273,21 @@ def get_live_data(symbols: tuple) -> dict:
             with _ib_mod.IBClient(ib_cfg["host"], ib_cfg["port"], ib_cfg["cid"]) as ib:
                 ib_result = ib.get_live_prices(list(symbols))
             if ib_result:
-                missing = tuple(s for s in symbols if s not in ib_result)
-                if missing:
-                    ib_result.update(_yf_get_live_data(missing))
+                # Fall back to Yahoo for symbols IB didn't return OR returned None price for
+                missing_yf = tuple(
+                    s for s in symbols
+                    if (s not in ib_result or ib_result[s].get("price") is None)
+                    and not _is_occ_symbol(s)
+                )
+                if missing_yf:
+                    ib_result.update(_yf_get_live_data(missing_yf))
                 st.session_state[_ck] = {"ts": _time.time(), "data": ib_result}
                 return ib_result
         except Exception:
             pass
-    return _yf_get_live_data(symbols)
+    # Yahoo Finance path: strip OCC option symbols it cannot price
+    yf_symbols = tuple(s for s in symbols if not _is_occ_symbol(s))
+    return _yf_get_live_data(yf_symbols)
 
 
 _FX_PAIRS = {
@@ -712,7 +729,8 @@ def _style_table(df: pd.DataFrame, settings: dict, group_keys: "pd.Series | None
 
     sign_cols = {"P&L", "Realized P&L $", "Acct P&L %", "Ann. P&L",
                  "Day P&L", "Day P&L %", "Locked-in Profit", "Open Risk",
-                 "Day's Change", "Day Change %", "Realized P&L %", "Ann. Return %"}
+                 "Day's Change", "Day Change %", "Realized P&L %", "Ann. Return %",
+                 "Unrealized P&L %", "Unrealized Ann. Return %"}
 
     today_date = pd.Timestamp.today().date()
     cols       = df.columns.tolist()
@@ -1930,6 +1948,16 @@ input, textarea, select,
     border-color: #3a5a8a !important;
     border-radius: 6px !important;
 }
+/* Flatten all inner containers to match the outer background */
+[data-baseweb="select"] > div:first-child > div,
+[data-baseweb="select"] > div:first-child > div > div,
+[data-baseweb="select"] > div:first-child > div > div > div,
+[data-baseweb="select"] input,
+[data-baseweb="input"],
+[data-baseweb="base-input"] {
+    background-color: #1e3050 !important;
+    background: #1e3050 !important;
+}
 [data-baseweb="select"] span,
 [data-baseweb="select"] [class*="singleValue"],
 [data-baseweb="select"] [class*="placeholder"] {
@@ -2039,9 +2067,9 @@ with st.sidebar:
 
     # ── Mode badge ─────────────────────────────────────────────────────────
     if is_demo:
-        st.markdown('<div class="mode-badge-demo">⚫  DEMO MODE</div>', unsafe_allow_html=True)
+        st.markdown('<div class="mode-badge-demo">📴  Offline</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="mode-badge-live">🔴  LIVE MODE</div>', unsafe_allow_html=True)
+        st.markdown('<div class="mode-badge-live">🟢  Connected to Broker</div>', unsafe_allow_html=True)
 
     for _p in _MAIN_PAGES:
         _active = st.session_state["nav_page"] == _p
@@ -2082,7 +2110,9 @@ with st.sidebar:
     if st.button("⚡  REFRESH LIVE PRICES", width='stretch', key="sb_fetch_live",
                  help="Clear the price cache and re-fetch all live quotes now"):
         _yf_get_live_data.clear()
-        st.session_state.pop("_ib_live_" + str(tuple()), None)
+        for _k in [k for k in st.session_state if k.startswith("_ib_live_")]:
+            del st.session_state[_k]
+        st.session_state.pop("_live_data_cache", None)
         st.session_state["_live_prices_loaded"] = True
         st.rerun()
     st.markdown(
@@ -2111,6 +2141,19 @@ _futures_commission      = float(settings.get("futures_commission",  "2.25") or 
 # ════════════════════════════════════════════════════════════════════════════════
 
 if page == "📋  Trading Log":
+
+    # Initialise filter defaults once per session (explicit keys prevent rerun-resets)
+    _FILTER_DEFAULTS: dict = {
+        "filter_status":     "Open",
+        "filter_ticker":     [],
+        "filter_tags":       [],
+        "filter_pnl":        "All",
+        "filter_date_col":   "Entry Date",
+        "filter_date_range": [],
+    }
+    for _fk, _fv in _FILTER_DEFAULTS.items():
+        if _fk not in st.session_state:
+            st.session_state[_fk] = _fv
 
     # ── Ticker Lookup ─────────────────────────────────────────────────────────
 
@@ -2564,62 +2607,67 @@ if page == "📋  Trading Log":
                 return (f"{row['ticker']}  ·  {fmt_date(row['entry_date'], euro_dates)}"
                         f"  ·  {fmt_qty(row['quantity'])} shares  (ID {row['id']})")
 
-            dv1, dv2 = st.columns(2)
-            with dv1:
-                st.markdown("##### Record Dividend")
-                dv_opts  = open_div_trades.apply(_div_trade_label, axis=1).tolist()
-                dv_label = st.selectbox("Trade", options=dv_opts, key="dv_trade_sel")
-                dv_idx   = dv_opts.index(dv_label)
-                dv_row   = open_div_trades.iloc[dv_idx]
-                dv_id    = int(dv_row["id"])
-                dv_date  = st.date_input("Ex-Dividend Date", value=pd.Timestamp.today().date(), key="dv_date")
-                dv_aps   = st.number_input("Amount per Share ($)", min_value=0.0, step=0.01,
-                                           format="%.4f", value=None, key="dv_aps",
-                                           placeholder="e.g. 0.25")
-                dv_qty   = st.number_input("Shares Held", min_value=0.0, step=1.0,
-                                           format="%.4f", value=float(dv_row.get("quantity") or 0) or None,
-                                           key="dv_qty",
-                                           help="Pre-filled from the trade; edit if you held a different quantity on the ex-date.")
-                dv_notes = st.text_input("Notes", placeholder="optional", key="dv_notes")
-                if st.button("Record Dividend", key="dv_submit", type="primary"):
-                    if dv_aps is None or dv_aps <= 0:
-                        st.error("Amount per share is required and must be > 0.")
-                    else:
-                        add_trade_dividend(dv_id, str(dv_date), float(dv_aps),
-                                           float(dv_qty) if dv_qty else None,
-                                           notes=dv_notes or "")
-                        st.success(f"Dividend recorded: {fmt_price(dv_aps)} / share"
-                                   + (f" · {fmt_price(dv_aps * dv_qty)} total" if dv_qty else ""))
-                        st.rerun()
+            # Search + select above the two-column layout so both sides share the same trade
+            dv_opts    = open_div_trades.apply(_div_trade_label, axis=1).tolist()
+            dv_search  = st.text_input("🔍 Search trade (ticker, date, or ID)",
+                                        key="dv_search", placeholder="Type to filter…")
+            dv_f_opts  = [o for o in dv_opts if dv_search.lower() in o.lower()] if dv_search else dv_opts
+            dv_label   = st.selectbox("Select trade", options=dv_f_opts,
+                                       key="dv_trade_sel", index=0 if dv_f_opts else None)
 
-            with dv2:
-                st.markdown("##### Dividend History")
-                _dv_view_label = st.selectbox("View dividends for", options=dv_opts,
-                                               key="dv_view_sel", index=0)
-                _dv_view_idx   = dv_opts.index(_dv_view_label)
-                _dv_view_id    = int(open_div_trades.iloc[_dv_view_idx]["id"])
-                _divs          = load_trade_dividends(_dv_view_id)
-                if not _divs:
-                    st.info("No dividends recorded for this trade yet.")
-                else:
-                    _dv_df = pd.DataFrame(_divs)[["ex_date", "amount_per_share", "quantity",
-                                                   "total_amount", "notes"]]
-                    _dv_df.columns = ["Ex-Date", "$/Share", "Qty", "Total", "Notes"]
-                    _dv_df["$/Share"] = _dv_df["$/Share"].apply(lambda v: fmt_price(v) if v else "—")
-                    _dv_df["Total"]   = _dv_df["Total"].apply(lambda v: fmt_price(v) if v else "—")
-                    st.dataframe(_dv_df, width='stretch', hide_index=True)
-                    _dv_total = sum(d.get("total_amount") or 0 for d in _divs)
-                    st.metric("Total Dividends Received", fmt_price(_dv_total))
-                    with st.expander("🗑️ Delete a dividend"):
-                        _dv_del_opts = {
-                            f"{d['ex_date']} — {fmt_price(d.get('total_amount') or d['amount_per_share'])}": d["id"]
-                            for d in _divs
-                        }
-                        _dv_del_sel = st.selectbox("Select", options=list(_dv_del_opts.keys()),
-                                                    index=None, placeholder="Choose…", key="dv_del_sel")
-                        if _dv_del_sel and st.button("Delete", key="dv_del_btn", type="secondary"):
-                            delete_trade_dividend(_dv_del_opts[_dv_del_sel])
+            if dv_label:
+                dv_idx = dv_opts.index(dv_label)
+                dv_row = open_div_trades.iloc[dv_idx]
+                dv_id  = int(dv_row["id"])
+
+                dv1, dv2 = st.columns(2)
+                with dv1:
+                    st.markdown("##### Record Dividend")
+                    dv_date  = st.date_input("Ex-Dividend Date", value=pd.Timestamp.today().date(), key="dv_date")
+                    dv_aps   = st.number_input("Amount per Share ($)", min_value=0.0, step=0.01,
+                                               format="%.4f", value=None, key="dv_aps",
+                                               placeholder="e.g. 0.25")
+                    dv_qty   = st.number_input("Shares Held", min_value=0.0, step=1.0,
+                                               format="%.4f", value=float(dv_row.get("quantity") or 0) or None,
+                                               key="dv_qty",
+                                               help="Pre-filled from the trade; edit if you held a different quantity on the ex-date.")
+                    dv_notes = st.text_input("Notes", placeholder="optional", key="dv_notes")
+                    if st.button("Record Dividend", key="dv_submit", type="primary"):
+                        if dv_aps is None or dv_aps <= 0:
+                            st.error("Amount per share is required and must be > 0.")
+                        else:
+                            add_trade_dividend(dv_id, str(dv_date), float(dv_aps),
+                                               float(dv_qty) if dv_qty else None,
+                                               notes=dv_notes or "")
+                            st.success(f"Dividend recorded: {fmt_price(dv_aps)} / share"
+                                       + (f" · {fmt_price(dv_aps * dv_qty)} total" if dv_qty else ""))
                             st.rerun()
+
+                with dv2:
+                    st.markdown("##### Dividend History")
+                    # History automatically mirrors whichever trade is selected on the left
+                    _divs = load_trade_dividends(dv_id)
+                    if not _divs:
+                        st.info("No dividends recorded for this trade yet.")
+                    else:
+                        _dv_df = pd.DataFrame(_divs)[["ex_date", "amount_per_share", "quantity",
+                                                       "total_amount", "notes"]]
+                        _dv_df.columns = ["Ex-Date", "$/Share", "Qty", "Total", "Notes"]
+                        _dv_df["$/Share"] = _dv_df["$/Share"].apply(lambda v: fmt_price(v) if v else "—")
+                        _dv_df["Total"]   = _dv_df["Total"].apply(lambda v: fmt_price(v) if v else "—")
+                        st.dataframe(_dv_df, width='stretch', hide_index=True)
+                        _dv_total = sum(d.get("total_amount") or 0 for d in _divs)
+                        st.metric("Total Dividends Received", fmt_price(_dv_total))
+                        with st.expander("🗑️ Delete a dividend"):
+                            _dv_del_opts = {
+                                f"{d['ex_date']} — {fmt_price(d.get('total_amount') or d['amount_per_share'])}": d["id"]
+                                for d in _divs
+                            }
+                            _dv_del_sel = st.selectbox("Select", options=list(_dv_del_opts.keys()),
+                                                        index=None, placeholder="Choose…", key="dv_del_sel")
+                            if _dv_del_sel and st.button("Delete", key="dv_del_btn", type="secondary"):
+                                delete_trade_dividend(_dv_del_opts[_dv_del_sel])
+                                st.rerun()
 
     # ── Options Rolling ───────────────────────────────────────────────────────
 
@@ -2640,8 +2688,12 @@ if page == "📋  Trading Log":
                               f"exp {fmt_date(r.get('expiration'), euro_dates)} (ID {r['id']})",
                     axis=1,
                 ).tolist()
+                _roll_search   = st.text_input("🔍 Search legs (ticker, strike, ID)",
+                                                key="roll_search", placeholder="Type to filter…")
+                _roll_f_labels = [o for o in _opt_labels if _roll_search.lower() in o.lower()] \
+                                 if _roll_search else _opt_labels
                 _roll_sel = st.multiselect("Select option legs to group as a roll",
-                                           options=_opt_labels, key="roll_sel")
+                                           options=_roll_f_labels, key="roll_sel")
                 _roll_name = st.text_input("Roll group name (leave blank to auto-generate)",
                                            key="roll_name_input")
                 if st.button("🔗  Group as Roll", key="roll_group_btn"):
@@ -2703,15 +2755,21 @@ if page == "📋  Trading Log":
         fr1c1, fr1c2, fr1c3 = st.columns(3)
         ticker_filter = fr1c1.multiselect("Ticker",
                             options=sorted(trades["ticker"].dropna().unique()),
-                            placeholder="All tickers")
-        status_filter = fr1c2.selectbox("Status",        ["All", "Open", "Closed"])
-        pnl_filter    = fr1c3.selectbox("Winners/Losers", ["All", "Profit (+)", "Loss (-)"])
+                            placeholder="All tickers", key="filter_ticker")
+        status_filter = fr1c2.selectbox("Status",        ["All", "Open", "Closed"], key="filter_status")
+        pnl_filter    = fr1c3.selectbox("Winners/Losers", ["All", "Profit (+)", "Loss (-)"], key="filter_pnl")
 
-        fr2c1, fr2c2, fr2c3 = st.columns(3)
+        fr2c1, fr2c2, fr2c3, fr2c4 = st.columns([1, 1, 1, 0.45])
         tag_filter   = fr2c1.multiselect("Tags (any match)",
-                            options=sorted(tag_name_to_id.keys()), placeholder="All tags")
-        date_col_sel = fr2c2.selectbox("Filter date", ["Entry Date", "Exit Date"])
-        date_range   = fr2c3.date_input("Date range", value=[])
+                            options=sorted(tag_name_to_id.keys()), placeholder="All tags", key="filter_tags")
+        date_col_sel = fr2c2.selectbox("Filter date", ["Entry Date", "Exit Date"], key="filter_date_col")
+        date_range   = fr2c3.date_input("Date range", value=[], key="filter_date_range")
+        fr2c4.markdown("<div style='margin-top:1.6rem'></div>", unsafe_allow_html=True)
+        if fr2c4.button("↺ Reset", key="reset_filters", help="Reset all filters to defaults",
+                        width='stretch'):
+            for _fk, _fv in _FILTER_DEFAULTS.items():
+                st.session_state[_fk] = _fv
+            st.rerun()
 
         # ── Apply filters ─────────────────────────────────────────────────────
 
@@ -2759,10 +2817,14 @@ if page == "📋  Trading Log":
             _expired = _has_exp & (_exp.dt.normalize() < pd.Timestamp.today().normalize())
             return _open & ~_expired
 
-        # Build live tickers once for all eligible open rows (one .apply instead of many)
+        # Build live tickers for display (filtered view)
         live_ticker_ser  = filtered.apply(_get_live_ticker, axis=1)
         _eligible_mask   = _live_eligible_mask(filtered)
-        live_symbols     = tuple(live_ticker_ser[_eligible_mask].dropna().unique())
+        # Fetch prices for ALL open positions (not just the filtered subset) so
+        # the cache is complete regardless of which filters are currently active.
+        _all_live_ser    = trades.apply(_get_live_ticker, axis=1)
+        _all_elig_mask   = _live_eligible_mask(trades)
+        live_symbols     = tuple(_all_live_ser[_all_elig_mask].dropna().unique())
 
         _n_live = len(live_symbols)
         if _n_live > 0 and st.session_state.get("_live_prices_loaded"):
@@ -2916,7 +2978,22 @@ if page == "📋  Trading Log":
         _price_num = pd.to_numeric(pd.Series(_price, index=filtered.index), errors="coerce")
         _raw   = (_price_num - _ep) * _qty * _mult * pd.Series(_sign, index=filtered.index)
         _valid = _qty.notna() & _ep.notna() & _price_num.notna()
-        display["_pnl_num"] = np.where(_valid, _raw, np.nan)
+        # Include dividends in P&L. For open trades with a live price, add to price-based
+        # P&L. For open trades with no price yet, show dividends alone so the cost-basis
+        # reduction is always visible (rather than hidden behind "—").
+        _div_ids = filtered["id"].tolist()
+        if _div_ids:
+            _div_map_pnl = load_dividends_for_trades(_div_ids)
+            _div_by_id   = {tid: sum(d.get("total_amount") or 0 for d in divs)
+                            for tid, divs in _div_map_pnl.items()}
+            _div_series  = filtered["id"].map(_div_by_id).fillna(0.0)
+        else:
+            _div_series = pd.Series(0.0, index=filtered.index)
+        display["_pnl_num"] = np.where(
+            _valid.values,
+            _raw.values + _div_series.values,
+            np.where(_div_series.values > 0, _div_series.values, np.nan),
+        )
 
         display = display.rename(columns={
             "id":           "Trade ID",
@@ -2935,7 +3012,13 @@ if page == "📋  Trading Log":
         display["Trade ID"]       = display["Trade ID"].astype(str)
         display["Entry Date"]     = filtered["entry_date"].apply(lambda v: fmt_date(v, euro_dates))
         display["Exit Date"]      = filtered["exit_date"].apply(lambda v: fmt_date(v, euro_dates))
-        display["Entry Price"]    = filtered["entry_price"].apply(fmt_price)
+        # Adjust displayed entry price (cost basis) by total dividends received per share
+        _adj_ep_vals = np.where(
+            (_qty.values > 0) & (_div_series.values > 0),
+            _ep.values - _div_series.values / _qty.values,
+            _ep.values,
+        )
+        display["Entry Price"] = [fmt_price(v) if pd.notna(v) else "—" for v in _adj_ep_vals]
         display["Quantity"]       = filtered["quantity"].apply(fmt_qty)
         display["Exit Price"]     = np.where(is_open_mask, "", filtered["exit_price"].apply(fmt_price))
         display["Live Price"]     = np.where(
@@ -3071,6 +3154,44 @@ if page == "📋  Trading Log":
                 _rpct_valid,
                 _rpct_raw.apply(fmt_signed_pct),
                 "—",
+            )
+
+        need_urp = any(c in vis for c in ["Unrealized P&L %", "Unrealized Ann. Return %"])
+        if need_urp:
+            # Dividend-adjusted entry price (per share)
+            _urp_adj_ep = pd.Series(
+                np.where(
+                    (_qty.values > 0) & (_div_series.values > 0),
+                    _ep.values - _div_series.values / _qty.values,
+                    _ep.values,
+                ),
+                index=filtered.index,
+            )
+            _urp_live  = pd.to_numeric(_live_prices_ser, errors="coerce")
+            _urp_sign  = pd.Series(_sign, index=filtered.index)
+            _urp_valid = is_open_mask & _urp_live.notna() & _urp_adj_ep.notna() & (_urp_adj_ep != 0)
+            _urp_raw_pct = np.where(
+                _urp_valid,
+                (_urp_live - _urp_adj_ep) / _urp_adj_ep.abs() * 100 * _urp_sign,
+                np.nan,
+            )
+            _urp_pct_ser = pd.Series(_urp_raw_pct, index=filtered.index)
+
+        if "Unrealized P&L %" in vis:
+            display["Unrealized P&L %"] = _urp_pct_ser.apply(
+                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
+            )
+
+        if "Unrealized Ann. Return %" in vis:
+            _uarp_entry_dt = pd.to_datetime(filtered["entry_date"], errors="coerce")
+            _uarp_days     = (today_ts - _uarp_entry_dt).dt.days
+            _uarp_ann      = np.where(
+                _urp_valid & (_uarp_days > 0),
+                _urp_raw_pct / _uarp_days * 365,
+                np.nan,
+            )
+            display["Unrealized Ann. Return %"] = pd.Series(_uarp_ann, index=filtered.index).apply(
+                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
             )
 
         if "Acct P&L %" in vis:
@@ -3356,6 +3477,19 @@ if page == "📋  Trading Log":
                     _agg_row["P&L"]         = fmt_pnl(_agg_pnl)
                     _agg_row["_pnl_num"]    = _agg_pnl
                     _agg_row["Quantity"]    = f"{len(_grp_rows)} legs"
+                    # Net live price: sum each leg's market price with side polarity
+                    if _any_open and live_data:
+                        _grp_live_tkrs = live_ticker_ser[_grp_mask]
+                        _grp_signs     = np.where(
+                            _grp_filt["side"].fillna("long").str.lower() == "short", -1.0, 1.0
+                        )
+                        _leg_pxs = [
+                            float(live_data[sym]["price"]) * sign
+                            for sym, sign in zip(_grp_live_tkrs.values, _grp_signs)
+                            if sym and live_data.get(sym, {}).get("price") is not None
+                        ]
+                        if len(_leg_pxs) == len(_grp_filt):
+                            _agg_row["Live Price"] = fmt_price(sum(_leg_pxs))
                     _agg_rows.append(_agg_row)
                     _agg_member_ids.append(_grp_filt["id"].tolist())
 
@@ -3572,7 +3706,7 @@ if page == "📋  Trading Log":
                 st.session_state["trade_table"] = {"selection": {"rows": [], "columns": []}}
 
             event = st.dataframe(styled, width='stretch', hide_index=True,
-                                 on_select="rerun", selection_mode="single-row",
+                                 on_select="rerun", selection_mode="multi-row",
                                  key="trade_table")
 
             selected_rows = event.selection.rows
@@ -3594,10 +3728,17 @@ if page == "📋  Trading Log":
             else:
                 st.session_state.pop("_bulk_sel_ids", None)
 
-            st.caption(
+            _cap_c1, _cap_c2, _cap_c3 = st.columns([4, 1, 1])
+            _cap_c1.caption(
                 f"{len(filtered)} trade{'s' if len(filtered) != 1 else ''}"
                 + (f"  ·  {len(selected_rows)} selected" if selected_rows else "")
             )
+            if _cap_c2.button("☑  Select All", key="select_all_btn", help="Select all visible rows"):
+                st.session_state["trade_table"] = {"selection": {"rows": list(range(len(display))), "columns": []}}
+                st.rerun()
+            if selected_rows and _cap_c3.button("✕  Clear", key="clear_sel_btn", help="Clear selection"):
+                st.session_state["_reset_table_sel"] = True
+                st.rerun()
 
             # Inline drill-down: quick-edit + lots + dividends when a single non-group row is selected
             if len(valid_non_group_rows) == 1:
@@ -3662,59 +3803,61 @@ if page == "📋  Trading Log":
                         st.rerun()
                 _dd_lots = load_trade_lots(_dd_id)
                 _dd_divs = load_trade_dividends(_dd_id)
-                if _dd_lots or _dd_divs:
-                    _lot_col, _div_col = st.columns(2)
-                    with _lot_col:
-                        st.markdown("**Tax Lots**")
-                        if _dd_lots:
-                            _lots_df = pd.DataFrame(
-                                _dd_lots,
-                                columns=["id", "trade_id", "date", "quantity", "price", "lot_type", "notes"]
-                            )
-                            st.dataframe(
-                                _lots_df[["date", "lot_type", "quantity", "price"]].rename(
-                                    columns={"lot_type": "Type", "quantity": "Qty", "price": "Price"}
-                                ),
-                                width='stretch', hide_index=True
-                            )
-                        else:
-                            st.caption("No lots recorded.")
-                    with _div_col:
-                        st.markdown("**Dividends**")
-                        if _dd_divs:
-                            _divs_df = pd.DataFrame(
-                                _dd_divs,
-                                columns=["id", "trade_id", "ex_date", "amount_per_share",
-                                         "quantity", "total_amount", "notes"]
-                            )
-                            st.dataframe(
-                                _divs_df[["ex_date", "amount_per_share", "quantity", "total_amount"]].rename(
-                                    columns={"ex_date": "Ex-Date", "amount_per_share": "$/Share",
-                                             "quantity": "Qty", "total_amount": "Total"}
-                                ),
-                                width='stretch', hide_index=True
-                            )
-                        else:
-                            st.caption("No dividends recorded.")
+                _lot_col, _div_col = st.columns(2)
+                with _lot_col:
+                    st.markdown("**Tax Lots**")
+                    if _dd_lots:
+                        _lots_df = pd.DataFrame(
+                            _dd_lots,
+                            columns=["id", "trade_id", "date", "quantity", "price", "lot_type", "notes"]
+                        )
+                        st.dataframe(
+                            _lots_df[["date", "lot_type", "quantity", "price"]].rename(
+                                columns={"lot_type": "Type", "quantity": "Qty", "price": "Price"}
+                            ),
+                            width='stretch', hide_index=True
+                        )
+                    else:
+                        st.caption("No lots recorded.")
+                with _div_col:
+                    st.markdown("**Dividends**")
+                    if _dd_divs:
+                        _divs_df = pd.DataFrame(
+                            _dd_divs,
+                            columns=["id", "trade_id", "ex_date", "amount_per_share",
+                                     "quantity", "total_amount", "notes"]
+                        )
+                        st.dataframe(
+                            _divs_df[["ex_date", "amount_per_share", "quantity", "total_amount"]].rename(
+                                columns={"ex_date": "Ex-Date", "amount_per_share": "$/Share",
+                                         "quantity": "Qty", "total_amount": "Total"}
+                            ),
+                            width='stretch', hide_index=True
+                        )
+                    else:
+                        st.caption("No dividends recorded.")
 
         # ── Bulk Actions ───────────────────────────────────────────────────────
 
         st.markdown("**Bulk Actions**")
         ba1, ba2, ba3, ba4 = st.columns([1, 1, 1, 2])
 
-        # Delete all currently filtered trades (uses active filters as scope)
+        # Delete selected rows (if any) or all filtered trades
         _bulk_all_ids = filtered["id"].tolist() if not filtered.empty else []
-        _bulk_n = len(_bulk_all_ids)
-        _del_key = "_bulk_del_confirm"
+        _sel_ids      = st.session_state.get("_bulk_sel_ids", [])
+        _target_ids   = _sel_ids if _sel_ids else _bulk_all_ids
+        _bulk_n       = len(_target_ids)
+        _del_label    = f"🗑️  Delete Selected ({_bulk_n})" if _sel_ids else f"🗑️  Delete All ({_bulk_n})"
+        _del_key      = "_bulk_del_confirm"
         if not st.session_state.get(_del_key):
-            if ba1.button(f"🗑️  Delete All ({_bulk_n})", disabled=_bulk_n == 0):
+            if ba1.button(_del_label, disabled=_bulk_n == 0):
                 st.session_state[_del_key] = True
                 st.rerun()
         else:
             ba1.warning(f"Delete {_bulk_n} trade{'s' if _bulk_n != 1 else ''}?")
             _dc1, _dc2 = ba1.columns(2)
             if _dc1.button("Yes", key="bulk_del_yes"):
-                bulk_delete_trades(_bulk_all_ids)
+                bulk_delete_trades(_target_ids)
                 st.session_state[_del_key] = False
                 st.session_state["_reset_table_sel"] = True
                 st.rerun()
@@ -4141,9 +4284,14 @@ if page == "📋  Trading Log":
 
     if not trades.empty:
         with st.expander("✏️  Edit Trade"):
-            selected_label = st.selectbox("Select trade",
-                                          options=trades.apply(trade_label, axis=1).tolist())
-            selected_idx   = trades.apply(trade_label, axis=1).tolist().index(selected_label)
+            _et_all_labels = trades.apply(trade_label, axis=1).tolist()
+            _et_search     = st.text_input("🔍 Search (ticker, date, or ID)", key="et_search",
+                                            placeholder="Type to filter…")
+            _et_f_labels   = [o for o in _et_all_labels if _et_search.lower() in o.lower()] \
+                              if _et_search else _et_all_labels
+            selected_label = st.selectbox("Select trade", options=_et_f_labels,
+                                          index=0 if _et_f_labels else None, key="et_select")
+            selected_idx   = _et_all_labels.index(selected_label) if selected_label else 0
             row            = trades.iloc[selected_idx]
             trade_id       = int(row["id"])
             inst_type      = str(row.get("instrument_type") or "stock").lower()
@@ -4332,10 +4480,14 @@ if page == "📋  Trading Log":
 
     if not trades.empty:
         with st.expander("🗑️  Delete Trade"):
-            del_label = st.selectbox("Select trade to delete",
-                                     options=trades.apply(trade_label, axis=1).tolist(),
-                                     key="del_select")
-            del_idx   = trades.apply(trade_label, axis=1).tolist().index(del_label)
+            _dt_all_labels = trades.apply(trade_label, axis=1).tolist()
+            _dt_search     = st.text_input("🔍 Search (ticker, date, or ID)", key="dt_search",
+                                            placeholder="Type to filter…")
+            _dt_f_labels   = [o for o in _dt_all_labels if _dt_search.lower() in o.lower()] \
+                              if _dt_search else _dt_all_labels
+            del_label = st.selectbox("Select trade to delete", options=_dt_f_labels,
+                                     index=0 if _dt_f_labels else None, key="del_select")
+            del_idx   = _dt_all_labels.index(del_label) if del_label else 0
             del_id    = int(trades.iloc[del_idx]["id"])
             st.warning("This cannot be undone.")
             confirmed = st.checkbox("I confirm I want to permanently delete this trade", key="del_confirm")
@@ -5594,8 +5746,22 @@ elif page == "📊  Statistics":
 
         # ── Display options ───────────────────────────────────────────────────
         _opt_c1, _opt_c2, _opt_c3, _opt_c4 = st.columns(4)
-        _use_pct     = _opt_c1.toggle("% Returns",         value=True,  key="st_use_pct",
-                                       help="Show all return metrics as % of trade value instead of $")
+        _pnl_mode = _opt_c1.radio(
+            "P&L Display", ["$", "%", "Acct. %"],
+            index=1, horizontal=True, key="st_pnl_mode",
+            help=(
+                "**$** — raw dollar P&L. Best for a pure stock portfolio where all "
+                "positions are roughly the same size.\n\n"
+                "**%** — return as a % of what the position cost "
+                "(entry price × qty × multiplier). Best for options, where a $200 "
+                "gain on a $500 contract is very different from $200 on a $20,000 stock.\n\n"
+                "**Acct. %** — return as a % of your total account balance. Puts every "
+                "trade on the same playing field regardless of size or instrument — ideal "
+                "for a mixed portfolio of stocks and options, because it shows how much "
+                "each trade actually moved the needle for your account."
+            ),
+        )
+        _use_pct = _pnl_mode != "$"
         _mean_method = _opt_c2.selectbox(
             "Mean Method", ["Mean", "10% Trimmed Mean"], index=0, key="st_mean_method",
             help=(
@@ -5687,19 +5853,28 @@ elif page == "📊  Statistics":
                     base = abs(float(ep) * float(qty) * mult) if ep and qty else None
                     return (pnl_val / base * 100) if base and pnl_val is not None else None
 
-                if _use_pct:
+                if _pnl_mode == "%":
                     pnl_avail["_pnl_disp"] = pnl_avail.apply(
                         lambda r: _pct_of_trade(r, r["_pnl"]), axis=1)
+                elif _pnl_mode == "Acct. %":
+                    if not acct_bal:
+                        st.warning("Set your account balance in ⚙️ Settings to use Acct. % mode.")
+                    pnl_avail["_pnl_disp"] = pnl_avail["_pnl"].apply(
+                        lambda v: (v / acct_bal * 100) if acct_bal and v is not None else None)
+
+                if _pnl_mode in ("%", "Acct. %"):
                     _pct_series = pnl_avail["_pnl_disp"].dropna().astype(float)
                     _eff_series = _pct_series
                     def _mv(v, prefix="", decimals=2):
                         return "N/A" if v is None else f"{v:,.{decimals}f}%"
                     _eff_winners = _eff_series[_eff_series > 0]
                     _eff_losers  = _eff_series[_eff_series < 0]
-                    _avg_winner_v = float(_eff_winners.mean()) if not _eff_winners.empty else None
-                    _avg_loser_v  = float(_eff_losers.mean())  if not _eff_losers.empty  else None
-                    _std_winner_v = float(_eff_winners.std())  if len(_eff_winners) > 1   else None
-                    _std_loser_v  = float(_eff_losers.std())   if len(_eff_losers) > 1    else None
+                    _avg_winner_v = float(_eff_winners.mean())   if not _eff_winners.empty else None
+                    _avg_loser_v  = float(_eff_losers.mean())    if not _eff_losers.empty  else None
+                    _med_winner_v = float(_eff_winners.median()) if not _eff_winners.empty else None
+                    _med_loser_v  = float(_eff_losers.median())  if not _eff_losers.empty  else None
+                    _std_winner_v = float(_eff_winners.std())    if len(_eff_winners) > 1  else None
+                    _std_loser_v  = float(_eff_losers.std())     if len(_eff_losers) > 1   else None
                     _lw_v = float(_eff_winners.max()) if not _eff_winners.empty else None
                     _ll_v = float(_eff_losers.min())  if not _eff_losers.empty  else None
                 else:
@@ -5708,6 +5883,8 @@ elif page == "📊  Statistics":
                     _eff_losers   = _eff_series[_eff_series < 0]
                     _avg_winner_v = float(stats["avg_winner"]) if stats["avg_winner"] is not None else None
                     _avg_loser_v  = float(stats["avg_loser"])  if stats["avg_loser"]  is not None else None
+                    _med_winner_v = float(_eff_winners.median()) if not _eff_winners.empty else None
+                    _med_loser_v  = float(_eff_losers.median())  if not _eff_losers.empty  else None
                     _std_winner_v = float(stats["std_winner"]) if stats["std_winner"] is not None else None
                     _std_loser_v  = float(stats["std_loser"])  if stats["std_loser"]  is not None else None
                     _lw_v = float(pnl_series[pnl_series > 0].max()) if (pnl_series > 0).any() else None
@@ -5746,27 +5923,35 @@ elif page == "📊  Statistics":
                 _avg_days  = float(_days_held.mean()) if not _days_held.empty else None
                 _ann_ev    = _ev * (365 / _avg_days) if _ev is not None and _avg_days and _avg_days > 0 else None
 
+                _mode_label = {"$": "", "%": "· % returns", "Acct. %": "· Acct. % returns"}.get(_pnl_mode, "")
                 st.markdown(f"**{len(pnl_avail)} trade(s) in analysis**  "
-                            f"{'· % returns mode' if _use_pct else ''}  "
+                            f"{_mode_label}  "
                             f"{'· 10% trimmed mean (per group)' if _use_trimmed else ''}")
 
                 # ── Performance ───────────────────────────────────────────────
                 st.markdown("##### Performance")
-                r1 = st.columns(7)
-                r1[0].metric("Win Rate",   f"{_wr*100:.1f}%")
                 _w_label = "Avg Winner" + (" (trimmed)" if _use_trimmed else "")
                 _l_label = "Avg Loser"  + (" (trimmed)" if _use_trimmed else "")
+                # Row 1: win rate + average/median for winners and losers
+                r1 = st.columns(5)
+                r1[0].metric("Win Rate", f"{_wr*100:.1f}%")
                 r1[1].metric(_w_label, _avg_winner_disp,
                              help="10% trimmed: removes top+bottom 10% of winners before averaging." if _use_trimmed else None)
-                r1[2].metric("Std Dev — Winners", _mv(_std_winner_v),
-                             help="σ = √( Σ(xᵢ − x̄)² / (n−1) )")
+                r1[2].metric("Median Winner", _mv(_med_winner_v),
+                             help="Middle value of all winning trades when sorted by P&L. Less sensitive to outliers than the average.")
                 r1[3].metric(_l_label, _avg_loser_disp,
                              help="10% trimmed: removes top+bottom 10% of losers before averaging." if _use_trimmed else None)
-                r1[4].metric("Std Dev — Losers",  _mv(_std_loser_v),
-                             help="σ = √( Σ(xᵢ − x̄)² / (n−1) )")
-                r1[5].metric("Largest Winner", _mv(_lw_v),
+                r1[4].metric("Median Loser", _mv(_med_loser_v),
+                             help="Middle value of all losing trades when sorted by P&L. Less sensitive to outliers than the average.")
+                # Row 2: dispersion + extremes
+                r2 = st.columns(4)
+                r2[0].metric("Std Dev — Winners", _mv(_std_winner_v),
+                             help="How consistent your winning trades are. A low number means your winners tend to be similar in size. A high number means they're all over the place — some tiny, some huge.")
+                r2[1].metric("Std Dev — Losers",  _mv(_std_loser_v),
+                             help="How consistent your losing trades are. A low number means your losses are predictable and controlled. A high number means you occasionally take a much bigger hit than usual.")
+                r2[2].metric("Largest Winner", _mv(_lw_v),
                              help="Best single trade result.")
-                r1[6].metric("Largest Loser",  _mv(_ll_v),
+                r2[3].metric("Largest Loser",  _mv(_ll_v),
                              help="Worst single trade result.")
 
                 # ── EV row ────────────────────────────────────────────────────
@@ -5793,62 +5978,55 @@ elif page == "📊  Statistics":
                     help="Sum of all commissions in the filtered set.",
                 )
 
-                # Performance chart — single chart, adapts to $ / % mode
+                # Performance charts — two side-by-side bar charts
                 if _avg_winner_v is not None or _avg_loser_v is not None:
                     _aw = _avg_winner_v or 0
                     _al = _avg_loser_v  or 0
-                    _y_prefix = "" if _use_pct else "$"
-                    _y_suffix = "%" if _use_pct else ""
-                    _y_fmt    = ".2f" if _use_pct else ",.0f"
-
-                    _fig_perf = go.Figure()
-                    _fig_perf.add_bar(x=["Avg Winner"], y=[_aw],
-                                      marker_color="#2ecc71", name="Avg Winner")
-                    _fig_perf.add_bar(x=["Avg Loser"],  y=[_al],
-                                      marker_color="#e74c3c", name="Avg Loser")
-                    if _lw_v is not None:
-                        _fig_perf.add_bar(x=["Largest Winner"], y=[_lw_v],
-                                          marker_color="#27ae60", name="Largest Winner",
-                                          marker_pattern_shape="/")
-                    if _ll_v is not None:
-                        _fig_perf.add_bar(x=["Largest Loser"], y=[_ll_v],
-                                          marker_color="#c0392b", name="Largest Loser",
-                                          marker_pattern_shape="\\")
-                    _fig_perf.update_layout(
-                        title=f"Avg & Largest Win / Loss ({'%' if _use_pct else '$'})",
-                        height=300, showlegend=True,
-                        margin=dict(t=36, b=10, l=10, r=10),
+                    _y_prefix = "" if _pnl_mode != "$" else "$"
+                    _y_suffix = "%" if _pnl_mode != "$" else ""
+                    _y_fmt    = ".2f" if _pnl_mode != "$" else ",.0f"
+                    _chart_layout = dict(
+                        height=280, showlegend=False,
+                        margin=dict(t=40, b=10, l=10, r=10),
                         paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
                         font=dict(color="#c8cfe0"),
-                        legend=dict(bgcolor="#1a2236", font=dict(size=11)),
+                        bargap=0.55,
                         yaxis_tickprefix=_y_prefix, yaxis_ticksuffix=_y_suffix,
                         yaxis_tickformat=_y_fmt,
                         yaxis=dict(gridcolor="#2e3a50"),
+                        xaxis=dict(tickfont=dict(size=12)),
                     )
-                    st.plotly_chart(_fig_perf, width='stretch')
+
+                    _ch_left, _ch_right = st.columns(2)
+
+                    # Left: Avg Winner / Avg Loser
+                    _fig_avg = go.Figure()
+                    _fig_avg.add_bar(x=["Avg Winner"], y=[_aw], marker_color="#2ecc71")
+                    _fig_avg.add_bar(x=["Avg Loser"],  y=[_al], marker_color="#e74c3c")
+                    _fig_avg.update_layout(
+                        title=f"Average Win / Loss ({_pnl_mode})",
+                        **_chart_layout,
+                    )
+                    _ch_left.plotly_chart(_fig_avg, width='stretch')
+
+                    # Right: Largest Winner / Largest Loser
+                    _fig_ext = go.Figure()
+                    if _lw_v is not None:
+                        _fig_ext.add_bar(x=["Largest Winner"], y=[_lw_v], marker_color="#27ae60")
+                    if _ll_v is not None:
+                        _fig_ext.add_bar(x=["Largest Loser"],  y=[_ll_v], marker_color="#c0392b")
+                    _fig_ext.update_layout(
+                        title=f"Largest Win / Loss ({_pnl_mode})",
+                        **_chart_layout,
+                    )
+                    _ch_right.plotly_chart(_fig_ext, width='stretch')
 
                 # Scatter plot — P&L over time, respects $ / % mode
                 if not pnl_avail.empty:
                     _sc_dates = pd.to_datetime(pnl_avail["_date"], errors="coerce")
-                    if _use_pct and "_pnl_disp" in pnl_avail.columns:
+                    if _pnl_mode != "$" and "_pnl_disp" in pnl_avail.columns:
                         _sc_pnl = pnl_avail["_pnl_disp"].values
-                        _sc_y_label = "P&L (%)"
-                        _sc_hover   = [f"{t}<br>{p:,.2f}%" for t, p in zip(pnl_avail["ticker"].values, _sc_pnl)]
-                        _sc_tick_sfx = "%"
-                        _sc_tick_pfx = ""
-                        _sc_tick_fmt = ".2f"
-                    elif _use_pct:
-                        # Compute % on the fly if _pnl_disp wasn't built yet
-                        def _pct_for_scatter(row):
-                            ep   = row.get("entry_price")
-                            qty  = row.get("quantity")
-                            mult = float(row.get("multiplier") or 1.0)
-                            pnl  = row["_pnl"]
-                            base = abs(float(ep) * float(qty) * mult) if ep and qty else None
-                            return (pnl / base * 100) if base else pnl
-                        _sc_pnl_raw = pnl_avail.apply(_pct_for_scatter, axis=1).values
-                        _sc_pnl     = _sc_pnl_raw
-                        _sc_y_label = "P&L (%)"
+                        _sc_y_label = f"P&L ({_pnl_mode})"
                         _sc_hover   = [f"{t}<br>{p:,.2f}%" for t, p in zip(pnl_avail["ticker"].values, _sc_pnl)]
                         _sc_tick_sfx = "%"
                         _sc_tick_pfx = ""
@@ -6137,8 +6315,8 @@ elif page == "🔗  Broker Sync":
     # ── Demo mode warning ─────────────────────────────────────────────────────
     if is_demo:
         st.warning(
-            "⚫ **Demo Mode** — Broker auto-sync and auto-connect are disabled. "
-            "Manual button actions below still work. Switch to **Live Mode** in ⚙️ Settings to enable auto-sync.",
+            "📴 **Offline Mode** — Broker auto-sync and auto-connect are disabled. "
+            "Manual button actions below still work. Switch to **Connected to Broker** mode in ⚙️ Settings to enable auto-sync.",
             icon="ℹ️",
         )
 
@@ -6359,7 +6537,7 @@ elif page == "🔗  Broker Sync":
     st.markdown("#### Account Balance Sync")
     st.caption(
         "Pulls the current net liquidation value directly from TWS/Gateway (requires active connection). "
-        + ("**⚫ Demo mode:** this button is available but auto-sync is disabled." if is_demo else "")
+        + ("**📴 Offline mode:** this button is available but auto-sync is disabled." if is_demo else "")
     )
     if st.button("⬇️  Pull Account Balance from IB", width='content'):
         if not _ib_mod.is_available():
@@ -6967,8 +7145,8 @@ elif page == "⚙️  Settings":
     with st.form("settings_mode_form"):
         st.markdown("#### App Mode")
         st.caption(
-            "**Demo mode** uses a fixed $100,000 balance and never calls your broker automatically. "
-            "**Live mode** enables auto-connect and auto-sync features on the Broker Sync page."
+            "**Offline mode** is safe — no broker calls are made automatically. "
+            "**Connected to Broker** enables auto-connect and auto-sync features on the Broker Sync page."
         )
         _cur_mode  = settings.get("app_mode", "demo")
         _mode_opts = ["demo", "live"]
@@ -6976,12 +7154,12 @@ elif page == "⚙️  Settings":
             "Mode",
             _mode_opts,
             index=_mode_opts.index(_cur_mode) if _cur_mode in _mode_opts else 0,
-            format_func=lambda m: "⚫  Demo (safe, no broker calls)" if m == "demo" else "🔴  Live (broker auto-sync enabled)",
+            format_func=lambda m: "📴  Offline (safe, no broker calls)" if m == "demo" else "🟢  Connected to Broker (auto-sync enabled)",
             horizontal=True,
         )
         if st.form_submit_button("💾  Save App Mode", width='stretch'):
             set_setting("app_mode", new_mode)
-            st.success(f"App mode set to {'Live' if new_mode == 'live' else 'Demo'}. Restart or reload to apply badge.")
+            st.success(f"App mode set to {'Connected to Broker' if new_mode == 'live' else 'Offline'}. Restart or reload to apply badge.")
             st.rerun()
 
     st.divider()
