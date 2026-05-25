@@ -328,6 +328,48 @@ def find_open_trade_id(
     return row[0] if row else None
 
 
+def find_open_trade_by_ticker_qty(
+    ticker: str,
+    quantity: float,
+    instrument_type: str = "stock",
+    expiration=None,
+    strike=None,
+) -> int | None:
+    """Find an open trade by ticker + quantity when entry details aren't available.
+
+    Used when a Flex close fill has no matching open fill in the date range.
+    Returns the most-recent matching open trade ID, or None.
+    """
+    if not ticker or quantity is None:
+        return None
+    qty_f = float(quantity)
+    with get_connection() as conn:
+        if expiration and strike is not None:
+            row = conn.execute(
+                """SELECT id FROM trades
+                   WHERE ticker = ?
+                     AND ABS(quantity - ?) < 0.001
+                     AND LOWER(COALESCE(instrument_type,'stock')) = LOWER(?)
+                     AND expiration = ?
+                     AND ABS(COALESCE(strike, 0) - ?) < 0.01
+                     AND (exit_date IS NULL OR exit_date = '')
+                   ORDER BY entry_date DESC LIMIT 1""",
+                (ticker.upper().strip(), qty_f, instrument_type or "stock",
+                 str(expiration)[:10], float(strike)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT id FROM trades
+                   WHERE ticker = ?
+                     AND ABS(quantity - ?) < 0.001
+                     AND LOWER(COALESCE(instrument_type,'stock')) = LOWER(?)
+                     AND (exit_date IS NULL OR exit_date = '')
+                   ORDER BY entry_date DESC LIMIT 1""",
+                (ticker.upper().strip(), qty_f, instrument_type or "stock"),
+            ).fetchone()
+    return row[0] if row else None
+
+
 if __name__ == "__main__":
     init_db()
     print(f"Database ready at {DB_PATH}")

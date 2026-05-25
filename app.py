@@ -11,7 +11,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from pathlib import Path
-from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id
+from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
 import ib_client as _ib_mod
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
@@ -525,6 +525,21 @@ def fetch_next_earnings(ticker: str) -> str | None:
 
 
 @st.cache_data(ttl=3600)
+def fetch_risk_free_rate() -> float:
+    """Return the current annualised risk-free rate (decimal) from yfinance ^IRX (3-month T-bill).
+    Falls back to 4.50% if the feed is unavailable."""
+    try:
+        raw = yf.download("^IRX", period="5d", auto_adjust=True, progress=False)
+        if not raw.empty:
+            close = raw["Close"].dropna()
+            if not close.empty:
+                return round(float(close.iloc[-1]) / 100, 4)
+    except Exception:
+        pass
+    return 0.045  # 4.50% default
+
+
+@st.cache_data(ttl=3600)
 def compute_benchmark_stats(ticker: str, start_date: str, end_date: str) -> dict:
     """Annualised Sharpe, Sortino, Calmar for a benchmark over a date range."""
     try:
@@ -681,7 +696,7 @@ def load_benchmark_series(ticker: str, start_date: str, start_equity: float) -> 
 # ── Logic helpers ──────────────────────────────────────────────────────────────
 
 def _is_open(row) -> bool:
-    return pd.isna(row["exit_date"]) or pd.isna(row["exit_price"]) or not row["exit_price"]
+    return pd.isna(row["exit_date"])
 
 
 def _pnl_numeric(row, live_data: dict):
@@ -699,9 +714,9 @@ def _pnl_numeric(row, live_data: dict):
         raw = (lp - ep) * qty * multiplier
         return -raw if side == "short" else raw
     xp = row["exit_price"]
-    if not xp:
+    if xp is None or (isinstance(xp, float) and pd.isna(xp)):
         return None
-    raw = (xp - ep) * qty * multiplier
+    raw = (float(xp) - ep) * qty * multiplier
     return -raw if side == "short" else raw
 
 
@@ -1134,7 +1149,7 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
             quantity or None,
             entry_price or None,
             exit_date.isoformat() if exit_date else None,
-            exit_price or None,
+            float(exit_price) if exit_price is not None else None,
             notes or None,
             1 if stop_enabled else 0,
             opening_stop if stop_enabled else None,
@@ -1184,7 +1199,7 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
         ]
         vals = [
             exit_date.isoformat() if exit_date else None,
-            exit_price or None,
+            float(exit_price) if exit_price is not None else None,
             notes or None,
             current_stop if stop_enabled else None,
             1 if stop_enabled else 0,
@@ -1407,7 +1422,7 @@ def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_d
     with get_connection() as conn:
         conn.execute(
             "UPDATE trades SET exit_date=?, exit_price=?, quantity=? WHERE id=?",
-            (exit_date.isoformat() if exit_date else None, exit_price or None, exit_qty, trade_id),
+            (exit_date.isoformat() if exit_date else None, float(exit_price) if exit_price is not None else None, exit_qty, trade_id),
         )
 
 
@@ -1428,6 +1443,12 @@ def add_tag(name: str, description: str):
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO tags (name, description) VALUES (?, ?)",
                      (name.strip(), description.strip()))
+
+
+def update_tag(tag_id: int, name: str, description: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE tags SET name=?, description=? WHERE id=?",
+                     (name.strip(), description.strip(), tag_id))
 
 
 def delete_tag(tag_id: int):
@@ -1484,6 +1505,12 @@ def delete_tag(tag_id):
     _cached_load_tags.clear()
     _bust("_v_tags")
 
+_raw_update_tag = update_tag
+def update_tag(tag_id, name, description):
+    _raw_update_tag(tag_id, name, description)
+    _cached_load_tags.clear()
+    _bust("_v_tags")
+
 _raw_clear_all_tags = clear_all_tags
 def clear_all_tags():
     _raw_clear_all_tags()
@@ -1513,6 +1540,11 @@ def delete_account(name: str):
 def add_tag_to_trade(trade_id: int, tag_id: int):
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO trade_tags (trade_id, tag_id) VALUES (?, ?)", (trade_id, tag_id))
+
+
+def remove_tag_from_trade(trade_id: int, tag_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM trade_tags WHERE trade_id=? AND tag_id=?", (trade_id, tag_id))
 
 
 def save_attachment(trade_id: int, uploaded_file):
@@ -1601,7 +1633,11 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
         if v is None:
             return None
         try:
-            return pd.to_datetime(v).date()
+            dt = pd.to_datetime(v).date()
+            # IB exports 0 for absent dates, which pandas parses as 1970-01-01
+            if dt.year < 1990:
+                return None
+            return dt
         except Exception:
             return None
 
@@ -1908,8 +1944,8 @@ input, textarea, select,
 /* ── Mode badge ─────────────────────────────────────── */
 .mode-badge-live {
     display: inline-block;
-    background: #c0392b;
-    color: #fff;
+    background: #1e6f3a;
+    color: #7fffb0;
     font-weight: 800;
     font-size: 0.85rem;
     letter-spacing: 0.12em;
@@ -1918,7 +1954,7 @@ input, textarea, select,
     margin: 0.4rem 0 0.6rem 0;
     width: 100%;
     text-align: center;
-    border: 2px solid #e74c3c;
+    border: 2px solid #27ae60;
 }
 .mode-badge-demo {
     display: inline-block;
@@ -1935,6 +1971,12 @@ input, textarea, select,
     border: 2px solid #27ae60;
 }
 
+/* ── Primary action buttons ─────────────────────────── */
+button[kind="primary"] {
+    color: #0a2558 !important;
+    font-weight: 700 !important;
+}
+
 /* ── Fetch live button ───────────────────────────────── */
 .stButton.fetch-live > button {
     background: #2c3e6a !important;
@@ -1942,10 +1984,10 @@ input, textarea, select,
     font-weight: 700 !important;
 }
 
-/* ── Dropdowns / Selectboxes — grayish-blue ─────────── */
+/* ── Dropdowns / Selectboxes — neutral gray ─────────── */
 [data-baseweb="select"] > div:first-child {
-    background-color: #1e3050 !important;
-    border-color: #3a5a8a !important;
+    background-color: #252a36 !important;
+    border-color: #424857 !important;
     border-radius: 6px !important;
 }
 /* Flatten all inner containers to match the outer background */
@@ -1955,18 +1997,18 @@ input, textarea, select,
 [data-baseweb="select"] input,
 [data-baseweb="input"],
 [data-baseweb="base-input"] {
-    background-color: #1e3050 !important;
-    background: #1e3050 !important;
+    background-color: #252a36 !important;
+    background: #252a36 !important;
 }
 [data-baseweb="select"] span,
 [data-baseweb="select"] [class*="singleValue"],
 [data-baseweb="select"] [class*="placeholder"] {
     color: #c8cfe0 !important;
 }
-[data-baseweb="select"] svg { fill: #4e8ef7 !important; }
+[data-baseweb="select"] svg { fill: #7a8598 !important; }
 [data-baseweb="menu"] {
-    background-color: #1e2d45 !important;
-    border: 1px solid #3a5a8a !important;
+    background-color: #1e222d !important;
+    border: 1px solid #424857 !important;
     border-radius: 6px !important;
 }
 [data-baseweb="option"] {
@@ -1975,14 +2017,14 @@ input, textarea, select,
 }
 [data-baseweb="option"]:hover,
 [data-baseweb="option"][aria-selected="true"] {
-    background-color: #253f63 !important;
+    background-color: #30363f !important;
     color: #ffffff !important;
 }
 [data-baseweb="tag"] {
-    background-color: #2a4a75 !important;
-    color: #d0e0ff !important;
+    background-color: #363c48 !important;
+    color: #c8cfe0 !important;
 }
-[data-baseweb="tag"] svg { fill: #8ab4f8 !important; }
+[data-baseweb="tag"] svg { fill: #7a8598 !important; }
 
 /* ── Remove status/separator lines inside dropdowns ─── */
 /* Hides the thin divider bar between the value area and the chevron arrow */
@@ -2779,11 +2821,7 @@ if page == "📋  Trading Log":
 
         # Compute open/closed mask once; reused throughout display building below
         def _make_is_open_mask(df: pd.DataFrame) -> pd.Series:
-            return (
-                df["exit_date"].isna() |
-                df["exit_price"].isna() |
-                (df["exit_price"].fillna(0) == 0)
-            )
+            return df["exit_date"].isna()
 
         if status_filter == "Open":
             _m = _make_is_open_mask(filtered)
@@ -2795,7 +2833,15 @@ if page == "📋  Trading Log":
             def _has_any_tag(tags_str):
                 if not tags_str or pd.isna(tags_str): return False
                 return any(t.strip() in tag_filter for t in tags_str.split(","))
-            filtered = filtered[filtered["tags"].apply(_has_any_tag)]
+            _tag_direct = filtered["tags"].apply(_has_any_tag)
+            if "leg_group" in filtered.columns:
+                _tag_groups = filtered.loc[
+                    _tag_direct & filtered["leg_group"].notna() & (filtered["leg_group"].astype(str) != ""),
+                    "leg_group",
+                ].unique()
+                filtered = filtered[_tag_direct | filtered["leg_group"].isin(_tag_groups)]
+            else:
+                filtered = filtered[_tag_direct]
         if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
             start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
             col_key    = "entry_date" if date_col_sel == "Entry Date" else "exit_date"
@@ -2891,12 +2937,15 @@ if page == "📋  Trading Log":
                 _pr1, _pr2, _pr3 = st.columns(3)
                 if _pr1.button("Stock", key="preset_stock", width='stretch'):
                     st.session_state["visible_cols"] = PRESET_STOCK
+                    st.session_state["col_order"]    = list(PRESET_STOCK)
                     st.rerun()
                 if _pr2.button("Options", key="preset_options", width='stretch'):
                     st.session_state["visible_cols"] = PRESET_OPTIONS
+                    st.session_state["col_order"]    = list(PRESET_OPTIONS)
                     st.rerun()
                 if _pr3.button("Default", key="preset_default", width='stretch'):
                     st.session_state["visible_cols"] = DEFAULT_COLS
+                    st.session_state["col_order"]    = list(DEFAULT_COLS)
                     st.rerun()
 
                 # ── Saved custom presets ───────────────────────────────────
@@ -2906,6 +2955,7 @@ if page == "📋  Trading Log":
                         _pb_col, _pd_col = st.columns([4, 1])
                         if _pb_col.button(_pname, key=f"preset_custom_{_pname}", width='stretch'):
                             st.session_state["visible_cols"] = _pcols
+                            st.session_state["col_order"]    = list(_pcols)
                             st.rerun()
                         if _pd_col.button("✕", key=f"preset_del_{_pname}", width='stretch'):
                             del _custom_presets[_pname]
@@ -2924,11 +2974,49 @@ if page == "📋  Trading Log":
                                                    placeholder="Preset name…", key="new_preset_name")
                 if _sv2.button("Save", key="btn_save_preset", width='stretch'):
                     if _new_preset_name.strip():
-                        _custom_presets[_new_preset_name.strip()] = st.session_state.get("visible_cols", DEFAULT_COLS)
+                        # Save using current col_order so the preset preserves order
+                        _co_now = st.session_state.get("col_order", st.session_state.get("visible_cols", DEFAULT_COLS))
+                        _custom_presets[_new_preset_name.strip()] = _co_now
                         set_setting("col_presets", _json.dumps(_custom_presets))
                         st.rerun()
 
-        vis = st.session_state.get("visible_cols", DEFAULT_COLS)
+        # ── Column order tracking ──────────────────────────────────────────────
+        # Multiselect always returns values in ALL_COLS order, so track insertion
+        # order separately: newly-added columns append to the end.
+        if "col_order" not in st.session_state:
+            _saved_co = get_setting("col_order")
+            st.session_state["col_order"] = (
+                _json.loads(_saved_co)
+                if _saved_co else list(st.session_state.get("visible_cols", DEFAULT_COLS))
+            )
+        _cur_vis_set  = set(st.session_state.get("visible_cols", DEFAULT_COLS))
+        _cur_vis_list = st.session_state.get("visible_cols", DEFAULT_COLS)
+        _col_order    = st.session_state["col_order"]
+        # Retain existing order; append any newly-selected columns at the end
+        _col_order = [c for c in _col_order if c in _cur_vis_set] + \
+                     [c for c in _cur_vis_list if c not in _col_order]
+        st.session_state["col_order"] = _col_order
+
+        # ── Column reorder expander ────────────────────────────────────────────
+        if len(_col_order) >= 2:
+            with st.expander("↕  Column order", expanded=False):
+                st.caption("Use ↑ / ↓ to reorder, then save as default.")
+                for _ci, _cn in enumerate(_col_order):
+                    _rca, _rcb, _rcc = st.columns([7, 0.7, 0.7])
+                    _rca.write(_cn)
+                    if _ci > 0 and _rcb.button("↑", key=f"_co_up_{_ci}"):
+                        _col_order[_ci - 1], _col_order[_ci] = _col_order[_ci], _col_order[_ci - 1]
+                        st.session_state["col_order"] = _col_order
+                        st.rerun()
+                    if _ci < len(_col_order) - 1 and _rcc.button("↓", key=f"_co_dn_{_ci}"):
+                        _col_order[_ci], _col_order[_ci + 1] = _col_order[_ci + 1], _col_order[_ci]
+                        st.session_state["col_order"] = _col_order
+                        st.rerun()
+                if st.button("📌  Save as default", key="save_col_order_default"):
+                    set_setting("col_order", _json.dumps(_col_order))
+                    st.toast("Column order saved as default.", icon="📌")
+
+        vis = _col_order
 
         # ── Lazy metadata ──────────────────────────────────────────────────────
 
@@ -4969,7 +5057,7 @@ elif page == "📈  Equity Curve":
                 )
                 st.plotly_chart(fig, width='stretch')
 
-                # ── Summary stats ─────────────────────────────────────────────
+                # ── Core scalars ──────────────────────────────────────────────
                 _first_bal    = float(_ec_plot_df["balance"].iloc[0])
                 _last_bal     = float(_ec_plot_df["balance"].iloc[-1])
                 _net_contribs = float(_ec_plot_df["contributions"].sum() - _ec_plot_df["withdrawals"].sum())
@@ -4977,20 +5065,245 @@ elif page == "📈  Equity Curve":
                 _peak_twr     = float(_ec_plot_df["twr_pct"].max())
                 _trough_twr   = float(_ec_plot_df.loc[_ec_plot_df["twr_pct"].idxmax():, "twr_pct"].min())
                 _max_dd       = _peak_twr - _trough_twr
+
+                # ── Daily sub-period returns for the filtered range ────────────
+                _ec_plot_prev  = _ec_plot_df["balance"].shift(1)
+                _ec_plot_denom = _ec_plot_prev + _ec_plot_df["contributions"] - _ec_plot_df["withdrawals"]
+                _ec_plot_pret  = np.where(_ec_plot_denom > 0, _ec_plot_df["balance"] / _ec_plot_denom - 1, 0.0)
+                _daily_ret_ser = pd.Series(
+                    _ec_plot_pret[1:], index=_ec_plot_df["date"].iloc[1:]
+                )  # drop first (0% baseline)
+
+                # ── Annualised return (CAGR) ──────────────────────────────────
+                _n_days = max(1, (_ec_plot_df["date"].iloc[-1] - _ec_plot_df["date"].iloc[0]).days)
+                _cagr   = ((1 + _twr_total / 100) ** (365.25 / _n_days) - 1) * 100
+
+                # ── Annualised std dev ─────────────────────────────────────────
+                _std_ann = (float(_daily_ret_ser.std(ddof=1)) * np.sqrt(252) * 100
+                            if len(_daily_ret_ser) > 1 else float("nan"))
+
+                # ── Risk-Free Rate (slider with auto-fetched default) ──────────
+                _rfr_fetched = fetch_risk_free_rate()   # decimal, cached 1h
+                st.markdown("---")
+                _rfr_col, _rfr_info = st.columns([3, 1])
+                with _rfr_col:
+                    _rfr_pct = st.slider(
+                        "Risk-Free Rate (% annual)",
+                        min_value=0.0, max_value=10.0,
+                        value=round(_rfr_fetched * 100, 2),
+                        step=0.25,
+                        key="ec_rfr_slider",
+                        help="Used for Sharpe & Sortino. Auto-loaded from the 3-month T-bill (^IRX). Drag to override.",
+                    )
+                _rfr_info.metric("3-Mo T-Bill", f"{_rfr_fetched*100:.2f}%",
+                                 help="Live rate from ^IRX (yfinance). Refreshes hourly.")
+                _rfr = _rfr_pct / 100.0   # as decimal
+                _daily_rfr = _rfr / 252.0
+
+                # ── Sharpe ────────────────────────────────────────────────────
+                _excess_daily  = _daily_ret_ser - _daily_rfr
+                _sharpe = (
+                    float(_excess_daily.mean() / _excess_daily.std(ddof=1) * np.sqrt(252))
+                    if len(_excess_daily) > 1 and _excess_daily.std(ddof=1) > 0
+                    else float("nan")
+                )
+
+                # ── Sortino ───────────────────────────────────────────────────
+                # Downside deviation uses only days below RFR; annualise the ratio
+                _downside = _daily_ret_ser[_daily_ret_ser < _daily_rfr] - _daily_rfr
+                _sortino = (
+                    float((_daily_ret_ser.mean() - _daily_rfr) * np.sqrt(252)
+                          / np.sqrt((_downside**2).mean()))
+                    if len(_downside) > 1 and (_downside**2).mean() > 0
+                    else float("nan")
+                )
+
+                # ── Calmar ────────────────────────────────────────────────────
+                _calmar = (
+                    float((_cagr / 100) / (_max_dd / 100))
+                    if _max_dd > 0 else float("nan")
+                )
+
+                # ── Best / Worst day and week ──────────────────────────────────
+                _best_day  = float(_daily_ret_ser.max() * 100) if not _daily_ret_ser.empty else float("nan")
+                _worst_day = float(_daily_ret_ser.min() * 100) if not _daily_ret_ser.empty else float("nan")
+                _weekly_rets = ((1 + _daily_ret_ser).resample("W").prod() - 1) * 100
+                _best_week  = float(_weekly_rets.max()) if not _weekly_rets.empty else float("nan")
+                _worst_week = float(_weekly_rets.min()) if not _weekly_rets.empty else float("nan")
+
+                def _fmt_stat(v, suffix="%", prec=2):
+                    return f"{v:+.{prec}f}{suffix}" if not np.isnan(v) else "N/A"
+                def _fmt_ratio(v, prec=2):
+                    return f"{v:.{prec}f}" if not np.isnan(v) else "N/A"
+
+                # ── Row 1: balance / TWR overview ─────────────────────────────
                 _sm1, _sm2, _sm3, _sm4 = st.columns(4)
                 _sm1.metric("Current Balance", f"${_last_bal:,.2f}")
-                _sm2.metric("TWR", f"{_twr_total:+.2f}%")
+                _sm2.metric("TWR (period)", f"{_twr_total:+.2f}%")
                 _sm3.metric("Net Contributions", f"${_net_contribs:,.2f}")
-                _sm4.metric("Max Drawdown (TWR)", f"{_max_dd:.2f}%")
+                _sm4.metric("Max Drawdown", f"{_max_dd:.2f}%")
+
+                # ── Row 2: return quality ──────────────────────────────────────
+                _ra1, _ra2, _ra3, _ra4, _ra5 = st.columns(5)
+                _ra1.metric("Annualized Return",  _fmt_stat(_cagr),
+                            help="CAGR over the selected date range (TWR compounded to 1 year).")
+                _ra2.metric("Std Dev (ann.)", _fmt_stat(_std_ann),
+                            help="Annualised standard deviation of daily sub-period returns (×√252).")
+                _ra3.metric("Sharpe Ratio", _fmt_ratio(_sharpe),
+                            help="(Ann. excess return above RFR) ÷ ann. σ. >1 = good, >2 = excellent.")
+                _ra4.metric("Sortino Ratio", _fmt_ratio(_sortino),
+                            help="Like Sharpe but σ is computed only on days below the RFR — rewards upside volatility.")
+                _ra5.metric("Calmar Ratio", _fmt_ratio(_calmar),
+                            help="Annualized return ÷ max drawdown. >1 = return more than compensates the worst drawdown.")
+
+                # ── Row 3: extremes ───────────────────────────────────────────
+                _ex1, _ex2, _ex3, _ex4 = st.columns(4)
+                _ex1.metric("Best Day",   _fmt_stat(_best_day))
+                _ex2.metric("Worst Day",  _fmt_stat(_worst_day))
+                _ex3.metric("Best Week",  _fmt_stat(_best_week))
+                _ex4.metric("Worst Week", _fmt_stat(_worst_week))
+
+                # ── Histogram of daily returns ─────────────────────────────────
+                st.markdown("---")
+                st.markdown("#### Return Distribution")
+                if len(_daily_ret_ser) >= 3:
+                    _hist_data = (_daily_ret_ser * 100).dropna()
+                    _hist_mean = float(_hist_data.mean())
+                    _hist_fig  = go.Figure()
+                    _hist_fig.add_trace(go.Histogram(
+                        x=_hist_data,
+                        nbinsx=min(40, max(10, len(_hist_data) // 3)),
+                        name="Daily Returns",
+                        marker_color="#4e8ef7",
+                        opacity=0.8,
+                    ))
+                    _hist_fig.add_vline(x=0, line_width=2, line_dash="dash",
+                                        line_color="#e74c3c",
+                                        annotation_text="0%", annotation_position="top right",
+                                        annotation_font_color="#e74c3c")
+                    _hist_fig.add_vline(x=_hist_mean, line_width=1.5, line_dash="dot",
+                                        line_color="#f39c12",
+                                        annotation_text=f"mean {_hist_mean:+.2f}%",
+                                        annotation_position="top left",
+                                        annotation_font_color="#f39c12")
+                    _hist_fig.update_layout(
+                        xaxis_title="Daily Return (%)", yaxis_title="Days",
+                        paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
+                        font=dict(color="#c8cfe0"),
+                        xaxis=dict(gridcolor="#2e3a50", ticksuffix="%"),
+                        yaxis=dict(gridcolor="#2e3a50"),
+                        showlegend=False,
+                        height=300,
+                        margin=dict(t=20, b=40),
+                    )
+                    st.plotly_chart(_hist_fig, width='stretch')
+                else:
+                    st.info("Need at least 3 data points to show the return distribution.")
+
+                # ── Monthly returns table ──────────────────────────────────────
+                st.markdown("---")
+                st.markdown("#### Monthly Returns")
+                if len(_daily_ret_ser) >= 5:
+                    _monthly_rets = ((1 + _daily_ret_ser).resample("ME").prod() - 1) * 100
+                    _mo_df = pd.DataFrame({
+                        "Year":   _monthly_rets.index.year,
+                        "Month":  _monthly_rets.index.month,
+                        "Return": _monthly_rets.values,
+                    })
+                    _month_abbr = ["Jan","Feb","Mar","Apr","May","Jun",
+                                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+                    _mo_df["MonthAbbr"] = _mo_df["Month"].apply(lambda m: _month_abbr[m-1])
+                    _mo_pivot = _mo_df.pivot(index="Year", columns="MonthAbbr", values="Return")
+                    # Keep months in calendar order for columns that exist
+                    _mo_pivot = _mo_pivot.reindex(
+                        columns=[m for m in _month_abbr if m in _mo_pivot.columns]
+                    )
+                    # Annual totals column
+                    _mo_pivot["Annual"] = (
+                        (1 + _mo_df.groupby("Year")["Return"].apply(
+                            lambda s: (s / 100 + 1).prod() - 1
+                        )) - 1
+                    ) * 100
+
+                    # Optional benchmark overlay
+                    _mo_show_bench = False
+                    if selected_benchmarks:
+                        _mo_show_bench = st.toggle(
+                            "Show benchmark monthly returns", value=False, key="ec_mo_bench_toggle"
+                        )
+
+                    def _color_ret(val):
+                        if pd.isna(val): return ""
+                        return "color: #2ecc71" if val > 0 else "color: #e74c3c"
+
+                    _mo_fmt = {c: "{:+.1f}%" for c in _mo_pivot.columns}
+                    st.dataframe(
+                        _mo_pivot.style
+                            .format(_mo_fmt, na_rep="—")
+                            .map(_color_ret),
+                        width='stretch',
+                    )
+
+                    if _mo_show_bench and selected_benchmarks:
+                        for _bench in selected_benchmarks:
+                            _bs = load_benchmark_series(
+                                _bench, _ec_start_str, _ec_start_bal
+                            )
+                            if _bs.empty:
+                                continue
+                            _bs_rets = (_bs.pct_change().dropna())
+                            _bs_mo   = ((1 + _bs_rets).resample("ME").prod() - 1) * 100
+                            _bs_df   = pd.DataFrame({
+                                "Year":  _bs_mo.index.year,
+                                "Month": _bs_mo.index.month,
+                                "Return":_bs_mo.values,
+                            })
+                            _bs_df["MonthAbbr"] = _bs_df["Month"].apply(lambda m: _month_abbr[m-1])
+                            _bs_pivot = _bs_df.pivot(index="Year", columns="MonthAbbr", values="Return")
+                            _bs_pivot = _bs_pivot.reindex(
+                                columns=[m for m in _month_abbr if m in _bs_pivot.columns]
+                            )
+                            _bs_pivot["Annual"] = (
+                                (1 + _bs_df.groupby("Year")["Return"].apply(
+                                    lambda s: (s / 100 + 1).prod() - 1
+                                )) - 1
+                            ) * 100
+                            st.caption(f"**{_bench}** monthly returns")
+                            st.dataframe(
+                                _bs_pivot.style
+                                    .format(_mo_fmt, na_rep="—")
+                                    .map(_color_ret),
+                                width='stretch',
+                            )
+                else:
+                    st.info("Need at least 5 data points to compute monthly returns.")
 
                 # ── Daily balance table ───────────────────────────────────────
-                st.markdown("#### Daily Balances")
+                _db_head_col, _db_clr_col = st.columns([4, 1])
+                _db_head_col.markdown("#### Daily Balances")
+                with _db_clr_col:
+                    with st.popover("🗑️  Clear All", use_container_width=True):
+                        st.warning("Permanently delete **all** equity entries?", icon="⚠️")
+                        if st.button("Yes, clear all", type="primary",
+                                     use_container_width=True, key="chart_clear_equity_btn"):
+                            clear_equity_entries()
+                            _cached_load_equity_entries.clear()
+                            _bust("_v_equity")
+                            st.rerun()
                 _tbl = _ec_plot_df[["date", "balance", "contributions", "withdrawals", "twr_pct"]].copy()
                 _tbl["Daily Change ($)"] = _tbl["balance"].diff().fillna(0.0)
                 _tbl["Daily Return (%)"] = (
                     (_tbl["balance"] / (_tbl["balance"].shift(1)
                      + _tbl["contributions"] - _tbl["withdrawals"]) - 1) * 100
                 ).fillna(0.0)
+                # Flag rows that look like missing contributions: >15% single-day move
+                # with no cash flow recorded — these are the primary cause of curve spikes.
+                _tbl["⚠️"] = np.where(
+                    (_tbl["Daily Return (%)"].abs() > 15)
+                    & (_tbl["contributions"] == 0)
+                    & (_tbl["withdrawals"]   == 0),
+                    "⚠️ check", "",
+                )
                 _tbl = _tbl.rename(columns={
                     "date":          "Date",
                     "balance":       "Balance ($)",
@@ -5001,8 +5314,18 @@ elif page == "📈  Equity Curve":
                 _tbl["Date"] = _tbl["Date"].dt.strftime("%Y-%m-%d")
                 _tbl = _tbl[[
                     "Date", "Balance ($)", "Daily Change ($)", "Daily Return (%)",
-                    "Cum. TWR (%)", "Contributions ($)", "Withdrawals ($)"
+                    "Cum. TWR (%)", "Contributions ($)", "Withdrawals ($)", "⚠️"
                 ]].sort_values("Date", ascending=False).reset_index(drop=True)
+                _n_suspect = (_tbl["⚠️"] != "").sum()
+                if _n_suspect:
+                    st.warning(
+                        f"⚠️ **{_n_suspect} row(s) flagged** — a >15% single-day balance "
+                        "change with no contributions or withdrawals recorded. "
+                        "These are likely caused by deposits/withdrawals that were imported "
+                        "without cash-flow data. Edit those entries in the **Manual Entry** "
+                        "tab to add the correct contributions/withdrawals.",
+                        icon="⚠️",
+                    )
                 st.dataframe(
                     _tbl.style
                         .format({
@@ -5111,7 +5434,28 @@ elif page == "📈  Equity Curve":
                     _csv_df["balance"]       = pd.to_numeric(_csv_df["balance"],       errors="coerce")
                     _csv_df["contributions"] = pd.to_numeric(_csv_df.get("contributions", 0), errors="coerce").fillna(0.0)
                     _csv_df["withdrawals"]   = pd.to_numeric(_csv_df.get("withdrawals",   0), errors="coerce").fillna(0.0)
-                    _csv_df = _csv_df.dropna(subset=["balance"])
+                    _csv_df = _csv_df.dropna(subset=["balance"]).sort_values("date").reset_index(drop=True)
+                    # Spike detection: warn when a large balance jump has no cash flow recorded
+                    _csv_prev  = _csv_df["balance"].shift(1)
+                    _csv_denom = _csv_prev + _csv_df["contributions"] - _csv_df["withdrawals"]
+                    _csv_iret  = np.where(_csv_denom > 0, (_csv_df["balance"] / _csv_denom - 1) * 100, 0.0)
+                    _csv_df["_impl_ret"] = np.where(_csv_df.index == 0, 0.0, _csv_iret)
+                    _csv_spike = (
+                        (_csv_df["_impl_ret"].abs() > 15)
+                        & (_csv_df["contributions"] == 0)
+                        & (_csv_df["withdrawals"]   == 0)
+                    )
+                    if _csv_spike.any():
+                        _csv_spike_lines = "\n".join(
+                            f"- **{r['date']}**: implied {r['_impl_ret']:+.1f}% (balance ${r['balance']:,.2f})"
+                            for _, r in _csv_df[_csv_spike].iterrows()
+                        )
+                        st.warning(
+                            f"⚠️ **{_csv_spike.sum()} day(s) show a balance jump >15% with no "
+                            "recorded contributions or withdrawals.** "
+                            "If a deposit occurred on these dates, add it to the CSV to avoid equity curve spikes.\n\n"
+                            + _csv_spike_lines
+                        )
                     st.dataframe(_csv_df[["date","balance","contributions","withdrawals"]], width='stretch', hide_index=True)
                     if st.button(f"Import {len(_csv_df)} entries from CSV", type="primary", key="ec_csv_import_btn"):
                         for _, _r in _csv_df.iterrows():
@@ -5131,28 +5475,95 @@ elif page == "📈  Equity Curve":
         if _xml_file:
             try:
                 _xml_root = _ET.parse(_io.BytesIO(_xml_file.read())).getroot()
+
+                # ── Parse cash transactions so deposits/withdrawals are attributed
+                # correctly. Without this, deposits look like trading profit and
+                # cause massive spikes in the equity curve (TWR denominator error).
+                _xml_deps: dict[str, float] = {}
+                _xml_wths: dict[str, float] = {}
+                for _txn in _xml_root.iter("CashTransaction"):
+                    # Skip summary rows — IB emits each transaction twice
+                    if _txn.get("levelOfDetail", "").upper() == "SUMMARY":
+                        continue
+                    _ttype = (_txn.get("type") or "").lower()
+                    try:
+                        _tamt = float(_txn.get("amount", 0) or 0)
+                    except (ValueError, TypeError):
+                        _tamt = 0.0
+                    _traw = _txn.get("reportDate") or _txn.get("dateTime", "")
+                    try:
+                        _tdate = pd.to_datetime(str(_traw)[:10]).strftime("%Y-%m-%d")
+                    except Exception:
+                        continue
+                    if "deposit" in _ttype and _tamt > 0:
+                        _xml_deps[_tdate] = _xml_deps.get(_tdate, 0.0) + _tamt
+                    elif "withdrawal" in _ttype and _tamt < 0:
+                        _xml_wths[_tdate] = _xml_wths.get(_tdate, 0.0) + abs(_tamt)
+
+                # ── Build daily rows with correct contributions/withdrawals ──────
                 _xml_rows = []
                 for _el in _xml_root.iter("EquitySummaryByReportDateInBase"):
                     _rdate = _el.get("reportDate") or _el.get("date")
                     _total = _el.get("total")
                     if _rdate and _total:
                         try:
+                            _iso = pd.to_datetime(_rdate).strftime("%Y-%m-%d")
                             _xml_rows.append({
-                                "date":          pd.to_datetime(_rdate).strftime("%Y-%m-%d"),
+                                "date":          _iso,
                                 "balance":       float(_total),
-                                "contributions": 0.0,
-                                "withdrawals":   0.0,
+                                "contributions": _xml_deps.get(_iso, 0.0),
+                                "withdrawals":   _xml_wths.get(_iso, 0.0),
                             })
                         except Exception:
                             pass
+
                 if not _xml_rows:
                     st.warning("No `EquitySummaryByReportDateInBase` records found in the XML.")
                 else:
-                    _xml_df = pd.DataFrame(_xml_rows).drop_duplicates("date")
-                    st.dataframe(_xml_df[["date","balance"]], width='stretch', hide_index=True)
+                    _xml_df = (
+                        pd.DataFrame(_xml_rows)
+                        .drop_duplicates("date")
+                        .sort_values("date")
+                        .reset_index(drop=True)
+                    )
+
+                    # ── Spike detection: warn before user imports ─────────────
+                    _xprev   = _xml_df["balance"].shift(1)
+                    _xdenom  = _xprev + _xml_df["contributions"] - _xml_df["withdrawals"]
+                    _xret    = np.where(_xdenom > 0, (_xml_df["balance"] / _xdenom - 1) * 100, 0.0)
+                    _xml_df["_impl_ret"] = np.where(
+                        _xml_df.index == 0, 0.0, _xret
+                    )
+                    _spike_mask = (
+                        (_xml_df["_impl_ret"].abs() > 15)
+                        & (_xml_df["contributions"] == 0)
+                        & (_xml_df["withdrawals"]   == 0)
+                    )
+                    if _spike_mask.any():
+                        _spike_lines = "\n".join(
+                            f"- **{r['date']}**: implied {r['_impl_ret']:+.1f}% "
+                            f"(balance ${r['balance']:,.2f})"
+                            for _, r in _xml_df[_spike_mask].iterrows()
+                        )
+                        st.warning(
+                            f"⚠️ **{_spike_mask.sum()} day(s) show a balance jump >15% with no "
+                            "recorded contributions or withdrawals.**\n\n"
+                            "If you deposited or withdrew money on these dates, the equity curve "
+                            "will show a false spike. Check whether your XML includes `CashTransaction` "
+                            "nodes, or add the deposit/withdrawal manually after importing.\n\n"
+                            + _spike_lines
+                        )
+
+                    st.dataframe(
+                        _xml_df[["date", "balance", "contributions", "withdrawals"]],
+                        width='stretch', hide_index=True,
+                    )
                     if st.button(f"Import {len(_xml_df)} entries from XML", type="primary", key="ec_xml_import_btn"):
                         for _, _r in _xml_df.iterrows():
-                            upsert_equity_entry(_r["date"], float(_r["balance"]), 0.0, 0.0)
+                            upsert_equity_entry(
+                                _r["date"], float(_r["balance"]),
+                                float(_r["contributions"]), float(_r["withdrawals"]),
+                            )
                         _cached_load_equity_entries.clear()
                         _bust("_v_equity")
                         st.success(f"Imported {len(_xml_df)} entries.")
@@ -5855,7 +6266,15 @@ elif page == "📊  Statistics":
             def _has_any_tag_st(tags_str):
                 if not tags_str or pd.isna(tags_str): return False
                 return any(t.strip() in st_tags for t in tags_str.split(","))
-            sf = sf[sf["tags"].apply(_has_any_tag_st)]
+            _tag_direct_st = sf["tags"].apply(_has_any_tag_st)
+            if "leg_group" in sf.columns:
+                _tag_groups_st = sf.loc[
+                    _tag_direct_st & sf["leg_group"].notna() & (sf["leg_group"].astype(str) != ""),
+                    "leg_group",
+                ].unique()
+                sf = sf[_tag_direct_st | sf["leg_group"].isin(_tag_groups_st)]
+            else:
+                sf = sf[_tag_direct_st]
         if isinstance(st_daterange, (list, tuple)) and len(st_daterange) == 2:
             start, end = pd.Timestamp(st_daterange[0]), pd.Timestamp(st_daterange[1])
             dc   = "exit_date" if st_date_col == "Exit Date" else "entry_date"
@@ -5891,6 +6310,14 @@ elif page == "📊  Statistics":
                     rep = legs.iloc[0].copy()
                     rep["_pnl"]  = agg_pnl
                     rep["_date"] = agg_date
+                    # Merge tags from all legs so the aggregated row is fully tagged
+                    _merged_tags = ", ".join(sorted({
+                        t.strip()
+                        for ts in legs["tags"].dropna()
+                        for t in str(ts).split(",")
+                        if t.strip()
+                    }))
+                    rep["tags"] = _merged_tags or None
                     grouped_rows.append(rep)
                 if grouped_rows:
                     multi_grps = {r["leg_group"] for r in grouped_rows}
@@ -6332,37 +6759,236 @@ elif page == "🏷️  Tags":
     tag_list = _cached_load_tags(st.session_state["_v_tags"])
 
     # ── Clear All button ──────────────────────────────────────────────────────
-    if tag_list:
-        _clr_col, _ = st.columns([1, 4])
-        with _clr_col:
-            with st.popover("🗑️  Clear All Tags", width='stretch'):
-                st.warning("This will permanently delete **all tags** and remove them from all trades.", icon="⚠️")
-                if st.button("Yes, delete all tags", type="primary", width='stretch', key="confirm_clear_tags"):
-                    clear_all_tags()
+    _tag_tab_manage, _tag_tab_bulk = st.tabs(["🏷️  Manage Tags", "📋  Bulk Tag Editor"])
+
+    # ── Tab 1: Manage Tags (existing behaviour) ───────────────────────────────
+    with _tag_tab_manage:
+        if tag_list:
+            _clr_col, _ = st.columns([1, 4])
+            with _clr_col:
+                with st.popover("🗑️  Clear All Tags", width='stretch'):
+                    st.warning("This will permanently delete **all tags** and remove them from all trades.", icon="⚠️")
+                    if st.button("Yes, delete all tags", type="primary", width='stretch', key="confirm_clear_tags"):
+                        clear_all_tags()
+                        st.rerun()
+
+        if tag_list:
+            st.markdown("#### Existing Tags")
+            for tag in tag_list:
+                editing = st.session_state.get(f"_edit_tag_{tag['id']}", False)
+                if editing:
+                    with st.form(key=f"edit_tag_form_{tag['id']}"):
+                        ef1, ef2 = st.columns([2, 3])
+                        edited_name = ef1.text_input("Name", value=tag["name"], key=f"et_name_{tag['id']}")
+                        edited_desc = ef2.text_input("Description", value=tag["description"] or "", key=f"et_desc_{tag['id']}")
+                        sb1, sb2 = st.columns(2)
+                        if sb1.form_submit_button("Save", type="primary", use_container_width=True):
+                            if edited_name.strip():
+                                update_tag(tag["id"], edited_name, edited_desc)
+                                st.session_state[f"_edit_tag_{tag['id']}"] = False
+                                st.rerun()
+                            else:
+                                st.error("Name is required.")
+                        if sb2.form_submit_button("Cancel", use_container_width=True):
+                            st.session_state[f"_edit_tag_{tag['id']}"] = False
+                            st.rerun()
+                else:
+                    tc1, tc2, tc3 = st.columns([5, 1, 1])
+                    tc1.markdown(f"**{tag['name']}**  \n{tag['description'] or ''}")
+                    if tc2.button("✎", key=f"edit_tag_{tag['id']}", help="Edit tag"):
+                        st.session_state[f"_edit_tag_{tag['id']}"] = True
+                        st.rerun()
+                    with tc3.popover("✕", help="Delete tag"):
+                        st.warning(f"Delete **{tag['name']}**? It will be removed from all trades.", icon="⚠️")
+                        if st.button("Yes, delete", type="primary",
+                                     key=f"confirm_del_tag_{tag['id']}", width='stretch'):
+                            delete_tag(tag["id"])
+                            st.rerun()
+            st.divider()
+        else:
+            st.info("No tags yet.")
+
+        st.markdown("#### Add New Tag")
+        with st.form("add_tag", clear_on_submit=True):
+            new_tag_name = st.text_input("Name", placeholder="e.g. Breakout")
+            new_tag_desc = st.text_area("Description", placeholder="e.g. Range breakout momentum plays", height=80)
+            if st.form_submit_button("Add Tag", width='stretch'):
+                if new_tag_name.strip():
+                    add_tag(new_tag_name, new_tag_desc)
                     st.rerun()
+                else:
+                    st.error("Name is required.")
 
-    if tag_list:
-        st.markdown("#### Existing Tags")
-        for tag in tag_list:
-            tc1, tc2 = st.columns([5, 1])
-            tc1.markdown(f"**{tag['name']}**  \n{tag['description'] or ''}")
-            if tc2.button("✕", key=f"del_tag_{tag['id']}", help="Delete tag"):
-                delete_tag(tag["id"])
-                st.rerun()
-        st.divider()
-    else:
-        st.info("No tags yet.")
+    # ── Tab 2: Bulk Tag Editor ────────────────────────────────────────────────
+    with _tag_tab_bulk:
+        if not tag_list:
+            st.info("No tags defined yet — add tags on the **Manage Tags** tab first.")
+        else:
+            st.caption(
+                "Toggle checkboxes to add or remove tags across many trades at once. "
+                "Nothing is saved until you click **Save Changes**."
+            )
 
-    st.markdown("#### Add New Tag")
-    with st.form("add_tag", clear_on_submit=True):
-        new_tag_name = st.text_input("Name", placeholder="e.g. Breakout")
-        new_tag_desc = st.text_area("Description", placeholder="e.g. Range breakout momentum plays", height=80)
-        if st.form_submit_button("Add Tag", width='stretch'):
-            if new_tag_name.strip():
-                add_tag(new_tag_name, new_tag_desc)
-                st.rerun()
+            # Filters
+            _be_f1, _be_f2, _be_f3 = st.columns([1, 2, 2])
+            _be_status  = _be_f1.selectbox("Status", ["All", "Open", "Closed"], key="be_status")
+            _be_ticker  = _be_f2.text_input("Ticker", placeholder="Filter by ticker…", key="be_ticker").strip().upper()
+            _be_tag_sel = _be_f3.selectbox(
+                "Show only trades tagged with…",
+                ["(all trades)"] + [t["name"] for t in tag_list],
+                key="be_tag_filter",
+            )
+            _be_untagged_only = st.checkbox("Untagged trades only", key="be_untagged_only", value=False)
+
+            # Load + filter
+            _be_all = _cached_load_trades(st.session_state["_v_trades"]).copy()
+            _be_all = _be_all.reset_index(drop=True)
+
+            if _be_status == "Open":
+                _be_all = _be_all[_be_all.apply(_is_open, axis=1)].reset_index(drop=True)
+            elif _be_status == "Closed":
+                _be_all = _be_all[~_be_all.apply(_is_open, axis=1)].reset_index(drop=True)
+
+            if _be_ticker:
+                _be_all = _be_all[_be_all["ticker"].str.upper() == _be_ticker].reset_index(drop=True)
+
+            # Tag-presence filter: read trade_tags once
+            with get_connection() as _be_conn:
+                _be_tt_rows = _be_conn.execute("SELECT trade_id, tag_id FROM trade_tags").fetchall()
+            _be_all_tt: dict = {}
+            for _r in _be_tt_rows:
+                _be_all_tt.setdefault(_r[0], set()).add(_r[1])
+
+            if _be_untagged_only:
+                # A spread is "untagged" when none of its legs have any tag
+                def _is_untagged(tid):
+                    return not _be_all_tt.get(tid)
+                _be_direct_untag = _be_all["id"].map(_is_untagged)
+                if "leg_group" in _be_all.columns:
+                    # For spreads: include all legs only when ALL legs are untagged
+                    _be_tagged_grps = _be_all.loc[
+                        ~_be_direct_untag & _be_all["leg_group"].notna() & (_be_all["leg_group"].astype(str) != ""),
+                        "leg_group",
+                    ].unique()
+                    _be_all = _be_all[
+                        _be_direct_untag & ~_be_all["leg_group"].isin(_be_tagged_grps)
+                    ].reset_index(drop=True)
+                else:
+                    _be_all = _be_all[_be_direct_untag].reset_index(drop=True)
+
+            if _be_tag_sel != "(all trades)":
+                _be_filter_tag_id = next((t["id"] for t in tag_list if t["name"] == _be_tag_sel), None)
+                if _be_filter_tag_id:
+                    _be_direct = _be_all["id"].map(lambda tid: _be_filter_tag_id in _be_all_tt.get(tid, set()))
+                    if "leg_group" in _be_all.columns:
+                        _be_matched_grps = _be_all.loc[
+                            _be_direct & _be_all["leg_group"].notna() & (_be_all["leg_group"].astype(str) != ""),
+                            "leg_group",
+                        ].unique()
+                        _be_all = _be_all[_be_direct | _be_all["leg_group"].isin(_be_matched_grps)].reset_index(drop=True)
+                    else:
+                        _be_all = _be_all[_be_direct].reset_index(drop=True)
+
+            if _be_all.empty:
+                st.info("No trades match the current filters.")
             else:
-                st.error("Name is required.")
+                # Build display rows, collapsing spread legs into a single row per group
+                _has_lg = "leg_group" in _be_all.columns
+                # Pre-build group map so the loop never does per-row filtering
+                _be_grp_map: dict[str, pd.DataFrame] = {}
+                if _has_lg:
+                    for _gk, _gdf in _be_all.groupby("leg_group", dropna=True):
+                        _be_grp_map[str(_gk)] = _gdf
+
+                _be_trade_id_groups: list[list[int]] = []  # one list of IDs per display row
+                _be_rows = []
+                _seen_groups: set = set()
+
+                for _, _r in _be_all.iterrows():
+                    _lg_raw = _r.get("leg_group") if _has_lg else None
+                    _lg = str(_lg_raw).strip() if (_lg_raw is not None and not pd.isna(_lg_raw)) else ""
+                    if _lg and _lg in _be_grp_map and _lg not in _seen_groups:
+                        _seen_groups.add(_lg)
+                        _legs    = _be_grp_map[_lg]
+                        _leg_ids = _legs["id"].tolist()
+                        _stype   = str(_legs.iloc[0].get("spread_type") or "").strip()
+                        _tickers = "/".join(dict.fromkeys(_legs["ticker"].dropna().tolist()))
+                        _row = {
+                            "Date":   str(_legs["entry_date"].dropna().min() or ""),
+                            "Ticker": _tickers,
+                            "Type":   "Spread",
+                            "Status": "Open" if any(_legs.apply(_is_open, axis=1)) else "Closed",
+                            "Detail": _stype if _stype else f"{len(_legs)}-leg",
+                        }
+                        # Checkbox = True only when ALL legs carry the tag (consistent state)
+                        _tset_inter = set.intersection(*[_be_all_tt.get(_lid, set()) for _lid in _leg_ids])
+                        for _t in tag_list:
+                            _row[_t["name"]] = _t["id"] in _tset_inter
+                        _be_trade_id_groups.append(_leg_ids)
+                        _be_rows.append(_row)
+                    elif not _lg:
+                        _tid_s = _r["id"]
+                        _itype = str(_r.get("instrument_type") or "stock").lower()
+                        _detail = ""
+                        if _itype == "option":
+                            _exp  = str(_r.get("expiration") or "")
+                            _strk = _r.get("strike")
+                            _ot   = str(_r.get("option_type") or "").upper()[:1]
+                            _detail = f"{_exp} ${_strk:.0f}{_ot}" if _strk else _exp
+                        _row = {
+                            "Date":   str(_r.get("entry_date") or ""),
+                            "Ticker": _r["ticker"],
+                            "Type":   {"stock": "Stock", "option": "Option", "future": "Future"}.get(_itype, "Stock"),
+                            "Status": "Open" if _is_open(_r) else "Closed",
+                            "Detail": _detail,
+                        }
+                        for _t in tag_list:
+                            _row[_t["name"]] = _t["id"] in _be_all_tt.get(_tid_s, set())
+                        _be_trade_id_groups.append([_tid_s])
+                        _be_rows.append(_row)
+                    # else: already emitted this leg_group — skip
+
+                _be_display = pd.DataFrame(_be_rows)
+                _n_spreads  = sum(1 for g in _be_trade_id_groups if len(g) > 1)
+                _be_caption = f"{len(_be_rows)} entr{'ies' if len(_be_rows) != 1 else 'y'} shown"
+                if _n_spreads:
+                    _be_caption += f" ({_n_spreads} spread{'s' if _n_spreads != 1 else ''} collapsed — tags apply to all legs)"
+                st.caption(_be_caption + ".")
+
+                _be_edited = st.data_editor(
+                    _be_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=["Date", "Ticker", "Type", "Status", "Detail"],
+                    column_config={
+                        _t["name"]: st.column_config.CheckboxColumn(_t["name"], default=False)
+                        for _t in tag_list
+                    },
+                    key=f"bulk_tag_editor_{_be_status}_{_be_ticker}_{_be_tag_sel}",
+                )
+
+                if st.button("💾  Save Changes", type="primary", key="be_save"):
+                    with st.spinner("Saving…"):
+                        _be_changes = 0
+                        for _ri, _erow in _be_edited.iterrows():
+                            for _tid in _be_trade_id_groups[_ri]:
+                                _cur = _be_all_tt.get(_tid, set())
+                                for _t in tag_list:
+                                    _was = _t["id"] in _cur
+                                    _now = bool(_erow.get(_t["name"], False))
+                                    if _was and not _now:
+                                        remove_tag_from_trade(_tid, _t["id"])
+                                        _be_changes += 1
+                                    elif not _was and _now:
+                                        add_tag_to_trade(_tid, _t["id"])
+                                        _be_changes += 1
+                        _cached_load_trades.clear()
+                        _bust("_v_trades")
+                    if _be_changes:
+                        st.toast(f"Saved — {_be_changes} tag assignment(s) updated.", icon="✅")
+                        st.rerun()
+                    else:
+                        st.info("No changes detected.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6886,6 +7512,38 @@ elif page == "🔗  Broker Sync":
                     _flex_closed   = 0
                     for _i, _ftd in enumerate(_flex_trades):
                         try:
+                            # Close-only: open fill was outside the Flex date range.
+                            # Find the existing open trade by ticker+qty and close it.
+                            if _ftd.get("close_only"):
+                                _co_match = find_open_trade_by_ticker_qty(
+                                    _ftd.get("ticker", ""),
+                                    _ftd.get("quantity"),
+                                    _ftd.get("instrument_type", "stock"),
+                                    _ftd.get("expiration"),
+                                    _ftd.get("strike"),
+                                )
+                                if _co_match:
+                                    update_trade(
+                                        _co_match,
+                                        exit_date=_ftd["exit_date"],
+                                        exit_price=_ftd["exit_price"],
+                                        notes=_ftd.get("notes"),
+                                        current_stop=None,
+                                        stop_enabled=False,
+                                        tag_ids=[],
+                                    )
+                                    _flex_closed += 1
+                                else:
+                                    _flex_errors.append(
+                                        f"{_ftd.get('ticker','?')}: close fill found "
+                                        f"but no matching open trade (qty {_ftd.get('quantity')})"
+                                    )
+                                _done    = _i + 1
+                                _elapsed = _t.time() - _start
+                                _eta     = (_elapsed / _done) * (_total - _done)
+                                _prog.progress(_done / _total, text=f"Importing {_done}/{_total} — {_ftd.get('ticker','')}")
+                                _eta_txt.caption(f"Elapsed: {_elapsed:.1f}s  ·  ETA: {_eta:.0f}s remaining")
+                                continue
                             if is_duplicate_trade(
                                 _ftd.get("ticker", ""),
                                 _ftd.get("entry_date"),

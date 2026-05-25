@@ -619,18 +619,82 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
         ])
         buckets[key].append(f)
 
+    def _split_cycles(fills: list[dict]) -> list[list[dict]]:
+        """Split an ordered fill list into trade cycles.
+
+        A cycle ends when the running net quantity returns to zero (position
+        fully closed).  Each cycle becomes one trade record, so re-entries in
+        the same ticker across different dates are not blended together.
+        """
+        cycles: list[list[dict]] = []
+        current: list[dict] = []
+        net = 0.0
+        for f in fills:  # already sorted by datetime
+            current.append(f)
+            if f["open_close"] == "O":
+                net += f["quantity"]
+            else:
+                net -= f["quantity"]
+            if abs(net) < 0.001:  # position fully closed → end of cycle
+                cycles.append(current)
+                current, net = [], 0.0
+        if current:
+            cycles.append(current)
+        return cycles
+
     trades: list[dict] = []
-    for key, bucket_fills in buckets.items():
+    for key, all_bucket_fills in buckets.items():
+      for bucket_fills in _split_cycles(all_bucket_fills):
         open_fills  = [f for f in bucket_fills if f["open_close"] == "O"]
-        close_fills = [f for f in bucket_fills if f["open_close"] == "C"]
+        # "C;O" = IB roll fill (closes existing lot, opens new one same session) — treat as close
+        close_fills = [f for f in bucket_fills if f["open_close"] in ("C", "C;O")]
 
         if not open_fills:
             if not close_fills:
                 continue
-            # IB sometimes tags combo leg fills as "C" even for new positions.
-            # If no open fills exist, treat all fills as the opening entry.
-            open_fills  = close_fills
-            close_fills = []
+            _itype_co = close_fills[0]["instrument_type"]
+            if _itype_co == "option":
+                # Options combo legs: IB sometimes tags new-position fills as "C".
+                # Treat as opening fills (legacy behaviour).
+                open_fills  = close_fills
+                close_fills = []
+            else:
+                # Stock/future: the open fill is outside the Flex date range.
+                # Return a close_only record — the importer will find and update
+                # the matching open trade in the log without needing entry details.
+                _co_qty   = sum(f["quantity"] for f in close_fills)
+                _co_price = (sum(f["quantity"] * f["price"] for f in close_fills) / _co_qty
+                             if _co_qty else 0)
+                _co_comm  = sum(f["commission"] for f in close_fills)
+                _co_pnl   = sum(f["fifo_pnl"] for f in close_fills)
+                _co_notes = ["Imported via Flex Query (close fill — open outside date range)"]
+                if _co_comm:
+                    _co_notes.append(f"Commission: ${_co_comm:.4f}")
+                if _co_pnl:
+                    _co_notes.append(f"FIFO P&L: ${_co_pnl:.2f}")
+                trades.append({
+                    "entry_date":      None,
+                    "ticker":          close_fills[0]["ticker"],
+                    "quantity":        _co_qty,
+                    "entry_price":     None,
+                    "exit_date":       _to_date(close_fills[-1]["date"]),
+                    "exit_price":      round(_co_price, 6) if _co_price else None,
+                    "notes":           " | ".join(_co_notes),
+                    "stop_enabled":    False,
+                    "opening_stop":    None,
+                    "current_stop":    None,
+                    "tag_ids":         [],
+                    "instrument_type": _itype_co,
+                    "expiration":      close_fills[0]["expiration"],
+                    "strike":          close_fills[0]["strike"],
+                    "option_type":     close_fills[0]["option_type"],
+                    "multiplier":      close_fills[0]["multiplier"],
+                    "side":            close_fills[0]["side"],
+                    "leg_group":       None,
+                    "leg_label":       None,
+                    "close_only":      True,
+                })
+                continue
 
         # Aggregate open fills → one entry (weighted-average price, sum qty)
         total_open_qty   = sum(f["quantity"] for f in open_fills)

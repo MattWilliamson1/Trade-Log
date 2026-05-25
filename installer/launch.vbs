@@ -8,7 +8,7 @@ Set FSO    = CreateObject("Scripting.FileSystemObject")
 script_dir = FSO.GetParentFolderName(WScript.ScriptFullName) & "\"
 python_exe = script_dir & ".venv\Scripts\python.exe"
 app_py     = script_dir & "app.py"
-port       = 8502
+port       = 8501
 
 ' ── Sanity check ────────────────────────────────────────────────────────────
 If Not FSO.FileExists(python_exe) Then

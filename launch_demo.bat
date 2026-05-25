@@ -10,5 +10,5 @@ if errorlevel 1 (
 )
 
 set TRADELOG_DB=%~dp0demo\tradelog_demo.db
-python -m streamlit run app.py
+python -m streamlit run app.py --server.port 8502
 pause
