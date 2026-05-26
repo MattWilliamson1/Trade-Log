@@ -1,14 +1,52 @@
-name: Build & Release
+name: Test & Release
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  # ── Run on every push and every PR ──────────────────────────────────────────
+  test:
+    name: Install test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # report all three OSes even if one fails
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile app.py db.py ib_client.py
+
+      - name: Smoke-test library imports
+        run: python -c "import streamlit, pandas, numpy, plotly, yfinance, openpyxl, PIL, ib_insync, nest_asyncio; print('All imports OK')"
+
+      - name: Smoke-test DB init
+        run: python -c "from db import init_db; init_db(); print('DB init OK')"
+
+  # ── Build and publish only on push to main, only if all tests passed ────────
   build:
+    name: Build & Release (Windows)
+    needs: test
+    if: github.event_name == 'push'
     runs-on: windows-latest
 
     steps:
