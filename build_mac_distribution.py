@@ -135,7 +135,7 @@ INFO_PLIST = """\
 </plist>
 """
 
-SOURCE_FILES = ["app.py", "db.py", "ib_client.py", "requirements.txt"]
+SOURCE_FILES = ["app.py", "db.py", "ib_client.py", "updater.py", "requirements.txt", "VERSION"]
 
 
 def add_str(tar: tarfile.TarFile, arcname: str, content: str, mode: int = 0o644) -> None:

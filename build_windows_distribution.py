@@ -40,7 +40,9 @@ ROOT_FILES = [
     "app.py",
     "db.py",
     "ib_client.py",
+    "updater.py",
     "requirements.txt",
+    "VERSION",
 ]
 
 # Flat files from installer/

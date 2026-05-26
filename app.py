@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 from pathlib import Path
 from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
 import ib_client as _ib_mod
+import updater as _upd
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
@@ -59,6 +60,167 @@ DEFAULT_SETTINGS = {
     "ib_use_live_prices":   "0",
     "ib_auto_sync_balance": "0",
     "ib_auto_connect":      "0",
+    # Theme
+    "app_theme":            "ocean_dark",
+}
+
+# ── App themes ────────────────────────────────────────────────────────────────
+THEMES: dict[str, dict] = {
+    "ocean_dark": {
+        "label":          "🌊  Ocean Dark",
+        "bg_main":        "#131929",
+        "bg_sidebar":     "#1a2236",
+        "bg_card":        "#1e2a40",
+        "bg_input":       "#131929",
+        "bg_select":      "#252a36",
+        "bg_expander":    "#1a2236",
+        "bg_menu":        "#1e222d",
+        "bg_form":        "#1a2236",
+        "border":         "#252f45",
+        "border_input":   "#2e3a50",
+        "accent":         "#4e8ef7",
+        "text_primary":   "#c8cfe0",
+        "text_secondary": "#8fa4c8",
+        "text_dim":       "#7a90b0",
+        "text_heading":   "#c8cfe0",
+        "text_metric":    "#e0e8f5",
+        "hr":             "#252f45",
+        "tag_bg":         "#363c48",
+        "nav_hover_bg":   "#1f2d46",
+        "nav_hover_text": "#c8cfe0",
+        "nav_active_bg":  "#1e3566",
+        "nav_active_text":"#ffffff",
+        "option_hover":   "#30363f",
+        "chart_bg":       "#1e2535",
+        "chart_grid":     "#2e3a50",
+        "chart_font":     "#c8cfe0",
+        "chart_legend":   "#252d3f",
+        "chart_legend_font": "#c8cfe0",
+    },
+    "midnight": {
+        "label":          "🌑  Midnight",
+        "bg_main":        "#0a0a0f",
+        "bg_sidebar":     "#111118",
+        "bg_card":        "#16161f",
+        "bg_input":       "#0a0a0f",
+        "bg_select":      "#1c1c27",
+        "bg_expander":    "#111118",
+        "bg_menu":        "#16161f",
+        "bg_form":        "#111118",
+        "border":         "#2a2a3d",
+        "border_input":   "#2a2a3d",
+        "accent":         "#9b59b6",
+        "text_primary":   "#d4d4e8",
+        "text_secondary": "#8888aa",
+        "text_dim":       "#666688",
+        "text_heading":   "#d4d4e8",
+        "text_metric":    "#e8e8f5",
+        "hr":             "#2a2a3d",
+        "tag_bg":         "#2a2a3d",
+        "nav_hover_bg":   "#1e1e2e",
+        "nav_hover_text": "#d4d4e8",
+        "nav_active_bg":  "#2d1b69",
+        "nav_active_text":"#bb86fc",
+        "option_hover":   "#252535",
+        "chart_bg":       "#0f0f18",
+        "chart_grid":     "#2a2a3d",
+        "chart_font":     "#d4d4e8",
+        "chart_legend":   "#16161f",
+        "chart_legend_font": "#d4d4e8",
+    },
+    "forest": {
+        "label":          "🌲  Forest",
+        "bg_main":        "#0d1a0f",
+        "bg_sidebar":     "#122016",
+        "bg_card":        "#172a1c",
+        "bg_input":       "#0d1a0f",
+        "bg_select":      "#1c2d20",
+        "bg_expander":    "#122016",
+        "bg_menu":        "#172a1c",
+        "bg_form":        "#122016",
+        "border":         "#1e3d25",
+        "border_input":   "#2a4d32",
+        "accent":         "#2ecc71",
+        "text_primary":   "#c0d8c4",
+        "text_secondary": "#7aa880",
+        "text_dim":       "#5a8860",
+        "text_heading":   "#c0d8c4",
+        "text_metric":    "#d8f0dc",
+        "hr":             "#1e3d25",
+        "tag_bg":         "#1e3d25",
+        "nav_hover_bg":   "#1a3020",
+        "nav_hover_text": "#c0d8c4",
+        "nav_active_bg":  "#0d3318",
+        "nav_active_text":"#2ecc71",
+        "option_hover":   "#1c321e",
+        "chart_bg":       "#0f1f12",
+        "chart_grid":     "#1e3d25",
+        "chart_font":     "#c0d8c4",
+        "chart_legend":   "#172a1c",
+        "chart_legend_font": "#c0d8c4",
+    },
+    "light": {
+        "label":          "☀️  Light",
+        "bg_main":        "#f5f7fa",
+        "bg_sidebar":     "#e8ecf4",
+        "bg_card":        "#ffffff",
+        "bg_input":       "#ffffff",
+        "bg_select":      "#ffffff",
+        "bg_expander":    "#ffffff",
+        "bg_menu":        "#ffffff",
+        "bg_form":        "#ffffff",
+        "border":         "#d0d8e8",
+        "border_input":   "#c0ccd8",
+        "accent":         "#2563eb",
+        "text_primary":   "#1a1f2e",
+        "text_secondary": "#4a5568",
+        "text_dim":       "#6b7280",
+        "text_heading":   "#1a1f2e",
+        "text_metric":    "#1a1f2e",
+        "hr":             "#d0d8e8",
+        "tag_bg":         "#e2e8f0",
+        "nav_hover_bg":   "#dde5f0",
+        "nav_hover_text": "#1a1f2e",
+        "nav_active_bg":  "#dbeafe",
+        "nav_active_text":"#1e40af",
+        "option_hover":   "#f0f4ff",
+        "chart_bg":       "#ffffff",
+        "chart_grid":     "#e2e8f0",
+        "chart_font":     "#1a1f2e",
+        "chart_legend":   "#f8fafc",
+        "chart_legend_font": "#1a1f2e",
+    },
+    "warm_sand": {
+        "label":          "🏖️  Warm Sand",
+        "bg_main":        "#faf7f0",
+        "bg_sidebar":     "#f0ebe0",
+        "bg_card":        "#fffdf7",
+        "bg_input":       "#fffdf7",
+        "bg_select":      "#fffdf7",
+        "bg_expander":    "#fdf9f2",
+        "bg_menu":        "#fffdf7",
+        "bg_form":        "#fdf9f2",
+        "border":         "#ddd0bc",
+        "border_input":   "#c8b89a",
+        "accent":         "#c0622a",
+        "text_primary":   "#3d2c1a",
+        "text_secondary": "#6b5040",
+        "text_dim":       "#8a7060",
+        "text_heading":   "#3d2c1a",
+        "text_metric":    "#2a1c0a",
+        "hr":             "#ddd0bc",
+        "tag_bg":         "#ede0cc",
+        "nav_hover_bg":   "#e8dcc8",
+        "nav_hover_text": "#3d2c1a",
+        "nav_active_bg":  "#fde8cc",
+        "nav_active_text":"#c0622a",
+        "option_hover":   "#f5ede0",
+        "chart_bg":       "#fdf9f2",
+        "chart_grid":     "#e8dcc8",
+        "chart_font":     "#3d2c1a",
+        "chart_legend":   "#f5efe0",
+        "chart_legend_font": "#3d2c1a",
+    },
 }
 
 DEFAULT_COLS = [
@@ -166,6 +328,62 @@ def fmt_num(v, decimals: int = 2) -> str:
 
 # ── Instrument helpers ─────────────────────────────────────────────────────────
 
+# IB exchange code → Yahoo Finance ticker suffix for non-US markets.
+# US exchanges (NYSE, NASDAQ, ARCA, SMART, etc.) are omitted — no suffix needed.
+_IB_EXCHANGE_TO_YF: dict[str, str] = {
+    "IBIS":     ".DE",   # Xetra (Germany)
+    "IBIS2":    ".DE",
+    "FWB":      ".DE",   # Frankfurt
+    "LSE":      ".L",    # London Stock Exchange
+    "LSEETF":   ".L",
+    "AEB":      ".AS",   # Euronext Amsterdam
+    "SBF":      ".PA",   # Euronext Paris
+    "BVME":     ".MI",   # Borsa Italiana
+    "ENEXT.BE": ".BR",   # Euronext Brussels
+    "VSE":      ".VI",   # Vienna
+    "VIRTX":    ".SW",   # SIX Swiss Exchange
+    "TSEJ":     ".T",    # Tokyo Stock Exchange
+    "HKEX":     ".HK",   # Hong Kong
+    "SEHK":     ".HK",
+    "ASX":      ".AX",   # Australian Securities Exchange
+    "TSX":      ".TO",   # Toronto Stock Exchange
+    "VENTURE":  ".V",    # TSX Venture
+    "SGX":      ".SI",   # Singapore
+    "KSE":      ".KS",   # Korea
+}
+
+# Dropdown options for the manual Add Trade form: (IB code, user-facing label).
+# Sorted alphabetically by country. The empty-string entry represents US/default (no suffix).
+_EXCHANGE_OPTIONS: list[tuple[str, str]] = [
+    ("",          "— US / Default"),
+    ("ASX",       "ASX - Australia"),
+    ("VSE",       "VSE - Austria"),
+    ("ENEXT.BE",  "ENEXT.BE - Belgium"),
+    ("TSX",       "TSX - Canada"),
+    ("VENTURE",   "VENTURE - Canada (TSX Venture)"),
+    ("SBF",       "SBF - France"),
+    ("IBIS",      "IBIS - Germany (Xetra)"),
+    ("FWB",       "FWB - Germany (Frankfurt)"),
+    ("HKEX",      "HKEX - Hong Kong"),
+    ("BVME",      "BVME - Italy"),
+    ("TSEJ",      "TSEJ - Japan"),
+    ("AEB",       "AEB - Netherlands"),
+    ("SGX",       "SGX - Singapore"),
+    ("KSE",       "KSE - South Korea"),
+    ("VIRTX",     "VIRTX - Switzerland"),
+    ("LSE",       "LSE - United Kingdom"),
+]
+_EXCHANGE_LABEL: dict[str, str] = {code: label for code, label in _EXCHANGE_OPTIONS}
+
+
+def _yf_symbol(ticker: str, exchange: str = "") -> str:
+    """Return the Yahoo Finance symbol for a ticker, appending the exchange suffix if needed."""
+    suffix = _IB_EXCHANGE_TO_YF.get((exchange or "").upper().strip(), "")
+    if suffix and not ticker.upper().endswith(suffix.upper()):
+        return f"{ticker}{suffix}"
+    return ticker
+
+
 def build_option_symbol(ticker: str, expiration, strike: float, opt_type: str) -> str:
     """OCC-format symbol: AAPL261231C00242500  (strike × 1000, zero-padded to 8 digits)."""
     exp       = pd.to_datetime(expiration)
@@ -174,7 +392,7 @@ def build_option_symbol(ticker: str, expiration, strike: float, opt_type: str) -
 
 
 def _get_live_ticker(row) -> str:
-    """Symbol used for live-price lookup (OCC symbol for options, raw ticker otherwise)."""
+    """Symbol used for live-price lookup (OCC symbol for options, yfinance-suffixed for non-US stocks)."""
     if str(row.get("instrument_type") or "stock").lower() == "option":
         exp    = row.get("expiration")
         strike = row.get("strike")
@@ -182,7 +400,7 @@ def _get_live_ticker(row) -> str:
             return build_option_symbol(
                 row["ticker"], exp, float(strike), row.get("option_type") or "C"
             )
-    return row["ticker"]
+    return _yf_symbol(row["ticker"], row.get("exchange") or "")
 
 
 def _contract_sym(row) -> str:
@@ -385,27 +603,27 @@ def get_highest_high_since(ticker: str, entry_date: str) -> float | None:
 
 
 @st.cache_data(ttl=30)
-def _get_single_live_price(ticker: str) -> float | None:
+def _get_single_live_price(ticker: str, exchange: str = "") -> float | None:
     """Fast single-ticker price lookup for trade-entry forms (30-second cache)."""
     try:
-        p = yf.Ticker(ticker).fast_info.last_price
+        p = yf.Ticker(_yf_symbol(ticker, exchange)).fast_info.last_price
         return float(p) if p else None
     except Exception:
         return None
 
 
 @st.cache_data(ttl=3600)
-def validate_ticker(ticker: str) -> bool:
+def validate_ticker(ticker: str, exchange: str = "") -> bool:
     try:
-        return yf.Ticker(ticker).fast_info.last_price is not None
+        return yf.Ticker(_yf_symbol(ticker, exchange)).fast_info.last_price is not None
     except Exception:
         return False
 
 
 @st.cache_data(ttl=3600)
-def get_ticker_info(ticker: str) -> dict | None:
+def get_ticker_info(ticker: str, exchange: str = "") -> dict | None:
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(_yf_symbol(ticker, exchange)).info
         name = info.get("longName") or info.get("shortName")
         exch = info.get("fullExchangeName") or info.get("exchange")
         return {"name": name, "exchange": exch} if name else None
@@ -414,9 +632,9 @@ def get_ticker_info(ticker: str) -> dict | None:
 
 
 @st.cache_data(ttl=86400)
-def get_ticker_sector(ticker: str) -> str | None:
+def get_ticker_sector(ticker: str, exchange: str = "") -> str | None:
     try:
-        return yf.Ticker(ticker).info.get("sector")
+        return yf.Ticker(_yf_symbol(ticker, exchange)).info.get("sector")
     except Exception:
         return None
 
@@ -1130,7 +1348,7 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
               spread_type=None, commission=0.0, underlying_price_at_entry=None,
               account_name="Default", roll_group=None,
               native_currency="USD", fx_rate_entry=1.0, fx_rate_exit=1.0,
-              trail_type="fixed", trail_amount=None) -> int:
+              trail_type="fixed", trail_amount=None, exchange="") -> int:
     with get_connection() as conn:
         cs = current_stop if current_stop is not None else (opening_stop if stop_enabled else None)
         cur = conn.execute("""
@@ -1141,8 +1359,8 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
                                 multiplier, leg_group, leg_label, side, spread_type,
                                 commission, underlying_price_at_entry, account_name, roll_group,
                                 native_currency, fx_rate_entry, fx_rate_exit,
-                                trail_type, trail_amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                trail_type, trail_amount, exchange)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             entry_date.isoformat() if entry_date else None,
             ticker.upper().strip(),
@@ -1172,6 +1390,7 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
             float(fx_rate_exit)  if fx_rate_exit  else 1.0,
             trail_type or "fixed",
             float(trail_amount) if trail_amount else None,
+            exchange or "",
         ))
         trade_id = cur.lastrowid
         for tid in tag_ids:
@@ -1780,6 +1999,15 @@ for _ck in ("_v_trades", "_v_settings", "_v_tags", "_v_accounts", "_v_equity", "
 settings   = _cached_get_settings(st.session_state["_v_settings"])
 today_ts   = pd.Timestamp.today().normalize()
 euro_dates = settings.get("euro_dates", "0") == "1"
+
+# ── Active theme + chart color shorthands ─────────────────────────────────────
+_theme_key    = settings.get("app_theme", "ocean_dark")
+_TH           = THEMES.get(_theme_key, THEMES["ocean_dark"])
+_CHT_BG       = _TH["chart_bg"]
+_CHT_GRID     = _TH["chart_grid"]
+_CHT_FONT     = _TH["chart_font"]
+_CHT_LEG      = _TH["chart_legend"]
+_CHT_LEG_FONT = _TH["chart_legend_font"]
 app_mode   = settings.get("app_mode", "demo")   # "demo" | "live"
 is_demo    = app_mode != "live"
 # Demo: use saved setting (default 0). Live: 0 until a broker pull is done this session.
@@ -2049,6 +2277,83 @@ button[kind="primary"] {
 </style>
 """, unsafe_allow_html=True)
 
+# ── Theme override CSS (applied on top of the base dark styles above) ──────────
+def _build_theme_css(t: dict) -> str:
+    return f"""
+<style>
+[data-testid="stAppViewContainer"]  {{ background: {t['bg_main']} !important; }}
+section[data-testid="stMain"]       {{ background: {t['bg_main']} !important; }}
+[data-testid="stSidebar"]           {{ background: {t['bg_sidebar']} !important; border-right-color: {t['border']} !important; }}
+
+[data-testid="stSidebar"] h1 {{ color: {t['accent']} !important; border-bottom-color: {t['border']} !important; }}
+[data-testid="stSidebar"] .stButton button {{ color: {t['text_secondary']} !important; background: transparent !important; }}
+[data-testid="stSidebar"] .stButton button:hover {{ background: {t['nav_hover_bg']} !important; color: {t['nav_hover_text']} !important; }}
+[data-testid="stSidebar"] .stButton button[kind="primary"] {{ background: {t['nav_active_bg']} !important; color: {t['nav_active_text']} !important; }}
+
+[data-testid="stExpander"] {{ background: {t['bg_expander']} !important; border-color: {t['border']} !important; }}
+[data-testid="stExpander"] summary {{ color: {t['text_secondary']} !important; }}
+[data-testid="stExpander"] summary svg {{ fill: {t['text_secondary']} !important; }}
+
+[data-testid="stMetric"] {{ background: {t['bg_card']} !important; border-color: {t['border']} !important; }}
+[data-testid="stMetric"] label {{ color: {t['text_dim']} !important; }}
+[data-testid="stMetricValue"] {{ color: {t['text_metric']} !important; }}
+
+h4, h5 {{ color: {t['text_heading']} !important; }}
+hr {{ border-color: {t['hr']} !important; }}
+.stMarkdown p, p {{ color: {t['text_primary']}; }}
+[data-testid="stCaptionContainer"] p {{ color: {t['text_dim']} !important; }}
+[data-testid="stWidgetLabel"] p {{ color: {t['text_secondary']} !important; }}
+[data-testid="stRadio"] label p,
+[data-testid="stCheckbox"] label p {{ color: {t['text_primary']} !important; }}
+
+[data-testid="stForm"] {{ background: {t['bg_form']} !important; border-color: {t['border']} !important; }}
+input, textarea, select,
+[data-baseweb="input"] > div,
+[data-baseweb="textarea"] > div {{
+    background: {t['bg_input']} !important;
+    border-color: {t['border_input']} !important;
+    color: {t['text_primary']} !important;
+}}
+
+[data-baseweb="select"] > div:first-child {{
+    background-color: {t['bg_select']} !important;
+    border-color: {t['border_input']} !important;
+}}
+[data-baseweb="select"] > div:first-child > div,
+[data-baseweb="select"] > div:first-child > div > div,
+[data-baseweb="select"] > div:first-child > div > div > div,
+[data-baseweb="select"] input,
+[data-baseweb="input"],
+[data-baseweb="base-input"] {{
+    background-color: {t['bg_select']} !important;
+    background: {t['bg_select']} !important;
+}}
+[data-baseweb="select"] span,
+[data-baseweb="select"] [class*="singleValue"],
+[data-baseweb="select"] [class*="placeholder"] {{ color: {t['text_primary']} !important; }}
+[data-baseweb="menu"] {{
+    background-color: {t['bg_menu']} !important;
+    border-color: {t['border_input']} !important;
+}}
+[data-baseweb="option"] {{ color: {t['text_primary']} !important; background: transparent !important; }}
+[data-baseweb="option"]:hover,
+[data-baseweb="option"][aria-selected="true"] {{
+    background-color: {t['option_hover']} !important;
+    color: {t['text_primary']} !important;
+}}
+[data-baseweb="tag"] {{ background-color: {t['tag_bg']} !important; color: {t['text_primary']} !important; }}
+
+[data-testid="stDataFrame"] {{ border-color: {t['border']} !important; }}
+[data-testid="stTabs"] button {{ color: {t['text_secondary']} !important; }}
+[data-testid="stTabs"] button[aria-selected="true"] {{ color: {t['accent']} !important; border-bottom-color: {t['accent']} !important; }}
+
+[data-testid="stPopover"] > div {{ background: {t['bg_expander']} !important; border-color: {t['border']} !important; }}
+</style>
+"""
+
+if _theme_key != "ocean_dark":
+    st.markdown(_build_theme_css(_TH), unsafe_allow_html=True)
+
 components.html("""
 <script>
 (function() {
@@ -2126,6 +2431,39 @@ with st.sidebar:
                      type="primary" if _active else "secondary"):
             st.session_state["nav_page"] = _p
             st.rerun()
+
+    # ── App updates ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.caption(f"v{_upd.get_local_version()}")
+    if st.button("Check for updates", width="stretch", key="sb_check_updates"):
+        with st.spinner("Checking…"):
+            _remote_ver = _upd.get_remote_version()
+        if _remote_ver is None:
+            st.session_state["_upd_status"] = "error"
+            st.session_state.pop("_upd_remote_ver", None)
+        elif _remote_ver == _upd.get_local_version():
+            st.session_state["_upd_status"] = "current"
+            st.session_state.pop("_upd_remote_ver", None)
+        else:
+            st.session_state["_upd_status"] = "available"
+            st.session_state["_upd_remote_ver"] = _remote_ver
+
+    _upd_status = st.session_state.get("_upd_status")
+    if _upd_status == "error":
+        st.error("Could not reach GitHub.")
+    elif _upd_status == "current":
+        st.success("You're up to date.")
+    elif _upd_status == "available":
+        st.info(f"Update available → {st.session_state.get('_upd_remote_ver', '')}")
+        if st.button("⬇  Install update", width="stretch", key="sb_do_update", type="primary"):
+            with st.spinner("Downloading and installing…"):
+                _ok, _err = _upd.download_updates()
+            if _ok:
+                st.session_state.pop("_upd_status", None)
+                st.session_state.pop("_upd_remote_ver", None)
+                st.rerun()
+            else:
+                st.error(f"Update failed: {_err}")
 
     # ── Live data fetch (sidebar, always docked) ───────────────────────────
     st.markdown("---")
@@ -2253,17 +2591,21 @@ if page == "📋  Trading Log":
             label_visibility="visible",
         )
         _at_ticker = _at_ticker_raw.strip().upper()
+        _at_exchange = st.session_state.get("add_stock_exchange", "") or ""
         if _at_ticker:
-            _at_price = _get_single_live_price(_at_ticker)
+            _at_price = _get_single_live_price(_at_ticker, _at_exchange)
+            _at_yf_sym = _yf_symbol(_at_ticker, _at_exchange)
             if _at_price is not None:
+                _sym_label = f" · via {_at_yf_sym}" if _at_yf_sym != _at_ticker else ""
                 _tlk2.markdown(
                     f"<div style='padding-top:28px;font-size:1rem'>"
-                    f"<b>{_at_ticker}</b> &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
+                    f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
                     f"${_at_price:,.2f}</span></div>",
                     unsafe_allow_html=True,
                 )
             else:
-                _tlk2.caption("No price found — check the ticker symbol.")
+                _sym_hint = f" ({_at_yf_sym})" if _at_yf_sym != _at_ticker else ""
+                _tlk2.caption(f"No price found{_sym_hint} — check the ticker or exchange code.")
 
         with st.form("add_trade", clear_on_submit=True):
             inst   = st.session_state.get("add_inst_type", "Stock")
@@ -2297,6 +2639,13 @@ if page == "📋  Trading Log":
                     stock_account    = ca1.selectbox("Account", options=all_accounts, key="add_stock_acct")
                     stock_commission = ca2.number_input("Commission ($)", min_value=0.0, step=0.01,
                                                         format="%.2f", value=_default_commission, key="add_stock_comm")
+                    stock_exchange = st.selectbox(
+                        "Exchange",
+                        options=[code for code, _ in _EXCHANGE_OPTIONS],
+                        format_func=lambda c: _EXCHANGE_LABEL.get(c, c),
+                        key="add_stock_exchange",
+                        help="Leave as US / Default for NYSE, NASDAQ, and other US exchanges.",
+                    )
                     notes = st.text_area("Notes", height=60)
                     uploaded_files = st.file_uploader(
                         "Attachments", accept_multiple_files=True,
@@ -2420,6 +2769,7 @@ if page == "📋  Trading Log":
                                 fx_rate_exit=_fx_exit,
                                 trail_type=_add_trail_type,
                                 trail_amount=float(_add_trail_amount) if _add_trail_amount else None,
+                                exchange=stock_exchange or "",
                             )
                             for f in (uploaded_files or []):
                                 save_attachment(new_id, f)
@@ -5050,10 +5400,10 @@ elif page == "📈  Equity Curve":
                     yaxis_title=_ytitle, hovermode="x unified",
                     yaxis_tickprefix=_yprefix, yaxis_ticksuffix=_ysuffix,
                     yaxis_tickformat=_yformat,
-                    paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                    font=dict(color="#c8cfe0"),
-                    xaxis=dict(gridcolor="#2e3a50"),
-                    yaxis=dict(gridcolor="#2e3a50"),
+                    paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                    font=dict(color=_CHT_FONT),
+                    xaxis=dict(gridcolor=_CHT_GRID),
+                    yaxis=dict(gridcolor=_CHT_GRID),
                 )
                 st.plotly_chart(fig, width='stretch')
 
@@ -5188,10 +5538,10 @@ elif page == "📈  Equity Curve":
                                         annotation_font_color="#f39c12")
                     _hist_fig.update_layout(
                         xaxis_title="Daily Return (%)", yaxis_title="Days",
-                        paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                        font=dict(color="#c8cfe0"),
-                        xaxis=dict(gridcolor="#2e3a50", ticksuffix="%"),
-                        yaxis=dict(gridcolor="#2e3a50"),
+                        paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                        font=dict(color=_CHT_FONT),
+                        xaxis=dict(gridcolor=_CHT_GRID, ticksuffix="%"),
+                        yaxis=dict(gridcolor=_CHT_GRID),
                         showlegend=False,
                         height=300,
                         margin=dict(t=20, b=40),
@@ -6475,12 +6825,12 @@ elif page == "📊  Statistics":
                     _chart_layout = dict(
                         height=280, showlegend=False,
                         margin=dict(t=40, b=10, l=10, r=10),
-                        paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                        font=dict(color="#c8cfe0"),
+                        paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                        font=dict(color=_CHT_FONT),
                         bargap=0.55,
                         yaxis_tickprefix=_y_prefix, yaxis_ticksuffix=_y_suffix,
                         yaxis_tickformat=_y_fmt,
-                        yaxis=dict(gridcolor="#2e3a50"),
+                        yaxis=dict(gridcolor=_CHT_GRID),
                         xaxis=dict(tickfont=dict(size=12)),
                     )
 
@@ -6566,12 +6916,12 @@ elif page == "📊  Statistics":
                         title="Trade P&L Over Time",
                         xaxis_title="Date", yaxis_title=_sc_y_label,
                         height=300, showlegend=True,
-                        legend=dict(bgcolor="#1a2236", font=dict(size=11)),
+                        legend=dict(bgcolor=_CHT_LEG, font=dict(size=11, color=_CHT_LEG_FONT)),
                         margin=dict(t=36, b=10, l=10, r=10),
-                        paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                        font=dict(color="#c8cfe0"),
-                        xaxis=dict(gridcolor="#2e3a50"),
-                        yaxis=dict(gridcolor="#2e3a50", tickprefix=_sc_tick_pfx,
+                        paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                        font=dict(color=_CHT_FONT),
+                        xaxis=dict(gridcolor=_CHT_GRID),
+                        yaxis=dict(gridcolor=_CHT_GRID, tickprefix=_sc_tick_pfx,
                                    ticksuffix=_sc_tick_sfx, tickformat=_sc_tick_fmt),
                         hovermode="closest",
                     )
@@ -6645,9 +6995,9 @@ elif page == "📊  Statistics":
                             title=f"Sector Breakdown — {_pie_mode}",
                             height=340, showlegend=True,
                             margin=dict(t=40, b=10, l=10, r=10),
-                            paper_bgcolor="#1e2535",
-                            font=dict(color="#c8cfe0"),
-                            legend=dict(bgcolor="#252d3f"),
+                            paper_bgcolor=_CHT_BG,
+                            font=dict(color=_CHT_FONT),
+                            legend=dict(bgcolor=_CHT_LEG),
                         )
                         st.plotly_chart(_fig_pie, width='stretch')
 
@@ -6705,11 +7055,11 @@ elif page == "📊  Statistics":
                             xaxis_title="Trade #", yaxis_title="Ratio",
                             height=340, hovermode="x unified",
                             margin=dict(t=50, b=10),
-                            paper_bgcolor="#1e2535", plot_bgcolor="#1e2535",
-                            font=dict(color="#c8cfe0"),
-                            xaxis=dict(gridcolor="#2e3a50"),
-                            yaxis=dict(gridcolor="#2e3a50"),
-                            legend=dict(bgcolor="#252d3f"),
+                            paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                            font=dict(color=_CHT_FONT),
+                            xaxis=dict(gridcolor=_CHT_GRID),
+                            yaxis=dict(gridcolor=_CHT_GRID),
+                            legend=dict(bgcolor=_CHT_LEG),
                         )
                         st.plotly_chart(_fig_roll, width='stretch')
                         st.caption(
@@ -6749,6 +7099,111 @@ elif page == "📊  Statistics":
                         st.caption("All metrics are daily-annualised (same basis as benchmarks).")
                     else:
                         st.info("Select a date range in the filters above to enable benchmark comparison.")
+
+                # ── Tag comparison table ──────────────────────────────────────
+                st.divider()
+                st.markdown("##### Tag Comparison")
+                _cmp_tag_names = sorted({
+                    t.strip()
+                    for ts in pnl_avail["tags"].dropna()
+                    for t in str(ts).split(",")
+                    if t.strip()
+                })
+                if _cmp_tag_names:
+                    _cmp_rows = []
+                    for _tname in _cmp_tag_names:
+                        _t_mask = pnl_avail["tags"].apply(
+                            lambda ts, tn=_tname: bool(ts) and not pd.isna(ts)
+                            and any(x.strip() == tn for x in str(ts).split(","))
+                        )
+                        _t_df = pnl_avail[_t_mask]
+                        if _t_df.empty:
+                            continue
+                        _t_raw = _t_df["_pnl"].astype(float)
+                        if _pnl_mode in ("%", "Acct. %") and "_pnl_disp" in _t_df.columns:
+                            _t_eff = _t_df["_pnl_disp"].astype(float)
+                        else:
+                            _t_eff = _t_raw
+                        _t_pos = _t_eff[_t_raw > 0]
+                        _t_neg = _t_eff[_t_raw < 0]
+                        _t_n  = len(_t_raw)
+                        _t_nw = int((_t_raw > 0).sum())
+                        _t_wr = _t_nw / _t_n if _t_n else 0
+                        _t_aw = (_trimmed_group_mean(_t_pos.values) if _use_trimmed
+                                 else float(_t_pos.mean()) if not _t_pos.empty else None)
+                        _t_al = (_trimmed_group_mean(_t_neg.values) if _use_trimmed
+                                 else float(_t_neg.mean()) if not _t_neg.empty else None)
+                        _t_mw = float(_t_pos.median()) if not _t_pos.empty else None
+                        _t_ml = float(_t_neg.median()) if not _t_neg.empty else None
+                        _t_lw = float(_t_pos.max())    if not _t_pos.empty else None
+                        _t_ll = float(_t_neg.min())    if not _t_neg.empty else None
+                        _t_ev = (
+                            _t_wr * (_t_aw or 0) + (1 - _t_wr) * (_t_al or 0)
+                            if _t_aw is not None or _t_al is not None else None
+                        )
+                        _t_days = (
+                            pd.to_datetime(_t_df["_date"], errors="coerce")
+                            - pd.to_datetime(_t_df["entry_date"], errors="coerce")
+                        ).dt.days.dropna()
+                        _t_avg_days_v = float(_t_days.mean()) if not _t_days.empty else None
+                        _t_ann_ev     = (
+                            _t_ev * (365 / _t_avg_days_v)
+                            if _t_ev is not None and _t_avg_days_v and _t_avg_days_v > 0
+                            else None
+                        )
+                        _t_total_raw  = float(_t_raw.sum())
+                        _cmp_rows.append({
+                            "Tag":             _tname,
+                            "Trades":          _t_n,
+                            "Win Rate":        f"{_t_wr*100:.1f}%",
+                            "Avg Winner":      _mv(_t_aw),
+                            "Avg Loser":       _mv(_t_al),
+                            "Median Winner":   _mv(_t_mw),
+                            "Median Loser":    _mv(_t_ml),
+                            "Largest Winner":  _mv(_t_lw),
+                            "Largest Loser":   _mv(_t_ll),
+                            "EV / Trade":      _mv(_t_ev) if _t_ev is not None else "N/A",
+                            "Avg Days":        f"{_t_avg_days_v:.1f}" if _t_avg_days_v else "N/A",
+                            "Ann. Return":     _mv(_t_ann_ev) if _t_ann_ev is not None else "N/A",
+                            "Total P&L ($)":   fmt_price(_t_total_raw),
+                            # raw numeric for styling only — excluded from display
+                            "_ev_raw":         _t_ev,
+                            "_pnl_raw":        _t_total_raw,
+                            "_ann_raw":        _t_ann_ev,
+                        })
+                    if _cmp_rows:
+                        _cmp_df = pd.DataFrame(_cmp_rows)
+                        _style_cols = ["EV / Trade", "Ann. Return", "Total P&L ($)"]
+                        _raw_map    = {
+                            "EV / Trade":    "_ev_raw",
+                            "Ann. Return":   "_ann_raw",
+                            "Total P&L ($)": "_pnl_raw",
+                        }
+
+                        def _cmp_color(col_name):
+                            raw_col = _raw_map[col_name]
+                            def _styler(val):
+                                row_idx = _cmp_df.index[_cmp_df[col_name] == val]
+                                if row_idx.empty:
+                                    return ""
+                                raw = _cmp_df.loc[row_idx[0], raw_col]
+                                if raw is None or pd.isna(raw):
+                                    return ""
+                                return "color: #27ae60; font-weight: 600" if raw > 0 else (
+                                    "color: #e74c3c; font-weight: 600" if raw < 0 else ""
+                                )
+                            return _styler
+
+                        _display_df = _cmp_df.drop(columns=["_ev_raw", "_pnl_raw", "_ann_raw"])
+                        _styled = _display_df.style
+                        for _sc in _style_cols:
+                            if _sc in _display_df.columns:
+                                _styled = _styled.map(_cmp_color(_sc), subset=[_sc])
+                        st.dataframe(_styled, hide_index=True, width='stretch')
+                    else:
+                        st.info("No tagged trades in the current filter.")
+                else:
+                    st.info("No tagged trades in the current filter.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7585,6 +8040,7 @@ elif page == "🔗  Broker Sync":
                                     "opening_stop", "tag_ids", "current_stop",
                                     "instrument_type", "expiration", "strike",
                                     "option_type", "multiplier", "leg_group", "leg_label", "side",
+                                    "exchange",
                                 ] if k in _ftd})
                                 _flex_imported += 1
                         except Exception as _e:
@@ -7613,6 +8069,28 @@ elif page == "🔗  Broker Sync":
                             f"{_flex_closed} existing open trade(s) updated with closing data."
                         )
                     st.success(f"Imported {_flex_imported} trade(s).")
+                    # Check which newly-imported non-US tickers can't be resolved on Yahoo Finance.
+                    # Those positions will show no live P&L until a closing price is entered manually.
+                    _unvalidated = []
+                    _seen_for_validation: set = set()
+                    for _ftd in _flex_trades:
+                        if _ftd.get("close_only"):
+                            continue
+                        _vtk  = _ftd.get("ticker", "")
+                        _vexc = _ftd.get("exchange", "")
+                        _vkey = (_vtk, _vexc)
+                        if _vtk and _vexc and _vkey not in _seen_for_validation:
+                            _seen_for_validation.add(_vkey)
+                            if not validate_ticker(_vtk, _vexc):
+                                _unvalidated.append(f"{_vtk} ({_vexc})")
+                    if _unvalidated:
+                        st.warning(
+                            "The following tickers could not be validated on Yahoo Finance — "
+                            "live prices won't be available for these positions. "
+                            "You will need to enter the closing price manually. "
+                            "These trades will be excluded from P&L results until a closing price is recorded.\n\n"
+                            + "\n".join(f"• {t}" for t in _unvalidated)
+                        )
                     st.rerun()
                 if _fc2.button("🗑️  Clear", width='stretch', key="flex_clear"):
                     del st.session_state["_flex_result"]
@@ -7637,6 +8115,27 @@ elif page == "⚙️  Settings":
     s_stop_yellow = float(settings.get("stop_dist_yellow",   5))
     s_stop_red    = float(settings.get("stop_dist_red",      2))
     s_euro        = settings.get("euro_dates", "0") == "1"
+
+    # ── Theme ─────────────────────────────────────────────────────────────────
+    with st.form("settings_theme_form"):
+        st.markdown("#### Theme")
+        _theme_options = list(THEMES.keys())
+        _theme_labels  = [THEMES[k]["label"] for k in _theme_options]
+        _cur_theme_idx = _theme_options.index(_theme_key) if _theme_key in _theme_options else 0
+        _new_theme_idx = st.radio(
+            "App theme",
+            options=range(len(_theme_options)),
+            format_func=lambda i: _theme_labels[i],
+            index=_cur_theme_idx,
+            horizontal=True,
+        )
+        if st.form_submit_button("💾  Save Theme", width='stretch'):
+            set_setting("app_theme", _theme_options[_new_theme_idx])
+            _bust("_v_settings")
+            st.success(f"Theme set to {_theme_labels[_new_theme_idx]}. Reloading…")
+            st.rerun()
+
+    st.divider()
 
     # ── Display ───────────────────────────────────────────────────────────────
     with st.form("settings_display_form"):
