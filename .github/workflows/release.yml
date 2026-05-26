@@ -16,7 +16,7 @@ jobs:
     name: Install test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false   # report all three OSes even if one fails
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
@@ -42,9 +42,9 @@ jobs:
       - name: Smoke-test DB init
         run: python -c "from db import init_db; init_db(); print('DB init OK')"
 
-  # ── Build and publish only on push to main, only if all tests passed ────────
-  build:
-    name: Build & Release (Windows)
+  # ── Build Windows zip (only on push to main, only if tests passed) ──────────
+  build-windows:
+    name: Build (Windows)
     needs: test
     if: github.event_name == 'push'
     runs-on: windows-latest
@@ -75,13 +75,56 @@ jobs:
         shell: pwsh
         run: python build_windows_distribution.py
 
-      - name: Find zip path
-        id: zip
-        shell: pwsh
-        run: |
-          $f = Get-ChildItem "dist\*.zip" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          echo "path=$($f.FullName)" >> $env:GITHUB_OUTPUT
-          echo "name=$($f.Name)"     >> $env:GITHUB_OUTPUT
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/*.zip
+
+  # ── Build Mac tarball (only on push to main, only if tests passed) ──────────
+  build-mac:
+    name: Build (Mac)
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build tarball
+        run: python build_mac_distribution.py
+
+      - name: Upload Mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-dist
+          path: "dist/Trade Log Mac.tar.gz"
+
+  # ── Publish both to one GitHub Release ──────────────────────────────────────
+  publish:
+    name: Publish release
+    needs: [build-windows, build-mac]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/windows
+
+      - name: Download Mac artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-dist
+          path: dist/mac
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -91,11 +134,19 @@ jobs:
           body: |
             ## Latest build
 
+            ### Windows
             **Download the zip below**, extract it, and double-click
             `INSTALL - Double-Click This First.bat`.
 
+            ### Mac
+            **Download the `.tar.gz` below**, double-click it to extract,
+            open the `Trade Log Mac` folder, and double-click `Trade Log.app`.
+            If macOS shows a security warning, right-click the app → Open → Open.
+
             > This release is updated automatically every time an update is pushed.
-          files: ${{ steps.zip.outputs.path }}
+          files: |
+            dist/windows/*.zip
+            dist/mac/*.tar.gz
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
