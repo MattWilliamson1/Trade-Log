@@ -62,6 +62,8 @@ DEFAULT_SETTINGS = {
     "ib_auto_connect":      "0",
     # Theme
     "app_theme":            "ocean_dark",
+    # Onboarding / guided setup tour ("1" once completed or skipped)
+    "onboarding_done":      "0",
 }
 
 # ── App themes ────────────────────────────────────────────────────────────────
@@ -1988,6 +1990,12 @@ st.set_page_config(page_title="Trade Log", layout="wide")
 if not st.session_state.get("_db_ready"):
     init_db()
     seed_default_settings()
+    # Don't show the setup tour to users who already have trades (existing installs)
+    if get_setting("onboarding_done", "0") != "1":
+        with get_connection() as _c0:
+            _existing_trades = _c0.execute("SELECT COUNT(*) AS n FROM trades").fetchone()["n"]
+        if _existing_trades > 0:
+            set_setting("onboarding_done", "1")
     st.session_state["_db_ready"] = True
 
 # Initialise version counters used to bust @st.cache_data caches on mutations
@@ -2505,6 +2513,227 @@ with st.sidebar:
 page = st.session_state["nav_page"]
 
 
+# ── Guided setup tour ─────────────────────────────────────────────────────────
+# A first-run walkthrough: a welcome modal, then highlighted "coach" cards pinned
+# above the real widgets on each page. Driven by st.session_state["_tour_step"].
+
+TOUR_STEPS = [
+    {
+        "section": "broker",
+        "page": "🔗  Broker Sync",
+        "title": "Connect to Interactive Brokers (optional)",
+        "body": (
+            "If you use **Interactive Brokers**, you can connect Trade Log to TWS or "
+            "IB Gateway for live prices and automatic balance sync.\n\n"
+            "Expand **“🛟 How to connect — step by step”** below for plain-English "
+            "instructions. Set the **Host / Port / Client ID**, then click "
+            "**🔌 Test Connection**.\n\n"
+            "Don't use IBKR, or want to set this up later? Just hit **Skip this section** — "
+            "everything works fine entering trades manually."
+        ),
+    },
+    {
+        "section": "settings",
+        "page": "⚙️  Settings",
+        "title": "Set your account balance",
+        "body": (
+            "Open the **Account & Equity** section below and enter your current account "
+            "value, then **Save**.\n\n"
+            "This drives position sizing and the **% of Account** risk figures in your "
+            "trade table."
+        ),
+    },
+    {
+        "section": "settings",
+        "page": "⚙️  Settings",
+        "title": "Choose your date format",
+        "body": (
+            "In the **Display** section, flip **Euro dates** on if you prefer "
+            "**DD/MM/YYYY** instead of **MM/DD/YYYY**. This changes how every date is "
+            "shown across the app."
+        ),
+    },
+    {
+        "section": "settings",
+        "page": "⚙️  Settings",
+        "title": "Set your default commissions",
+        "body": (
+            "In **Commission Defaults**, enter your broker's typical fees for stocks "
+            "(flat per trade), options (per contract), and futures (per contract).\n\n"
+            "These pre-fill whenever you log a trade, so your P&L can be shown **net of "
+            "fees** automatically."
+        ),
+    },
+    {
+        "section": "settings",
+        "page": "⚙️  Settings",
+        "title": "Add any extra currencies",
+        "body": (
+            "Trading in a non-USD account? Open **Multi-Currency**, switch it on, and "
+            "pick your **native currency** (AUD, CAD, EUR).\n\n"
+            "Trade Log will then show P&L converted to your currency alongside the USD "
+            "figures. USD-only? Skip ahead."
+        ),
+    },
+    {
+        "section": "tags",
+        "page": "🏷️  Tags",
+        "title": "Create your first tag",
+        "body": (
+            "**Tags** let you slice and filter your trades later — by strategy, setup, "
+            "watchlist, conviction, anything you like.\n\n"
+            "Type a name in **Add New Tag** below (try something like *Breakout* or "
+            "*Swing*) and click **Add**. Go ahead and create one now — then hit "
+            "**Next →**."
+        ),
+    },
+    {
+        "section": "equity",
+        "page": "📈  Equity Curve",
+        "title": "Track your equity over time",
+        "body": (
+            "Click the **✏️ Manual Entry** tab above. Enter a **date** and your "
+            "**end-of-day balance** (plus any deposits or withdrawals that day) and "
+            "**Save**.\n\n"
+            "Add an entry regularly — or bulk-import from a CSV or Interactive Brokers — "
+            "and Trade Log plots your equity curve and time-weighted return."
+        ),
+    },
+    {
+        "section": "log",
+        "page": "📋  Trading Log",
+        "title": "Log your first trade",
+        "body": (
+            "This is home base. Click **➕ Add Trade** below to open the form.\n\n"
+            "Required fields are marked with a green **\\***: **Ticker**, **Quantity**, "
+            "and **Entry Price** (plus the **Entry Date**). Everything else — exit "
+            "price/date, stop loss, tags, notes — is optional and can be filled in "
+            "later.\n\n"
+            "Press **Ctrl+Enter** or click **Add Trade** to save. That's it — you're "
+            "set up!"
+        ),
+    },
+]
+
+
+def _start_tour():
+    st.session_state["_tour_active"] = True
+    st.session_state["_tour_step"] = 0
+    st.session_state["nav_page"] = TOUR_STEPS[0]["page"]
+    st.rerun()
+
+
+def _end_tour():
+    st.session_state["_tour_active"] = False
+    st.session_state.pop("_tour_step", None)
+    set_setting("onboarding_done", "1")
+    _bust("_v_settings")
+    st.rerun()
+
+
+def _tour_goto(idx: int):
+    """Advance/rewind the tour to a step index; ends the tour past the last step."""
+    if idx < 0:
+        idx = 0
+    if idx >= len(TOUR_STEPS):
+        _end_tour()
+        return
+    st.session_state["_tour_step"] = idx
+    st.session_state["nav_page"] = TOUR_STEPS[idx]["page"]
+    st.rerun()
+
+
+def _tour_skip_section(idx: int):
+    """Jump to the first step of the next section (or end the tour)."""
+    section = TOUR_STEPS[idx]["section"]
+    j = idx + 1
+    while j < len(TOUR_STEPS) and TOUR_STEPS[j]["section"] == section:
+        j += 1
+    _tour_goto(j)
+
+
+def render_tour_panel(page_key: str):
+    """Render the guided-tour coach card at the top of a page, if it's the active step."""
+    if not st.session_state.get("_tour_active"):
+        return
+    idx = st.session_state.get("_tour_step", 0)
+    if idx >= len(TOUR_STEPS):
+        return
+    step = TOUR_STEPS[idx]
+    if step["page"] != page_key:
+        return
+
+    with st.container(border=True):
+        st.markdown(
+            f"<div style='background:linear-gradient(135deg,#1a8a40,#22c55e);"
+            f"color:#fff;font-weight:800;padding:0.35rem 0.7rem;border-radius:8px;"
+            f"display:inline-block;margin-bottom:0.4rem'>"
+            f"🧭 Setup Tour · Step {idx + 1} of {len(TOUR_STEPS)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"#### {step['title']}")
+        st.markdown(step["body"])
+        is_last = idx == len(TOUR_STEPS) - 1
+        b1, b2, b3, b4 = st.columns([1, 1, 1.3, 1.3])
+        if b1.button("✕ End tour", key=f"_tour_end_{idx}", width="stretch"):
+            _end_tour()
+        if b2.button("← Back", key=f"_tour_back_{idx}", width="stretch", disabled=idx == 0):
+            _tour_goto(idx - 1)
+        if not is_last:
+            if b3.button("Skip this section ⏭", key=f"_tour_skipsec_{idx}", width="stretch"):
+                _tour_skip_section(idx)
+        if b4.button("Finish ✓" if is_last else "Next →", key=f"_tour_next_{idx}",
+                     type="primary", width="stretch"):
+            _tour_goto(idx + 1)
+
+
+def _welcome_body():
+    st.markdown(
+        "Trade Log is your personal trading journal — it runs entirely on **your "
+        "own computer** and your data never leaves your machine.\n\n"
+        "This quick **setup tour** walks you through getting ready:\n\n"
+        "- 🔗 Connecting **Interactive Brokers** (optional)\n"
+        "- ⚙️ Setting your **account balance, date format, commissions & currency**\n"
+        "- 🏷️ Creating your first **tag**\n"
+        "- 📈 Logging your **equity**\n"
+        "- 📋 Logging your first **trade**\n\n"
+        "It takes about a minute, and you can **skip any part** at any time."
+    )
+    wc1, wc2 = st.columns(2)
+    if wc1.button("🧭  Start setup tour", type="primary", width="stretch", key="_welcome_start"):
+        _start_tour()
+    if wc2.button("Skip for now", width="stretch", key="_welcome_skip"):
+        _end_tour()
+    st.caption("You can replay this tour anytime from ⚙️ Settings.")
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("👋  Welcome to Trade Log")
+    def _welcome_dialog():
+        _welcome_body()
+else:
+    def _welcome_dialog():
+        with st.container(border=True):
+            st.markdown("### 👋  Welcome to Trade Log")
+            _welcome_body()
+
+
+# Show the welcome splash on first run. We call it on EVERY run (until the user
+# starts or skips) so the dialog's buttons are re-instantiated on the rerun that
+# processes a click — otherwise the click would be lost and nothing would happen.
+if (settings.get("onboarding_done", "0") != "1"
+        and not st.session_state.get("_tour_active")):
+    _welcome_dialog()
+
+# Sidebar reminder + escape hatch while a tour is running
+if st.session_state.get("_tour_active"):
+    with st.sidebar:
+        st.markdown("---")
+        st.info("🧭 Setup tour in progress")
+        if st.button("End tutorial", width="stretch", key="sb_end_tour"):
+            _end_tour()
+
+
 # ── Shared data ────────────────────────────────────────────────────────────────
 
 all_tags       = _cached_load_tags(st.session_state["_v_tags"])
@@ -2521,6 +2750,8 @@ _futures_commission      = float(settings.get("futures_commission",  "2.25") or 
 # ════════════════════════════════════════════════════════════════════════════════
 
 if page == "📋  Trading Log":
+
+    render_tour_panel("📋  Trading Log")
 
     # Initialise filter defaults once per session (explicit keys prevent rerun-resets)
     _FILTER_DEFAULTS: dict = {
@@ -5282,6 +5513,8 @@ elif page == "📈  Equity Curve":
 
     _eq_entries = _cached_load_equity_entries(st.session_state["_v_equity"])
 
+    render_tour_panel("📈  Equity Curve")
+
     _ec_tab_chart, _ec_tab_entry, _ec_tab_import, _ec_tab_flex = st.tabs(
         ["📈 Chart", "✏️ Manual Entry", "📥 Import", "🔗 IB Flex Import"]
     )
@@ -7213,6 +7446,8 @@ elif page == "📊  Statistics":
 elif page == "🏷️  Tags":
     tag_list = _cached_load_tags(st.session_state["_v_tags"])
 
+    render_tour_panel("🏷️  Tags")
+
     # ── Clear All button ──────────────────────────────────────────────────────
     _tag_tab_manage, _tag_tab_bulk = st.tabs(["🏷️  Manage Tags", "📋  Bulk Tag Editor"])
 
@@ -7453,6 +7688,8 @@ elif page == "🏷️  Tags":
 elif page == "🔗  Broker Sync":
     st.header("Broker Sync")
 
+    render_tour_panel("🔗  Broker Sync")
+
     # ── Demo mode warning ─────────────────────────────────────────────────────
     if is_demo:
         st.warning(
@@ -7503,6 +7740,58 @@ elif page == "🔗  Broker Sync":
             st.success(f"Connected — {st.session_state.get('_ib_connect_msg', 'IB TWS/Gateway reachable')}")
         elif _conn_status is False:
             st.error(f"Not connected — {st.session_state.get('_ib_connect_msg', 'Could not reach IB TWS/Gateway')}")
+
+        # ── How-to-connect explainer (auto-opens when not connected) ──────────
+        with st.expander("🛟  How to connect — step by step", expanded=(_conn_status is False)):
+            st.success(
+                "**Your information stays private.** Trade Log talks only to the TWS / "
+                "IB Gateway program **already running on this same computer**, over the "
+                "local address `127.0.0.1` (\"localhost\"). Nothing is sent over the "
+                "internet, and Trade Log never sees your IB username or password — it "
+                "just reads data from the session you've already logged into. The "
+                "connection is **read-only**: it cannot place trades or move money.",
+                icon="🔒",
+            )
+            st.markdown(
+                "Follow these steps once. Most people are connected in under two minutes:\n\n"
+                "**1. Open TWS or IB Gateway and log in.**  \n"
+                "It must be running on *this* computer at the same time as Trade Log. "
+                "*(This is the program Trade Log will talk to.)*\n\n"
+                "**2. Turn on the API.**  \n"
+                "In **TWS**: *Edit → Global Configuration → API → Settings*. "
+                "In **IB Gateway**: *Configure → Settings → API → Settings*. "
+                "Tick **“Enable ActiveX and Socket Clients.”** "
+                "*(This lets a program on your own machine read data — it's off by default.)*\n\n"
+                "**3. Confirm the Socket Port** shown on that same screen, and make sure "
+                "it matches the **Port** field below:\n"
+                "- `7497` — TWS paper (practice) account\n"
+                "- `7496` — TWS live account\n"
+                "- `4002` — IB Gateway paper account\n"
+                "- `4001` — IB Gateway live account\n\n"
+                "*(The port is just the “channel number” the two programs use to talk on "
+                "your computer.)*\n\n"
+                "**4. (Recommended) Allow localhost.**  \n"
+                "Leave **“Allow connections from localhost only”** ticked, and optionally "
+                "add `127.0.0.1` to **Trusted IPs**. "
+                "*(This keeps the door open only to programs on your own machine, and "
+                "skips the “accept connection?” popup each time.)*\n\n"
+                "**5. Set the fields below** and click **🔌 Test Connection**:\n"
+                "- **Host:** `127.0.0.1`  *(your own computer)*\n"
+                "- **Port:** the number from step 3\n"
+                "- **Client ID:** any unused number — `1` is fine "
+                "*(just a label so TWS can tell apps apart)*\n\n"
+                "**6. Approve the connection if asked.**  \n"
+                "The very first time, TWS may pop up **“Accept incoming connection?”** — "
+                "click **Yes / Allow**. *(That's TWS confirming you trust this app — you do.)*"
+            )
+            st.info(
+                "Still seeing *“Not connected”*? The usual culprits: TWS/Gateway isn't "
+                "running, the **Port** here doesn't match the one in TWS, the API "
+                "checkbox in step 2 isn't ticked, or a TWS popup is waiting for you to "
+                "click **Yes**. No Interactive Brokers account? You can ignore this "
+                "whole section and log trades manually.",
+                icon="💡",
+            )
 
     st.divider()
 
@@ -8105,6 +8394,13 @@ elif page == "🔗  Broker Sync":
 
 elif page == "⚙️  Settings":
     st.header("Settings")
+
+    render_tour_panel("⚙️  Settings")
+
+    if not st.session_state.get("_tour_active"):
+        _rt_col, _ = st.columns([1, 3])
+        if _rt_col.button("🧭  Replay setup tutorial", width="stretch", key="settings_replay_tour"):
+            _start_tour()
 
     s_acct_val    = float(settings.get("account_balance",    0))
     s_equity_val  = float(settings.get("starting_equity",    100000))
