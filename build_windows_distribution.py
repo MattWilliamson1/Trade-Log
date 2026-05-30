@@ -12,7 +12,6 @@ these items (nothing else — no .venv, no stale zips, no dev files):
     db.py
     ib_client.py
     requirements.txt
-    launch.vbs
     launch.bat
     INSTALL - Double-Click This First.bat
     PLEASE_READ_THIS_FIRST.txt
@@ -48,7 +47,6 @@ ROOT_FILES = [
 
 # Flat files from installer/
 INSTALLER_FILES = [
-    "launch.vbs",
     "launch.bat",
     "INSTALL - Double-Click This First.bat",
     "PLEASE_READ_THIS_FIRST.txt",

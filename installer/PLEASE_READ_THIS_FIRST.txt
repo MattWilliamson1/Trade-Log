@@ -31,7 +31,6 @@ A black window will appear showing progress. It will:
   • Download a small setup tool
   • Install Python (the engine Trade Log runs on)
   • Install Trade Log and its components
-  • Create a "Trade Log" shortcut on your Desktop
 
 This takes 2–5 minutes depending on your internet speed.
 Do not close the window while it is running.
@@ -42,13 +41,27 @@ When it says "All done!" you can close it.
   STEP 3 — LAUNCH (every time after that)
 ════════════════════════════════════════════════════════════
 
-Double-click the "Trade Log" icon on your Desktop.
+Go back to THIS SAME FOLDER (the "Trade Log" folder you
+extracted) and double-click:
 
-Your browser will open automatically to the app.
-No terminal window. No fuss.
+   launch.bat
 
-If you accidentally close the browser, just double-click
-the Desktop icon again.
+It sits right next to the installer you just ran.
+
+Your browser will open automatically to the app. A black
+window will also open — that is normal. Just leave it open
+while you use Trade Log. Closing that window closes the app.
+
+If your browser does not open on its own, the black window
+shows the exact address to use (usually http://localhost:8502).
+Click or type that address into your browser.
+
+If you accidentally close the browser tab, just double-click
+launch.bat again.
+
+TIP: Right-click launch.bat and choose "Pin to Start" or
+"Send to → Desktop (create shortcut)" if you'd like quicker
+access later.
 
 ════════════════════════════════════════════════════════════
   USING THE APP
