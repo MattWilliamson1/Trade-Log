@@ -73,7 +73,7 @@ if exist "%~dp0.venv" (
 )
 
 :: ── Step 1: uv setup tools ────────────────────────────────────────────────────
-echo  [1 of 4]  Checking setup tools...
+echo  [1 of 3]  Checking setup tools...
 echo.
 
 set "UV_DIR=%~dp0_uv"
@@ -101,7 +101,7 @@ echo  [OK] Setup tools ready.
 echo.
 
 :: ── Step 2: Install Python ────────────────────────────────────────────────────
-echo  [2 of 4]  Installing Python 3.12...
+echo  [2 of 3]  Installing Python 3.12...
 echo            (one-time download — may take a minute)
 echo.
 "%UV%" python install 3.12
@@ -123,7 +123,7 @@ echo  [OK] Python ready.
 echo.
 
 :: ── Step 3: Create virtual environment ───────────────────────────────────────
-echo  [3 of 4]  Installing Trade Log...
+echo  [3 of 3]  Installing Trade Log...
 echo            ^(this is the slow step — 2 to 5 minutes^)
 echo            Please wait...
 echo.
@@ -165,30 +165,20 @@ if errorlevel 1 (
 echo  [OK] Trade Log installed.
 echo.
 
-:: ── Step 4: Desktop shortcut ─────────────────────────────────────────────────
-echo  [4 of 4]  Creating your Desktop shortcut...
-
-set "VBS_PATH=%~dp0launch.vbs"
-set "SHORTCUT=%USERPROFILE%\Desktop\Trade Log.lnk"
-
-powershell -NoProfile -Command ^
-  "$ws = New-Object -ComObject WScript.Shell; " ^
-  "$s = $ws.CreateShortcut('%SHORTCUT%'); " ^
-  "$s.TargetPath = 'wscript.exe'; " ^
-  "$s.Arguments = '\"%VBS_PATH%\"'; " ^
-  "$s.WorkingDirectory = '%~dp0'; " ^
-  "$s.IconLocation = '%SystemRoot%\System32\SHELL32.dll,14'; " ^
-  "$s.Description = 'Open Trade Log'; " ^
-  "$s.Save()"
-
-echo  [OK] Shortcut created on your Desktop.
-echo.
-
 echo  ============================================================
 echo.
 echo   All done!
 echo.
-echo   Double-click the "Trade Log" icon on your Desktop to open it.
+echo   To open Trade Log from now on:
+echo.
+echo     In THIS SAME FOLDER, double-click the file named
+echo.
+echo        launch.bat
+echo.
+echo   (It sits right next to this installer.) Your browser will
+echo   open automatically. Leave the black window open while you
+echo   use the app - closing it stops Trade Log.
+echo.
 echo   You do NOT need to run this installer again.
 echo.
 echo  ============================================================
