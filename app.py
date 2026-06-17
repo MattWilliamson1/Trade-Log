@@ -1,11 +1,12 @@
 import re
+import math
+import time as _time_global
 import uuid
 import smtplib
 import concurrent.futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -227,7 +228,7 @@ THEMES: dict[str, dict] = {
 
 DEFAULT_COLS = [
     "Trade ID", "Status", "Instrument", "Entry Date", "Ticker", "Quantity",
-    "Entry Price", "Exit Date", "Exit Price", "Live Price", "P&L",
+    "Spread Type", "Entry Price", "Exit Date", "Exit Price", "Live Price", "P&L",
 ]
 ALL_COLS = [
     "Trade ID", "Status", "Instrument", "Entry Date", "Ticker", "Quantity",
@@ -260,7 +261,7 @@ PRESET_STOCK = [
 ]
 PRESET_OPTIONS = [
     "Trade ID", "Status", "Instrument", "Underlying", "Expiration", "Strike",
-    "Quantity", "Entry Price", "Live Price", "P&L", "Delta", "Theta",
+    "Quantity", "Entry Price", "Live Price", "P&L", "% of Account", "Delta", "Theta",
 ]
 
 SECTOR_ETF_MAP = {
@@ -432,10 +433,17 @@ def _yf_get_live_data(symbols: tuple) -> dict:
         if raw.empty:
             raise ValueError("empty")
         if isinstance(raw.columns, pd.MultiIndex):
-            # Multiple tickers → MultiIndex columns (ticker, field)
+            # Multiple tickers → MultiIndex columns. With group_by="ticker" the
+            # levels are (ticker, field) so the close is raw[sym]["Close"]; other
+            # layouts use (field, ticker) → raw["Close"][sym]. Detect which level
+            # holds the tickers instead of assuming (the wrong assumption made
+            # every lookup KeyError, so all live prices came back empty).
+            _lvl0 = set(raw.columns.get_level_values(0))
+            _ticker_first = any(s in _lvl0 for s in symbols)
             for sym in symbols:
                 try:
-                    closes = raw["Close"][sym].dropna()
+                    _col   = raw[sym]["Close"] if _ticker_first else raw["Close"][sym]
+                    closes = _col.dropna()
                     if len(closes) >= 1:
                         price      = float(closes.iloc[-1])
                         prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else price
@@ -470,6 +478,323 @@ _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 
 def _is_occ_symbol(s: str) -> bool:
     return bool(_OCC_RE.match(s))
+
+
+def option_legs_max_risk(legs: list) -> "float | None":
+    """Maximum loss (positive dollars) of an option position at expiration.
+
+    `legs` is a list of dicts: {type:'call'/'put', strike, side:'long'/'short',
+    qty (contracts, positive), mult (shares/contract), entry_price (premium/share)}.
+
+    Computes the worst-case P&L by evaluating the piecewise-linear expiration payoff
+    at S=0 and at every strike (the only breakpoints), net of the entry debit/credit.
+    Returns the loss as a positive number, 0.0 if no loss is possible, or None if the
+    risk is unbounded (a net-short call position whose payoff → −∞ as the underlying
+    rises).
+    """
+    norm = []
+    for lg in legs:
+        try:
+            k  = float(lg["strike"])
+            q  = float(lg["qty"]) * float(lg.get("mult") or 1.0)
+            ep = float(lg["entry_price"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        s    = -1.0 if str(lg.get("side", "long")).lower() == "short" else 1.0
+        is_c = str(lg.get("type", "")).lower().startswith("c")
+        norm.append((s, is_c, k, q, ep))
+
+    if not norm:
+        return None
+
+    # Net cash paid at entry (positive = debit paid, negative = credit received)
+    cost = sum(s * ep * q for (s, is_c, k, q, ep) in norm)
+
+    # Slope of total payoff as S → ∞ (only calls contribute). Net short → unbounded.
+    slope_inf = sum(s * q for (s, is_c, k, q, ep) in norm if is_c)
+    if slope_inf < -1e-9:
+        return None
+
+    def payoff(S: float) -> float:
+        tot = 0.0
+        for (s, is_c, k, q, ep) in norm:
+            intr = max(S - k, 0.0) if is_c else max(k - S, 0.0)
+            tot += s * intr * q
+        return tot
+
+    strikes  = sorted({k for (_, _, k, _, _) in norm})
+    min_pnl  = min(payoff(S) - cost for S in ([0.0] + strikes))
+    return max(0.0, -min_pnl)
+
+
+def _detect_spread_type(legs) -> str:
+    """Infer spread type from leg structure.
+
+    Normalises by collapsing duplicate (side, strike, type, expiration) combos
+    first, so a vertical filled in two pieces is still detected as a Vertical.
+    """
+    if len(legs) < 2:
+        return "Single"
+
+    norm_cols = [c for c in ("side", "strike", "option_type", "expiration")
+                 if c in legs.columns]
+    if norm_cols:
+        norm = legs[norm_cols].dropna(subset=norm_cols).drop_duplicates()
+    else:
+        norm = legs
+
+    n_exps    = norm["expiration"].nunique()  if "expiration"   in norm.columns else 0
+    n_strikes = norm["strike"].nunique()      if "strike"       in norm.columns else 0
+    n_types   = norm["option_type"].nunique() if "option_type"  in norm.columns else 0
+
+    # ── Multi-expiry ──────────────────────────────────────────────────
+    if n_exps > 1:
+        # Same strike, different expirations → Calendar
+        # Different strikes, different expirations → Diagonal
+        return "Calendar" if n_strikes <= 1 else "Diagonal"
+
+    # ── Single expiry — classify by unique strikes and option types ───
+    if n_types <= 1:
+        # Single option type (all calls or all puts)
+        if n_strikes == 2:
+            return "Vertical"       # bull/bear spread
+        if n_strikes == 3:
+            return "Butterfly"      # classic 1-2-1
+        if n_strikes == 4:
+            return "Condor"         # 1-1-1-1 same type
+    else:
+        # Mixed calls and puts
+        if n_strikes == 1:
+            return "Straddle"       # same strike, call + put
+        if n_strikes == 2:
+            return "Strangle"       # diff strikes, call + put
+        if n_strikes == 3:
+            return "Iron Fly"       # put spread + call spread, shared middle
+        if n_strikes == 4:
+            return "Iron Condor"    # put spread + call spread, 4 strikes
+
+    return "Multi-Leg"
+
+
+def spread_unit_count(quantities) -> "float | None":
+    """Number of spread *units* from a list of per-leg quantities.
+
+    A balanced spread (all legs the same quantity) returns that quantity — e.g.
+    5 long calls + 5 short calls = 5 spreads. A ratio spread returns the GCD of
+    the integer leg quantities (a 1×2 ratio → 1 unit). Returns None when it
+    can't be determined (no quantities, or unequal fractional quantities).
+    """
+    qtys = [abs(float(q)) for q in quantities if q is not None and float(q) != 0]
+    if not qtys:
+        return None
+    if all(abs(q - round(q)) < 1e-9 for q in qtys):
+        ints = [int(round(q)) for q in qtys]
+        g = ints[0]
+        for x in ints[1:]:
+            g = math.gcd(g, x)
+        return float(g) if g > 0 else None
+    if max(qtys) - min(qtys) < 1e-9:
+        return qtys[0]
+    return None
+
+
+def row_is_option(row) -> bool:
+    return str(row.get("instrument_type") or "stock").lower() == "option"
+
+
+# ── Black-Scholes greeks (local fallback when IB model greeks aren't available) ──
+
+_SQRT2       = math.sqrt(2.0)
+_INV_SQRT2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+
+def _norm_pdf(x: float) -> float:
+    return _INV_SQRT2PI * math.exp(-0.5 * x * x)
+
+
+def _bs_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    if sigma <= 0 or T <= 0:
+        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / sq
+    d2 = d1 - sq
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def bs_greeks(S, K, T, r, sigma, is_call):
+    """Return (delta_per_share, theta_per_share_per_day) for a European option, or None."""
+    try:
+        S, K, T, r, sigma = float(S), float(K), float(T), float(r), float(sigma)
+    except (TypeError, ValueError):
+        return None
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return None
+    sqrtT = math.sqrt(T)
+    sq    = sigma * sqrtT
+    d1    = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / sq
+    d2    = d1 - sq
+    if is_call:
+        delta = _norm_cdf(d1)
+        theta = (-(S * _norm_pdf(d1) * sigma) / (2 * sqrtT)
+                 - r * K * math.exp(-r * T) * _norm_cdf(d2))
+    else:
+        delta = _norm_cdf(d1) - 1.0
+        theta = (-(S * _norm_pdf(d1) * sigma) / (2 * sqrtT)
+                 + r * K * math.exp(-r * T) * _norm_cdf(-d2))
+    return delta, theta / 365.0
+
+
+def bs_implied_vol(price, S, K, T, r, is_call):
+    """Invert Black-Scholes for implied volatility via bisection. None if not solvable."""
+    try:
+        price, S, K, T, r = float(price), float(S), float(K), float(T), float(r)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return None
+    intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    if price < intrinsic - 1e-6:
+        return None  # below intrinsic — bad/stale quote
+    lo, hi = 1e-4, 5.0
+    if price <= _bs_price(S, K, T, r, lo, is_call):
+        return lo
+    if price >= _bs_price(S, K, T, r, hi, is_call):
+        return hi
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _bs_price(S, K, T, r, mid, is_call) > price:
+            hi = mid
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+
+def _yf_close_frame(symbols: tuple, period: str):
+    """Download `period` of closes and return a {sym: pandas Series of closes}.
+    Handles yfinance's multi-ticker (field, ticker) MultiIndex and the single-ticker
+    flat-column layouts uniformly."""
+    out: dict = {}
+    if not symbols:
+        return out
+    try:
+        raw = yf.download(list(symbols), period=period, auto_adjust=True,
+                          progress=False, threads=True)
+        if raw.empty:
+            return out
+        if isinstance(raw.columns, pd.MultiIndex):
+            close = raw["Close"]  # default layout → top level is the field
+            for sym in symbols:
+                try:
+                    s = close[sym].dropna()
+                    if len(s):
+                        out[sym] = s
+                except Exception:
+                    pass
+        else:
+            s = raw["Close"].dropna()
+            if len(s):
+                out[symbols[0]] = s
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=120)
+def get_underlying_spots(symbols: tuple) -> dict:
+    """Latest close per symbol from Yahoo. {sym: price}. Correct multi-ticker parsing."""
+    return {sym: float(s.iloc[-1]) for sym, s in _yf_close_frame(symbols, "2d").items()}
+
+
+@st.cache_data(ttl=3600)
+def get_historical_vol(symbols: tuple) -> dict:
+    """Annualised historical volatility (decimal) per symbol from ~3 months of closes.
+    Used as the volatility input for local greeks when an option market price isn't
+    available to imply vol from. Cached hourly."""
+    out: dict = {}
+    for sym, closes in _yf_close_frame(symbols, "3mo").items():
+        try:
+            rets = np.log(closes / closes.shift(1)).dropna()
+            if len(rets) >= 10:
+                out[sym] = float(rets.std() * np.sqrt(252))
+        except Exception:
+            pass
+    return out
+
+
+def compute_position_greeks(open_trades, live_data) -> dict:
+    """Signed POSITION greeks per open option trade, keyed by trade id.
+
+    Returns {trade_id: {"delta": share-equiv position delta, "theta": $/day}}.
+    Short legs are negative; greeks scale by sign × qty × multiplier so spread
+    groups aggregate by simple summation.
+
+    Greeks are computed locally with Black-Scholes — crucially using each option's
+    *real market price* (already fetched into `live_data`) to imply volatility, so
+    the delta tracks the broker's model delta closely. Implied vol falls back to the
+    underlying's historical vol, then 0.30. Underlying spot prices come from Yahoo
+    (no extra IB round-trips, so this never blocks on per-contract market-data snapshots).
+
+    Intended to be called once per price refresh and cached — not on every rerun.
+    """
+    out: dict = {}
+    if open_trades is None or open_trades.empty:
+        return out
+    opt = open_trades[open_trades.apply(row_is_option, axis=1)]
+    if opt.empty:
+        return out
+
+    r_rate = fetch_risk_free_rate()
+
+    # Underlying spot prices + historical-vol fallback (Yahoo only — fast, cached).
+    _under_syms = tuple(sorted({
+        _yf_symbol(r["ticker"], r.get("exchange") or "") for _, r in opt.iterrows()
+    }))
+    spot_data = get_underlying_spots(_under_syms) if _under_syms else {}
+    hv_map    = get_historical_vol(_under_syms) if _under_syms else {}
+
+    for _, r in opt.iterrows():
+        try:
+            tid = int(r["id"]) if pd.notna(r.get("id")) else None
+            if tid is None:
+                continue
+            sign = -1.0 if str(r.get("side", "long")).lower() == "short" else 1.0
+            qty  = float(r["quantity"])
+            mult = float(r.get("multiplier") or 1.0)
+
+            under_sym = _yf_symbol(r["ticker"], r.get("exchange") or "")
+            S   = spot_data.get(under_sym)
+            K   = float(r["strike"]) if pd.notna(r.get("strike")) else None
+            exp = pd.to_datetime(r.get("expiration"), errors="coerce")
+            if not (S and K and pd.notna(exp)):
+                continue
+            T = max((exp - today_ts).days, 0) / 365.0
+            if T <= 0:
+                continue
+
+            is_call = str(r.get("option_type", "")).lower().startswith("c")
+            _occ    = build_option_symbol(r["ticker"], exp, K, r.get("option_type") or "C")
+            _opt_px = (live_data.get(_occ) or {}).get("price")
+            sigma   = bs_implied_vol(_opt_px, S, K, T, r_rate, is_call) if _opt_px else None
+            if not sigma:
+                sigma = hv_map.get(under_sym) or 0.30
+
+            g = bs_greeks(S, K, T, r_rate, sigma, is_call)
+            if g:
+                dps, tps = g
+                out[tid] = {
+                    "delta": sign * qty * mult * float(dps),
+                    "theta": sign * qty * mult * float(tps),
+                }
+        except Exception:
+            pass
+
+    return out
 
 
 def get_live_data(symbols: tuple) -> dict:
@@ -899,7 +1224,8 @@ def fetch_benchmark_data(tickers: list, start_date: str):
         pass
 
 
-def load_benchmark_series(ticker: str, start_date: str, start_equity: float) -> pd.Series:
+def load_benchmark_series(ticker: str, start_date: str, start_equity: float,
+                          normalize: bool = True) -> pd.Series:
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT date, close FROM benchmark_prices WHERE ticker=? AND date >= ? ORDER BY date",
@@ -908,9 +1234,46 @@ def load_benchmark_series(ticker: str, start_date: str, start_equity: float) -> 
     if not rows:
         return pd.Series(dtype=float)
     s = pd.Series([r["close"] for r in rows], index=pd.to_datetime([r["date"] for r in rows]), name=ticker)
-    if len(s) > 0 and s.iloc[0] != 0:
+    # normalize=False returns the raw closes — used for VIX, which is an index
+    # level (≈10–80), not a price to rebase onto the portfolio's equity.
+    if normalize and len(s) > 0 and s.iloc[0] != 0:
         s = s / s.iloc[0] * start_equity
     return s
+
+
+def smooth_line_xy(x_num, y, strength: float, subdivisions: int = 18):
+    """Visually smooth a line WITHOUT averaging the data.
+
+    Returns a denser (x, y) curve that still passes through every original point
+    but curves smoothly between them, using a centripetal-style Catmull-Rom spline
+    on the y-values. `strength` (0..1) blends from the straight polyline (0) to the
+    full smooth curve (1); x stays linear within each segment so dates remain
+    strictly increasing. Because the curve always hits the original points, this is
+    pure line smoothing — not a moving average.
+    """
+    x_num = np.asarray(x_num, dtype=float)
+    y     = np.asarray(y, dtype=float)
+    n = len(x_num)
+    if n < 3 or strength <= 0:
+        return x_num, y
+    xs = np.concatenate(([x_num[0]], x_num, [x_num[-1]]))
+    ys = np.concatenate(([y[0]],     y,     [y[-1]]))
+    t  = np.linspace(0.0, 1.0, subdivisions, endpoint=False)
+    t2, t3 = t * t, t * t * t
+    out_x, out_y = [], []
+    for i in range(1, n):
+        p0y, p1y, p2y, p3y = ys[i - 1], ys[i], ys[i + 1], ys[i + 2]
+        cy = 0.5 * ((2 * p1y)
+                    + (-p0y + p2y) * t
+                    + (2 * p0y - 5 * p1y + 4 * p2y - p3y) * t2
+                    + (-p0y + 3 * p1y - 3 * p2y + p3y) * t3)
+        lx = xs[i] + (xs[i + 1] - xs[i]) * t        # linear x within the segment
+        ly = p1y + (p2y - p1y) * t                  # straight-line y reference
+        out_x.extend(lx.tolist())
+        out_y.extend((ly + (cy - ly) * strength).tolist())
+    out_x.append(x_num[-1])
+    out_y.append(y[-1])
+    return np.asarray(out_x), np.asarray(out_y)
 
 
 # ── Logic helpers ──────────────────────────────────────────────────────────────
@@ -1660,6 +2023,41 @@ def bulk_delete_trades(trade_ids: list):
         conn.execute(f"DELETE FROM trades WHERE id IN ({placeholders})", trade_ids)
 
 
+def find_duplicate_trade_groups() -> list:
+    """Find groups of trades that look like the same fill imported more than once.
+
+    Two trades are flagged as duplicates only when ALL of these match: ticker,
+    instrument identity (type / expiration / strike / option type), side, entry
+    date, quantity, and entry price. Entry date is the finest execution-time
+    granularity stored, so it stands in for "same time". Returns a list of
+    groups (each a dict with the shared match key and its member trade rows),
+    limited to keys that have 2 or more trades. Read-only — never deletes.
+    """
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, entry_date, ticker, quantity, entry_price, exit_date,
+                      exit_price, side, instrument_type, expiration, strike,
+                      option_type, notes
+                 FROM trades ORDER BY id"""
+        ).fetchall()
+    for r in rows:
+        key = (
+            (r["ticker"] or "").upper().strip(),
+            (r["instrument_type"] or "stock").lower(),
+            str(r["expiration"] or ""),
+            round(float(r["strike"]), 4) if r["strike"] is not None else None,
+            (r["option_type"] or "").lower(),
+            (r["side"] or "long").lower(),
+            str(r["entry_date"] or "")[:10],
+            round(float(r["quantity"]), 6) if r["quantity"] is not None else None,
+            round(float(r["entry_price"]), 6) if r["entry_price"] is not None else None,
+        )
+        groups[key].append(dict(r))
+    return [{"key": k, "trades": v} for k, v in groups.items() if len(v) >= 2]
+
+
 def add_tag(name: str, description: str):
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO tags (name, description) VALUES (?, ?)",
@@ -1982,6 +2380,361 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
     return success, errors
 
 
+# ── Export for Review (PDF report) ────────────────────────────────────────────
+
+def _exp_to_float(v):
+    f = pd.to_numeric(v, errors="coerce")
+    return float(f) if pd.notna(f) else None
+
+
+def _exp_effective_stop(row):
+    """Active stop level — current_stop for fixed stops, the trailing level otherwise.
+    Mirrors the Trading Log table's effective-stop logic; falls back to current_stop
+    for cases needing extra market data (ATR trails, short-side trails)."""
+    tt = str(row.get("trail_type") or "fixed")
+    ta = row.get("trail_amount")
+    cs = _exp_to_float(row.get("current_stop"))
+    if tt == "fixed" or ta is None or (isinstance(ta, float) and pd.isna(ta)):
+        return cs
+    side = str(row.get("side") or "long").lower()
+    try:
+        ta = float(ta)
+        if side == "long":
+            hh = get_highest_high_since(row.get("ticker") or "", row.get("entry_date") or "")
+            if hh is None:
+                return cs
+            if tt == "$":
+                return hh - ta
+            if tt == "%":
+                return hh * (1 - ta / 100)
+        # ATR trails and short-side trails need extra data — use current_stop.
+    except Exception:
+        return cs
+    return cs
+
+
+def _exp_days_held(entry_date, exit_date):
+    try:
+        start = pd.to_datetime(entry_date, errors="coerce")
+        end   = pd.to_datetime(exit_date, errors="coerce") if exit_date else pd.Timestamp.today()
+        if pd.isna(start) or pd.isna(end):
+            return None
+        return max(0, int((end.normalize() - start.normalize()).days))
+    except Exception:
+        return None
+
+
+def _compute_review_rows(df: "pd.DataFrame", live_data: dict, acct_bal: float) -> list:
+    """Per-trade numeric metrics for the review report (mirrors the trade-table math)."""
+    if df.empty:
+        return []
+    div_map = load_dividends_for_trades(df["id"].tolist())
+    out = []
+    for _, r in df.iterrows():
+        qty  = _exp_to_float(r.get("quantity"))
+        ep   = _exp_to_float(r.get("entry_price"))
+        xp   = _exp_to_float(r.get("exit_price"))
+        mult = _exp_to_float(r.get("multiplier")) or 1.0
+        sign = -1.0 if str(r.get("side") or "long").lower() == "short" else 1.0
+        is_open = _is_open(r)
+        live_sym = _get_live_ticker(r)
+        live_px  = _exp_to_float(live_data.get(live_sym, {}).get("price")) if live_sym else None
+        price = live_px if is_open else xp
+        div_dollars = float(sum((d.get("total_amount") or 0) for d in div_map.get(r.get("id"), [])))
+
+        if qty is not None and ep is not None and price is not None:
+            pnl = (price - ep) * qty * mult * sign + div_dollars
+        elif div_dollars:
+            pnl = div_dollars
+        else:
+            pnl = None
+
+        commission = _exp_to_float(r.get("commission")) or 0.0
+        pnl_net = (pnl - commission) if pnl is not None else None
+
+        eff_stop     = _exp_to_float(_exp_effective_stop(r))
+        opening_stop = _exp_to_float(r.get("opening_stop"))
+
+        opening_risk = (abs(ep - opening_stop) * qty * mult
+                        if (ep is not None and opening_stop is not None and qty is not None) else None)
+        cur_val  = (qty * price * mult) if (qty is not None and price is not None) else None
+        pct_acct = (cur_val / acct_bal * 100) if (cur_val is not None and acct_bal and acct_bal > 0) else None
+        open_risk = ((price - eff_stop) * qty * mult
+                     if (is_open and price is not None and eff_stop is not None and qty is not None) else None)
+
+        out.append({
+            "id": r.get("id"),
+            "ticker": str(r.get("ticker") or ""),
+            "entry_date": r.get("entry_date") or "",
+            "is_open": is_open,
+            "qty": qty,
+            "entry_price": ep,
+            "stop": eff_stop if eff_stop is not None else opening_stop,
+            "opening_risk": opening_risk,
+            "pct_acct": pct_acct,
+            "pnl": pnl,
+            "pnl_net": pnl_net,
+            "open_risk": open_risk,
+            "commission": commission,
+            "days_held": _exp_days_held(r.get("entry_date"), r.get("exit_date")),
+            "tags": str(r.get("tags") or ""),
+            "notes": str(r.get("notes") or ""),
+        })
+    return out
+
+
+def _review_stat_lines(rows: list, acct_bal: float, net: bool) -> list:
+    """[(label, value), ...] — the full numeric stat set for a group of trades."""
+    pnl_key = "pnl_net" if net else "pnl"
+    have = [t for t in rows if t.get(pnl_key) is not None]
+    if not have:
+        return [("Trades", "0")]
+    pnls  = [t[pnl_key] for t in have]
+    dates = [t["entry_date"] for t in have]
+    s = compute_stats(tuple(pnls), tuple(dates), acct_bal)
+    pnl_ser = pd.Series(pnls, dtype=float)
+    winners = pnl_ser[pnl_ser > 0]
+    losers  = pnl_ser[pnl_ser < 0]
+    gross_win  = float(winners.sum())
+    gross_loss = float(-losers.sum())
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (None if gross_win == 0 else float("inf"))
+    total_comm = float(sum(t.get("commission") or 0 for t in rows))
+    days = [t["days_held"] for t in have if t.get("days_held") is not None]
+    avg_days = (sum(days) / len(days)) if days else None
+
+    def money(v): return fmt_pnl(v) if v is not None else "—"
+    def price(v): return fmt_price(v) if v is not None else "—"
+    def pct(v):   return fmt_pct(v)  if v is not None else "—"
+    def num(v, d=2): return fmt_num(v, d) if v is not None else "—"
+    pf_str = ("∞" if profit_factor == float("inf") else num(profit_factor)) if profit_factor is not None else "—"
+
+    return [
+        ("Trades",               str(len(have))),
+        ("Win rate",             pct(s.get("win_rate"))),
+        ("Total P&L",            money(float(pnl_ser.sum()))),
+        ("Average P&L / trade",  money(float(pnl_ser.mean()))),
+        ("Profit factor",        pf_str),
+        ("Average winner",       money(s.get("avg_winner"))),
+        ("Average loser",        money(s.get("avg_loser"))),
+        ("Largest winner",       money(float(winners.max())) if len(winners) else "—"),
+        ("Largest loser",        money(float(losers.min()))  if len(losers)  else "—"),
+        ("Std dev (winners)",    money(s.get("std_winner"))),
+        ("Std dev (losers)",     money(s.get("std_loser"))),
+        ("Avg days in trade",    num(avg_days, 1) if avg_days is not None else "—"),
+        ("Total commission",     price(total_comm)),
+        ("Sharpe (annualised)",  num(s.get("sharpe"))  if s.get("sharpe")  is not None else "—"),
+        ("Sortino (annualised)", num(s.get("sortino")) if s.get("sortino") is not None else "—"),
+        ("Calmar",               num(s.get("calmar"))  if s.get("calmar")  is not None else "—"),
+        ("VaR 95% (per trade)",  money(s.get("var_95"))),
+        ("Max drawdown",         money(s.get("max_dd"))),
+        ("Max drawdown %",       pct(s.get("max_dd_pct")) if s.get("max_dd_pct") is not None else "—"),
+        ("Recovery (days)",      str(s.get("recovery_days")) if s.get("recovery_days") is not None else "—"),
+    ]
+
+
+def _account_summary_lines(all_rows: list, open_rows: list, closed_rows: list,
+                           acct_bal: float, net: bool) -> list:
+    pnl_key = "pnl_net" if net else "pnl"
+    def _sum(rows, key): return float(sum((t.get(key) or 0) for t in rows))
+    realized   = _sum(closed_rows, pnl_key)
+    unrealized = _sum(open_rows,   pnl_key)
+    return [
+        ("Account balance",          fmt_price(acct_bal) if acct_bal else "— (set in Settings)"),
+        ("Trades in range",          str(len(all_rows))),
+        ("  · Closed",               str(len(closed_rows))),
+        ("  · Still open",           str(len(open_rows))),
+        ("Realized P&L (closed)",    fmt_pnl(realized)),
+        ("Unrealized P&L (open)",    fmt_pnl(unrealized)),
+        ("Combined P&L",             fmt_pnl(realized + unrealized)),
+        ("Total commission",         fmt_price(_sum(all_rows, "commission"))),
+        ("Open risk (to stops)",     fmt_pnl(_sum(open_rows, "open_risk"))),
+        ("Opening risk (at entry)",  fmt_price(_sum(open_rows, "opening_risk"))),
+        ("Open exposure (% of acct)", fmt_pct(_sum(open_rows, "pct_acct")) if acct_bal else "—"),
+    ]
+
+
+def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float) -> bytes:
+    """Build the 'Export for Review' PDF (trade log + full stats) and return its bytes."""
+    from io import BytesIO
+    from xml.sax.saxutils import escape as _xesc
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                    Paragraph, Spacer)
+
+    # ── Gather + filter (entry date within range) ────────────────────────────
+    df = load_trades()
+    if not df.empty:
+        _ed  = pd.to_datetime(df["entry_date"], errors="coerce").dt.date
+        df = df[(_ed >= start_date) & (_ed <= end_date)].copy()
+        df = df.sort_values("entry_date").reset_index(drop=True)
+
+    live_data = {}
+    if not df.empty:
+        open_syms = sorted({_get_live_ticker(r) for _, r in df.iterrows()
+                            if _is_open(r) and _get_live_ticker(r)})
+        if open_syms:
+            try:
+                live_data = get_live_data(tuple(open_syms))
+            except Exception:
+                live_data = {}
+
+    rows        = _compute_review_rows(df, live_data, acct_bal)
+    open_rows   = [t for t in rows if t["is_open"]]
+    closed_rows = [t for t in rows if not t["is_open"]]
+    pnl_key     = "pnl_net" if net_commission else "pnl"
+
+    # ── Styles ───────────────────────────────────────────────────────────────
+    styles = getSampleStyleSheet()
+    h1    = ParagraphStyle("rv_h1", parent=styles["Heading1"], fontSize=16, spaceAfter=2)
+    h2    = ParagraphStyle("rv_h2", parent=styles["Heading2"], fontSize=12, spaceBefore=12, spaceAfter=4)
+    h3    = ParagraphStyle("rv_h3", parent=styles["Heading3"], fontSize=10, spaceAfter=3)
+    sub   = ParagraphStyle("rv_sub", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#444444"))
+    small = ParagraphStyle("rv_sm", parent=styles["Normal"], fontSize=7, leading=8.5)
+
+    def _para(text, style=small):
+        return Paragraph(_xesc(str(text or "")).replace("\n", "<br/>"), style)
+
+    story = []
+    story.append(Paragraph("Trade Log — Export for Review", h1))
+    _range = f"{fmt_date(str(start_date), euro_dates)}  →  {fmt_date(str(end_date), euro_dates)}"
+    story.append(Paragraph(
+        f"Trades by entry date: <b>{_range}</b> &nbsp;·&nbsp; "
+        f"Account balance: <b>{fmt_price(acct_bal) if acct_bal else '—'}</b> &nbsp;·&nbsp; "
+        f"P&amp;L basis: <b>{'Net of commission' if net_commission else 'Gross'}</b>", sub))
+    story.append(Spacer(1, 8))
+
+    # ── Trade log table ──────────────────────────────────────────────────────
+    story.append(Paragraph(f"Trade Log — {len(rows)} trade(s) "
+                           f"({len(open_rows)} open, {len(closed_rows)} closed)", h2))
+    if rows:
+        header = ["Ticker", "Entry Date", "Qty", "Entry", "Stop", "Opening Risk",
+                  "% Acct", "P&L", "Open Risk", "Tags", "Notes"]
+        data = [header]
+        for t in rows:
+            data.append([
+                _para(t["ticker"]),
+                fmt_date(str(t["entry_date"]), euro_dates),
+                fmt_qty(t["qty"]) if t["qty"] is not None else "—",
+                fmt_price(t["entry_price"]) if t["entry_price"] is not None else "—",
+                fmt_price(t["stop"]) if t["stop"] is not None else "—",
+                fmt_price(t["opening_risk"]) if t["opening_risk"] is not None else "—",
+                fmt_pct(t["pct_acct"]) if t["pct_acct"] is not None else "—",
+                fmt_pnl(t[pnl_key]) if t[pnl_key] is not None else "—",
+                fmt_pnl(t["open_risk"]) if t["open_risk"] is not None else "—",
+                _para(t["tags"]),
+                _para(t["notes"]),
+            ])
+        col_w = [0.7, 0.85, 0.5, 0.72, 0.72, 0.9, 0.55, 0.9, 0.9, 1.25, 1.55]
+        tbl = Table(data, colWidths=[w * inch for w in col_w], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a2236")),
+            ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+            ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, 0), (-1, -1), 7),
+            ("ALIGN",      (2, 1), (8, -1), "RIGHT"),
+            ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+            ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f5fa")]),
+            ("TOPPADDING",    (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
+        ]))
+        story.append(tbl)
+    else:
+        story.append(Paragraph("No trades have an entry date in this range.", sub))
+
+    # ── Statistics (closed / open / account, side by side) ───────────────────
+    story.append(Paragraph("Statistics", h2))
+
+    def _stat_table(lines):
+        t = Table([[lbl, val] for lbl, val in lines], colWidths=[1.95 * inch, 1.25 * inch])
+        t.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN",    (1, 0), (1, -1), "RIGHT"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.HexColor("#e2e6ee")),
+            ("TOPPADDING",    (0, 0), (-1, -1), 1.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+        ]))
+        return t
+
+    cell_closed = [Paragraph("Closed trades", h3), _stat_table(_review_stat_lines(closed_rows, acct_bal, net_commission))]
+    cell_open   = [Paragraph("Open trades", h3),   _stat_table(_review_stat_lines(open_rows, acct_bal, net_commission))]
+    cell_acct   = [Paragraph("Account summary", h3), _stat_table(_account_summary_lines(rows, open_rows, closed_rows, acct_bal, net_commission))]
+    stats_layout = Table([[cell_closed, cell_open, cell_acct]],
+                         colWidths=[3.3 * inch, 3.3 * inch, 3.3 * inch])
+    stats_layout.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(stats_layout)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter),
+                            leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+                            topMargin=0.5 * inch, bottomMargin=0.5 * inch,
+                            title="Trade Log — Export for Review")
+    doc.build(story)
+    return buf.getvalue()
+
+
+@st.dialog("✅  Trade Added")
+def _trade_added_dialog(summary: dict):
+    st.markdown(f"**{summary.get('title', 'Trade added to your log.')}**")
+    for _ln in summary.get("lines", []):
+        st.markdown(_ln)
+    if st.button("OK", type="primary", width="stretch", key="_trade_added_ok"):
+        st.rerun()
+
+
+@st.dialog("📄  Export for Review")
+def _export_dialog(acct_bal: float):
+    st.markdown(
+        "Generate a PDF you can save or print — your **trade log** plus the **full "
+        "statistics** (open and closed, with account-level totals) for a date range."
+    )
+    _today = pd.Timestamp.today().date()
+    st.session_state.setdefault("_exp_from", (pd.Timestamp.today() - pd.Timedelta(days=90)).date())
+    st.session_state.setdefault("_exp_to", _today)
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", key="_exp_from")
+    end   = c2.date_input("To",   key="_exp_to")
+    net   = st.checkbox("Show P&L net of commission", value=True, key="_exp_net")
+
+    if start > end:
+        st.error("The ‘From’ date must be on or before the ‘To’ date.")
+        return
+
+    if st.button("📄  Build PDF report", type="primary", width="stretch", key="_exp_build"):
+        with st.spinner("Building report (fetching live prices for open trades)…"):
+            try:
+                st.session_state["_exp_pdf"] = build_review_pdf(start, end, net, acct_bal)
+                st.session_state["_exp_pdf_name"] = f"trade-review_{start}_{end}.pdf"
+            except ImportError:
+                st.session_state.pop("_exp_pdf", None)
+                st.error("The PDF engine (reportlab) isn't installed yet. Update the app, "
+                         "or run `pip install reportlab`, then try again.")
+            except Exception as _e:
+                st.session_state.pop("_exp_pdf", None)
+                st.error(f"Could not build the report: {_e}")
+
+    if st.session_state.get("_exp_pdf"):
+        st.success("Report ready.")
+        st.download_button("⬇  Download PDF", data=st.session_state["_exp_pdf"],
+                           file_name=st.session_state.get("_exp_pdf_name", "trade-review.pdf"),
+                           mime="application/pdf", width="stretch", key="_exp_dl")
+
+    if st.button("Close", width="stretch", key="_exp_close"):
+        st.session_state["_show_export"] = False
+        st.session_state.pop("_exp_pdf", None)
+        st.session_state.pop("_exp_pdf_name", None)
+        st.rerun()
+
+
 # ── App startup ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Trade Log", layout="wide")
@@ -2267,9 +3020,13 @@ button[kind="primary"] {
 [data-baseweb="select"] > div:first-child > div:last-child {
     border-left: none !important;
 }
-/* Hide any hr or empty span used as a visual separator */
+/* Hide any hr or empty span used as a visual separator.
+   The :empty guard is essential — without it this rule also matched the
+   multiselect chip's delete (×) wrapper (an aria-hidden span that *contains*
+   an svg), hiding it and making individual tags impossible to remove. The
+   real separator is an empty span, so :empty hides it while sparing the × . */
 [data-baseweb="select"] hr,
-[data-baseweb="select"] > div span[aria-hidden="true"]:not([class*="icon"]) {
+[data-baseweb="select"] > div span[aria-hidden="true"]:not([class*="icon"]):empty {
     display: none !important;
 }
 /* Remove the bottom status/focus bar that appears on some Streamlit builds */
@@ -2362,7 +3119,7 @@ input, textarea, select,
 if _theme_key != "ocean_dark":
     st.markdown(_build_theme_css(_TH), unsafe_allow_html=True)
 
-components.html("""
+st.iframe("""
 <script>
 (function() {
     var doc = window.parent.document;
@@ -2406,13 +3163,88 @@ components.html("""
     new MutationObserver(applyRequiredLabelStyle).observe(doc.body, { childList: true, subtree: true });
 })();
 </script>
-""", height=0)
+""", height=1)  # st.iframe (was components.html, deprecated); min height 1, JS-only injector
 
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 
 _MAIN_PAGES  = ["📋  Trading Log", "📝  Trading Plan", "📊  Statistics", "📈  Equity Curve", "🛠️  Trading Tools"]
 _ADMIN_PAGES = ["🏷️  Tags", "🔗  Broker Sync", "⚙️  Settings"]
+
+# ── Glossary content (edit freely — plain markdown) ─────────────────────────────
+GLOSSARY_MD = """
+**Charting and Analysis Platforms**
+- **Thinkorswim** — Charles Schwab's advanced desktop charting and trading platform.
+- **TradingView** — Web-based charting platform with social features and scripting (Pine Script).
+- **TradeVision** — Charting and analysis platform.
+- **StockCharts** — Web-based charting and technical analysis service.
+
+**Screening Platforms**
+- **Finviz** — Stock screener and market visualization (heatmaps, news, screens).
+- **TradingView** — Built-in screener for stocks, forex, and crypto.
+- **Thinkorswim** — Scan/screening tools built into the platform.
+- **TradeVision** — Screening platform.
+- **StockCharts** — Screening via scans and predefined filters.
+- **Chartmill** — Technical and fundamental stock screener.
+
+**Execution Platforms**
+- **TradingView** — Order entry and execution through connected brokers.
+
+**Brokers**
+- **IBKR** — Interactive Brokers; low-cost global broker with deep API access.
+- **Schwab (TOS)** — Charles Schwab, parent of the Thinkorswim platform.
+- **Fidelity** — Full-service US broker.
+- **Robinhood** — Commission-free mobile-first broker.
+- **ETrade** — US online broker (owned by Morgan Stanley).
+- **WeBull** — Commission-free broker with active-trader tools.
+- **212** — Trading 212; UK/EU commission-free broker.
+
+**Indicator List**
+- **RSI** — Relative Strength Index; momentum oscillator measuring speed/magnitude of price moves (0–100).
+- **MACD** — Moving Average Convergence Divergence; trend/momentum indicator from two EMAs.
+- **Stochastic** — Momentum oscillator comparing close to a range over a period.
+- **Moving Averages** — Smoothed average price over a window.
+    - **SMA** — Simple Moving Average; equal weighting of all periods.
+    - **EMA** — Exponential Moving Average; more weight to recent prices.
+- **MRSI** — Modified/Mean RSI variant.
+- **Bollinger Bands** — Volatility bands set a number of standard deviations around a moving average.
+- **ATR** — Average True Range; measure of volatility.
+
+**Terms**
+
+*Orders*
+- **Market** — Buy/sell immediately at the best available price.
+- **Limit** — Execute only at a specified price or better.
+- **Stop (Market)** — Becomes a market order once the stop price is hit.
+- **Stop (Limit)** — Becomes a limit order once the stop price is hit.
+- **Stop Buy orders** — Stop order to enter long above the current price.
+- **Trailing Stop** — Stop that follows price by a set distance/percentage.
+- **OCO** — One-Cancels-Other; filling one order cancels the other.
+- **OTOCO** — One-Triggers-OCO; an entry order that triggers a bracket (OCO) of exits.
+- **OTO** — One-Triggers-Other; filling the first order activates the next.
+- **1st Triggers OCO** — First order, once filled, activates an OCO pair.
+- **Multiple OCOs** — Several linked OCO groups managed together.
+- **MOC order** — Market-On-Close; executes at the closing price.
+- **LOC order** — Limit-On-Close; executes at the close only if the limit is met.
+- **AON order** — All-Or-None; fill the entire quantity or none.
+- **FOK order** — Fill-Or-Kill; fill immediately and completely or cancel.
+- **Conditional code for entries** — Rule/condition-based logic that triggers entries.
+
+*Miscellaneous Jargon*
+- _(add terms here)_
+
+**Metrics**
+- **Sharpe** — Risk-adjusted return using total volatility (std. deviation).
+- **Sortino** — Risk-adjusted return penalizing only downside volatility.
+- **R Value** — Profit/loss expressed in multiples of initial risk (1R = risk per trade).
+- **Calmar** — Return divided by maximum drawdown.
+- **Drawdown** — Peak-to-trough decline in equity.
+- **EV/Expectancy** — Average expected profit/loss per trade.
+
+**Risk Management**
+- **Risk based position sizing** — Size positions from the dollar risk per trade (entry to stop).
+- **Allocation based position sizing** — Size positions as a fixed percentage of account capital.
+"""
 
 if "nav_page" not in st.session_state:
     st.session_state["nav_page"] = "📋  Trading Log"
@@ -2439,6 +3271,35 @@ with st.sidebar:
                      type="primary" if _active else "secondary"):
             st.session_state["nav_page"] = _p
             st.rerun()
+
+    # ── Glossary ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("📖  Glossary"):
+        st.markdown(GLOSSARY_MD)
+
+    # ── Export for Review (big, prominent) ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        "<style>"
+        "div[data-testid='stSidebar'] .st-key-sb_export_review button {"
+        "  background: linear-gradient(135deg,#3b1d6e,#6d28d9,#8b5cf6) !important;"
+        "  color:#fff !important; font-size:1.35rem !important; font-weight:900 !important;"
+        "  border:none !important; border-radius:12px !important; padding:1.0rem 0 !important;"
+        "  letter-spacing:0.05em !important;"
+        "  box-shadow:0 4px 18px rgba(139,92,246,0.5),0 2px 6px #0008 !important;"
+        "  text-shadow:0 1px 4px #0005 !important; transition:transform .1s, box-shadow .1s !important;"
+        "}"
+        "div[data-testid='stSidebar'] .st-key-sb_export_review button:hover {"
+        "  transform:scale(1.03) !important;"
+        "  box-shadow:0 6px 24px rgba(139,92,246,0.65),0 3px 8px #000a !important;"
+        "}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+    if st.button("📄  EXPORT FOR REVIEW", width='stretch', key="sb_export_review",
+                 help="Create a PDF review report (trade log + full stats) for a date range"):
+        st.session_state["_show_export"] = True
+        st.rerun()
 
     # ── App updates ────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -2725,6 +3586,11 @@ if (settings.get("onboarding_done", "0") != "1"
         and not st.session_state.get("_tour_active")):
     _welcome_dialog()
 
+# Export-for-Review dialog — opened from the sidebar; re-rendered every run while
+# open so its buttons (Build / Download / Close) are processed correctly.
+if st.session_state.get("_show_export"):
+    _export_dialog(acct_bal)
+
 # Sidebar reminder + escape hatch while a tour is running
 if st.session_state.get("_tour_active"):
     with st.sidebar:
@@ -2783,6 +3649,17 @@ if page == "📋  Trading Log":
 
     # ── Add Trade ─────────────────────────────────────────────────────────────
 
+    # On the rerun after a successful add, surface the confirmation dialog. Popping
+    # the flag before opening it makes the dialog one-shot: OK (or dismiss) reruns
+    # with no flag → it closes.
+    _just_added = st.session_state.pop("_trade_added", None)
+    if _just_added:
+        # Reset the ticker field by bumping its key seed: the ticker lives outside
+        # the form (so clear_on_submit can't reach it) and deleting its key doesn't
+        # reliably reset a text_input. A fresh key = a brand-new, empty widget.
+        st.session_state["_add_tk_seed"] = st.session_state.get("_add_tk_seed", 0) + 1
+        _trade_added_dialog(_just_added)
+
     with st.expander("➕  Add Trade", expanded=False):
 
         # Instrument type selector — outside form so it drives field layout
@@ -2815,9 +3692,10 @@ if page == "📋  Trading Log":
             _tlk3.checkbox("Trailing Stop", key="add_trailing_en", value=False)
         else:
             _tlk1, _tlk2 = st.columns([2, 3])
+        _at_tk_key = f"add_ticker_lookup_{st.session_state.get('_add_tk_seed', 0)}"
         _at_ticker_raw = _tlk1.text_input(
             _at_lk_label,
-            key="add_ticker_lookup",
+            key=_at_tk_key,
             placeholder="e.g. AAPL",
             label_visibility="visible",
         )
@@ -2844,7 +3722,7 @@ if page == "📋  Trading Log":
 
             # ── STOCK ───────────────────────────────────────────────────────
             if inst == "Stock":
-                s_ticker = st.session_state.get("add_ticker_lookup", "").strip().upper()
+                s_ticker = _at_ticker
                 c1, c2, c3 = st.columns(3)
                 entry_date  = c1.date_input("Entry Date *")
                 quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.0f", value=None)
@@ -2885,7 +3763,7 @@ if page == "📋  Trading Log":
 
             # ── OPTION ──────────────────────────────────────────────────────
             elif inst == "Option":
-                s_ticker = st.session_state.get("add_ticker_lookup", "").strip().upper()
+                s_ticker = _at_ticker
                 oc1, oc2 = st.columns(2)
                 opt_entry_dt  = oc1.date_input("Entry Date *")
                 opt_mult      = oc2.number_input("Multiplier", value=100.0, step=1.0, format="%.0f",
@@ -2945,7 +3823,7 @@ if page == "📋  Trading Log":
 
             # ── FUTURE ──────────────────────────────────────────────────────
             else:
-                s_ticker = st.session_state.get("add_ticker_lookup", "").strip().upper()
+                s_ticker = _at_ticker
                 fc1, fc2, fc3 = st.columns(3)
                 fut_mult     = fc1.number_input("Multiplier *", value=50.0, step=1.0, format="%.0f",
                                                help="Contract multiplier (ES=50, NQ=20, CL=1000…)")
@@ -3004,7 +3882,13 @@ if page == "📋  Trading Log":
                             )
                             for f in (uploaded_files or []):
                                 save_attachment(new_id, f)
-                            st.toast(f"Trade added: {t}", icon="✅")
+                            st.session_state["_trade_added"] = {
+                                "title": f"{t} added to your log.",
+                                "lines": [
+                                    f"- **Quantity:** {fmt_qty(quantity)}",
+                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, euro_dates)}",
+                                ],
+                            }
                             st.rerun()
                         except Exception as _err:
                             st.error(f"Failed to save trade: {_err}")
@@ -3053,7 +3937,13 @@ if page == "📋  Trading Log":
                                 )
                                 added += 1
                             if added:
-                                st.toast(f"Added {added} option leg{'s' if added > 1 else ''} for {t}", icon="✅")
+                                st.session_state["_trade_added"] = {
+                                    "title": f"{t} option added to your log.",
+                                    "lines": [
+                                        f"- **Legs:** {added}",
+                                        f"- **Entry date:** {fmt_date(opt_entry_dt, euro_dates)}",
+                                    ],
+                                }
                                 st.rerun()
                             else:
                                 st.error("No valid legs to save — check required fields.")
@@ -3083,7 +3973,13 @@ if page == "📋  Trading Log":
                                 commission=float(fut_commission) if fut_commission else 0.0,
                                 account_name=fut_account,
                             )
-                            st.toast(f"Futures trade added: {t}", icon="✅")
+                            st.session_state["_trade_added"] = {
+                                "title": f"{t} futures trade added to your log.",
+                                "lines": [
+                                    f"- **Contracts:** {fmt_qty(quantity)}",
+                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, euro_dates)}",
+                                ],
+                            }
                             st.rerun()
                         except Exception as _err:
                             st.error(f"Failed to save futures trade: {_err}")
@@ -3386,7 +4282,7 @@ if page == "📋  Trading Log":
         tag_filter   = fr2c1.multiselect("Tags (any match)",
                             options=sorted(tag_name_to_id.keys()), placeholder="All tags", key="filter_tags")
         date_col_sel = fr2c2.selectbox("Filter date", ["Entry Date", "Exit Date"], key="filter_date_col")
-        date_range   = fr2c3.date_input("Date range", value=[], key="filter_date_range")
+        date_range   = fr2c3.date_input("Date range", key="filter_date_range")
         fr2c4.markdown("<div style='margin-top:1.6rem'></div>", unsafe_allow_html=True)
         if fr2c4.button("↺ Reset", key="reset_filters", help="Reset all filters to defaults",
                         width='stretch'):
@@ -3463,6 +4359,16 @@ if page == "📋  Trading Log":
             )
             with st.spinner(_load_msg):
                 live_data = get_live_data(live_symbols)
+                # Compute option greeks once, here, from the freshly-loaded prices —
+                # NOT on every rerun (avoids repeated network round-trips and any
+                # per-contract IB market-data blocking).
+                try:
+                    _open_for_greeks = trades[_make_is_open_mask(trades)]
+                    st.session_state["_greeks_cache"] = compute_position_greeks(
+                        _open_for_greeks, live_data
+                    )
+                except Exception:
+                    st.session_state["_greeks_cache"] = {}
             # Persist so prices survive navigation away and back
             st.session_state["_live_data_cache"] = live_data
             # Clear flag so subsequent reruns (column changes, etc.) don't re-fetch
@@ -3483,10 +4389,24 @@ if page == "📋  Trading Log":
 
         # ── View toggle (Positions / Trades) + expand legs ────────────────────
 
+        # Persist the view toggles across reruns. Sidebar actions like "Refresh
+        # live prices" call st.rerun() before these widgets are instantiated, so
+        # Streamlit drops their widget-keyed state — which made "Group by ticker"
+        # snap back to off on a refetch. We mirror each toggle into a plain
+        # (non-widget) key and restore it only when the widget key was dropped, so a
+        # normal toggle click is never clobbered but an aborted rerun no longer
+        # loses the choice. (Passing value= alongside key= is also avoided — it
+        # triggers Streamlit's "value set via Session State API" warning.)
+        for _tk in ("_positions_view", "_expand_legs"):
+            _pk = _tk + "_persist"
+            if _pk not in st.session_state:
+                st.session_state[_pk] = False
+            if _tk not in st.session_state:
+                st.session_state[_tk] = st.session_state[_pk]
+
         _grp_col1, _grp_col2, _grp_col3 = st.columns([2, 2, 4])
         _positions_view = _grp_col1.toggle(
             "Group by ticker",
-            value=st.session_state.get("_positions_view", False),
             key="_positions_view",
             help=(
                 "**On** — aggregates all open trades for the same ticker into one row "
@@ -3497,10 +4417,12 @@ if page == "📋  Trading Log":
         )
         _expand_legs = _grp_col2.toggle(
             "Expand individual legs",
-            value=st.session_state.get("_expand_legs", False),
             key="_expand_legs",
             help="When off, spread/roll legs are collapsed into one aggregated row per group. Toggle on to see all legs.",
         )
+        # Mirror the live values back into the persist keys for the next rerun.
+        st.session_state["_positions_view_persist"] = _positions_view
+        st.session_state["_expand_legs_persist"]    = _expand_legs
 
         # ── Column selector ────────────────────────────────────────────────────
 
@@ -3510,6 +4432,37 @@ if page == "📋  Trading Log":
             _custom_presets: dict = _json.loads(_raw_presets)
         except Exception:
             _custom_presets = {}
+
+        # Seed the visible-columns selection once per session so the multiselect is
+        # driven purely by session_state (no `default=` param). Passing both a
+        # default and a key that's already in session_state triggers Streamlit's
+        # "value set via Session State API" warning and can drop the user's custom
+        # column view on rerun (e.g. after the Refresh Live Prices button).
+        if "visible_cols" not in st.session_state:
+            _saved_vc = get_setting("col_order")
+            _vc0 = _json.loads(_saved_vc) if _saved_vc else list(DEFAULT_COLS)
+            _vc0 = [c for c in _vc0 if c in ALL_COLS] or list(DEFAULT_COLS)
+            # One-time: surface the Spread Type column for layouts saved before it
+            # existed. Guarded by a flag so a later manual removal stays removed.
+            if get_setting("_spread_type_col_seeded", "") != "1":
+                if "Spread Type" not in _vc0:
+                    _ins = (_vc0.index("Quantity") + 1) if "Quantity" in _vc0 else len(_vc0)
+                    _vc0.insert(_ins, "Spread Type")
+                set_setting("col_order", _json.dumps(_vc0))
+                set_setting("_spread_type_col_seeded", "1")
+            st.session_state["visible_cols"] = _vc0
+
+        # Apply a deferred column removal here — BEFORE the multiselect widget is
+        # instantiated (Streamlit forbids mutating a widget's state afterwards).
+        _rm_pending = st.session_state.pop("_col_remove_pending", None)
+        if _rm_pending:
+            st.session_state["visible_cols"] = [
+                c for c in st.session_state.get("visible_cols", []) if c != _rm_pending
+            ]
+            if "col_order" in st.session_state:
+                st.session_state["col_order"] = [
+                    c for c in st.session_state["col_order"] if c != _rm_pending
+                ]
 
         col_pop, _ = st.columns([1, 5])
         with col_pop:
@@ -3531,21 +4484,29 @@ if page == "📋  Trading Log":
 
                 # ── Saved custom presets ───────────────────────────────────
                 if _custom_presets:
-                    st.caption("Saved presets")
+                    st.caption("Saved presets — click to apply · 💾 update · ✕ delete")
                     for _pname, _pcols in list(_custom_presets.items()):
-                        _pb_col, _pd_col = st.columns([4, 1])
+                        _pb_col, _pu_col, _pd_col = st.columns([5, 1, 1])
                         if _pb_col.button(_pname, key=f"preset_custom_{_pname}", width='stretch'):
-                            st.session_state["visible_cols"] = _pcols
+                            st.session_state["visible_cols"] = list(_pcols)
                             st.session_state["col_order"]    = list(_pcols)
                             st.rerun()
-                        if _pd_col.button("✕", key=f"preset_del_{_pname}", width='stretch'):
+                        if _pu_col.button("💾", key=f"preset_upd_{_pname}", width='stretch',
+                                          help=f"Overwrite “{_pname}” with the current columns & order"):
+                            _co_now = st.session_state.get(
+                                "col_order", st.session_state.get("visible_cols", DEFAULT_COLS))
+                            _custom_presets[_pname] = list(_co_now)
+                            set_setting("col_presets", _json.dumps(_custom_presets))
+                            st.toast(f"Updated preset “{_pname}”.", icon="💾")
+                            st.rerun()
+                        if _pd_col.button("✕", key=f"preset_del_{_pname}", width='stretch',
+                                          help=f"Delete “{_pname}”"):
                             del _custom_presets[_pname]
                             set_setting("col_presets", _json.dumps(_custom_presets))
                             st.rerun()
 
                 # ── Column multiselect ─────────────────────────────────────
                 visible_cols = st.multiselect("Visible columns", options=ALL_COLS,
-                                              default=st.session_state.get("visible_cols", DEFAULT_COLS),
                                               key="visible_cols")
 
                 # ── Save current selection as new preset ───────────────────
@@ -3557,9 +4518,20 @@ if page == "📋  Trading Log":
                     if _new_preset_name.strip():
                         # Save using current col_order so the preset preserves order
                         _co_now = st.session_state.get("col_order", st.session_state.get("visible_cols", DEFAULT_COLS))
-                        _custom_presets[_new_preset_name.strip()] = _co_now
+                        _custom_presets[_new_preset_name.strip()] = list(_co_now)
                         set_setting("col_presets", _json.dumps(_custom_presets))
                         st.rerun()
+
+                # ── Make the current view the startup default ──────────────
+                st.divider()
+                if st.button("📌  Set current view as my default", key="set_cols_default",
+                             width='stretch',
+                             help="Use these columns & order as the startup view every session"):
+                    _co_now = st.session_state.get(
+                        "col_order", st.session_state.get("visible_cols", DEFAULT_COLS))
+                    set_setting("col_order", _json.dumps(list(_co_now)))
+                    st.toast("Saved as your default startup view.", icon="📌")
+                    st.rerun()
 
         # ── Column order tracking ──────────────────────────────────────────────
         # Multiselect always returns values in ALL_COLS order, so track insertion
@@ -3578,24 +4550,31 @@ if page == "📋  Trading Log":
                      [c for c in _cur_vis_list if c not in _col_order]
         st.session_state["col_order"] = _col_order
 
-        # ── Column reorder expander ────────────────────────────────────────────
-        if len(_col_order) >= 2:
-            with st.expander("↕  Column order", expanded=False):
-                st.caption("Use ↑ / ↓ to reorder, then save as default.")
+        # ── Column reorder / remove expander ────────────────────────────────────
+        if len(_col_order) >= 1:
+            with st.expander("↕  Column order & visibility", expanded=False):
+                st.caption("↑ / ↓ to reorder · ✕ to remove a column.")
                 for _ci, _cn in enumerate(_col_order):
-                    _rca, _rcb, _rcc = st.columns([7, 0.7, 0.7])
+                    _rca, _rcb, _rcc, _rcd = st.columns([6, 0.7, 0.7, 0.7])
                     _rca.write(_cn)
-                    if _ci > 0 and _rcb.button("↑", key=f"_co_up_{_ci}"):
+                    if _ci > 0 and _rcb.button("↑", key=f"_co_up_{_ci}", help="Move up"):
                         _col_order[_ci - 1], _col_order[_ci] = _col_order[_ci], _col_order[_ci - 1]
                         st.session_state["col_order"] = _col_order
                         st.rerun()
-                    if _ci < len(_col_order) - 1 and _rcc.button("↓", key=f"_co_dn_{_ci}"):
+                    if _ci < len(_col_order) - 1 and _rcc.button("↓", key=f"_co_dn_{_ci}", help="Move down"):
                         _col_order[_ci], _col_order[_ci + 1] = _col_order[_ci + 1], _col_order[_ci]
                         st.session_state["col_order"] = _col_order
                         st.rerun()
-                if st.button("📌  Save as default", key="save_col_order_default"):
+                    if len(_col_order) > 1 and _rcd.button("✕", key=f"_co_rm_{_ci}",
+                                                           help=f"Remove “{_cn}”"):
+                        # Defer the mutation — visible_cols is a widget already
+                        # instantiated above; apply it at the top of the next run.
+                        st.session_state["_col_remove_pending"] = _cn
+                        st.rerun()
+                if st.button("📌  Save as default", key="save_col_order_default",
+                             help="Use this columns & order as the startup view every session"):
                     set_setting("col_order", _json.dumps(_col_order))
-                    st.toast("Column order saved as default.", icon="📌")
+                    st.toast("Saved as your default startup view.", icon="📌")
 
         vis = _col_order
 
@@ -3608,6 +4587,19 @@ if page == "📋  Trading Log":
             metadata = get_ticker_metadata(meta_tickers) if meta_tickers else {}
         else:
             metadata = {}
+
+        # ── Option greeks (computed once at price-load, mapped from cache here) ──
+        # Signed position greeks → spread groups aggregate by simple summation.
+        if ("Delta" in vis or "Theta" in vis) and not filtered.empty and "id" in filtered.columns:
+            _gc = st.session_state.get("_greeks_cache", {})
+            if _gc:
+                _idser = filtered["id"]
+                filtered["_delta_pos"] = _idser.map(
+                    lambda i: (_gc.get(int(i)) or {}).get("delta") if pd.notna(i) else None
+                )
+                filtered["_theta_pos"] = _idser.map(
+                    lambda i: (_gc.get(int(i)) or {}).get("theta") if pd.notna(i) else None
+                )
 
         # ── Build display DataFrame ────────────────────────────────────────────
 
@@ -3738,7 +4730,8 @@ if page == "📋  Trading Log":
             )
 
         display["Position Value"] = filtered.apply(
-            lambda r: fmt_price(r["quantity"] * r["entry_price"]) if r["quantity"] and r["entry_price"] else "—", axis=1
+            lambda r: fmt_price(r["quantity"] * r["entry_price"] * (r.get("multiplier") or 1.0))
+                      if r["quantity"] and r["entry_price"] else "—", axis=1
         )
         display["Opening Stop"] = filtered["opening_stop"].apply(fmt_price)
         def _fmt_current_stop(row):
@@ -3769,7 +4762,8 @@ if page == "📋  Trading Log":
 
         if "Entry Value" in vis:
             display["Entry Value"] = filtered.apply(
-                lambda r: fmt_price(r["quantity"] * r["entry_price"]) if r["quantity"] and r["entry_price"] else "—", axis=1
+                lambda r: fmt_price(r["quantity"] * r["entry_price"] * (r.get("multiplier") or 1.0))
+                          if r["quantity"] and r["entry_price"] else "—", axis=1
             )
 
         need_cur_val = any(c in vis for c in ["Current Value", "% of Account"])
@@ -3779,16 +4773,31 @@ if page == "📋  Trading Log":
             _cv_xp   = pd.to_numeric(filtered["exit_price"], errors="coerce")
             _cv_px   = np.where(is_open_mask, _cv_live, _cv_xp)
             _cv_px_s = pd.to_numeric(pd.Series(_cv_px, index=filtered.index), errors="coerce")
-            filtered["_cur_val"] = np.where(_cv_qty.notna() & _cv_px_s.notna(), _cv_qty * _cv_px_s, np.nan)
+            filtered["_cur_val"] = np.where(_cv_qty.notna() & _cv_px_s.notna(),
+                                            _cv_qty * _cv_px_s * _mult, np.nan)
 
         if "Current Value" in vis:
             display["Current Value"] = filtered["_cur_val"].apply(fmt_price)
 
         if "% of Account" in vis:
-            display["% of Account"] = filtered.apply(
-                lambda r: fmt_pct(r["_cur_val"] / acct_bal * 100)
-                          if pd.notna(r.get("_cur_val")) and acct_bal > 0 else "—", axis=1
-            )
+            # Options: size by *max risk* (worst-case loss at expiration) as % of
+            # account. Stocks/other: size by current market value.
+            def _pct_of_account(r):
+                if not (acct_bal > 0):
+                    return "—"
+                if row_is_option(r):
+                    mr = option_legs_max_risk([{
+                        "type": r.get("option_type"), "strike": r.get("strike"),
+                        "side": r.get("side"),        "qty":    r.get("quantity"),
+                        "mult": r.get("multiplier"),  "entry_price": r.get("entry_price"),
+                    }])
+                    if mr is None:
+                        return "∞"          # unbounded (naked short call)
+                    return fmt_pct(mr / acct_bal * 100)
+                if pd.notna(r.get("_cur_val")):
+                    return fmt_pct(r["_cur_val"] / acct_bal * 100)
+                return "—"
+            display["% of Account"] = filtered.apply(_pct_of_account, axis=1)
 
         if "Ann. P&L" in vis:
             _ap_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
@@ -4053,14 +5062,16 @@ if page == "📋  Trading Log":
             display["Underlying"] = filtered.apply(_underlying, axis=1)
 
         if "Delta" in vis:
-            display["Delta"] = filtered["delta"].apply(
-                lambda v: fmt_num(float(v), decimals=4) if v is not None and not pd.isna(v) else "N/A"
-            ) if "delta" in filtered.columns else "N/A"
+            display["Delta"] = (
+                filtered["_delta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
+                if "_delta_pos" in filtered.columns else "—"
+            )
 
         if "Theta" in vis:
-            display["Theta"] = filtered["theta"].apply(
-                lambda v: fmt_num(float(v), decimals=4) if v is not None and not pd.isna(v) else "N/A"
-            ) if "theta" in filtered.columns else "N/A"
+            display["Theta"] = (
+                filtered["_theta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
+                if "_theta_pos" in filtered.columns else "—"
+            )
 
         if "Commission" in vis:
             display["Commission"] = filtered["commission"].apply(
@@ -4145,7 +5156,25 @@ if page == "📋  Trading Log":
                     _agg_row["Exit Date"]   = _grp_rows["Exit Date"].iloc[-1]
                     _agg_row["P&L"]         = fmt_pnl(_agg_pnl)
                     _agg_row["_pnl_num"]    = _agg_pnl
-                    _agg_row["Quantity"]    = f"{len(_grp_rows)} legs"
+                    # Quantity: for spreads show the number of *spreads* (the per-leg
+                    # contract count), which is what traders track — not the leg count,
+                    # which is just the structure. Rolls keep the leg count.
+                    if _gc == "leg_group":
+                        _sp_units = spread_unit_count(_grp_filt["quantity"].tolist())
+                        _agg_row["Quantity"] = (
+                            fmt_qty(_sp_units) if _sp_units else f"{len(_grp_rows)} legs"
+                        )
+                    else:
+                        _agg_row["Quantity"] = f"{len(_grp_rows)} legs"
+                    # Spread Type: stored type wins; otherwise infer from leg structure
+                    # so collapsed option spreads still show e.g. "Vertical" / "Iron Condor".
+                    if "Spread Type" in _agg_row:
+                        _stype_val = None
+                        if "spread_type" in _grp_filt.columns and _grp_filt["spread_type"].notna().any():
+                            _stype_val = _grp_filt["spread_type"].dropna().iloc[0]
+                        if not _stype_val and _grp_itype == "option" and _gc == "leg_group":
+                            _stype_val = _detect_spread_type(_grp_filt)
+                        _agg_row["Spread Type"] = str(_stype_val) if _stype_val else "—"
                     # Net live price: sum each leg's market price with side polarity
                     if _any_open and live_data:
                         _grp_live_tkrs = live_ticker_ser[_grp_mask]
@@ -4159,6 +5188,57 @@ if page == "📋  Trading Log":
                         ]
                         if len(_leg_pxs) == len(_grp_filt):
                             _agg_row["Live Price"] = fmt_price(sum(_leg_pxs))
+
+                    # Aggregate position-value columns across legs (net, with side
+                    # polarity — consistent with the net Live Price above).
+                    _val_signs = np.where(
+                        _grp_filt["side"].fillna("long").str.lower() == "short", -1.0, 1.0
+                    )
+                    # Current Value: net market value of the legs (with side polarity)
+                    if "_cur_val" in _grp_filt.columns:
+                        _leg_cv = pd.to_numeric(_grp_filt["_cur_val"], errors="coerce").to_numpy()
+                        if not np.all(np.isnan(_leg_cv)):
+                            _net_cv = float(np.nansum(_leg_cv * _val_signs))
+                            _agg_row["Current Value"] = fmt_price(_net_cv)
+                    # % of Account: option spreads sized by combined max risk
+                    # (worst-case loss across all legs); other groups by net value.
+                    if acct_bal > 0:
+                        if _grp_itype == "option":
+                            _mr = option_legs_max_risk([
+                                {"type": _r.get("option_type"), "strike": _r.get("strike"),
+                                 "side": _r.get("side"),        "qty":    _r.get("quantity"),
+                                 "mult": _r.get("multiplier"),  "entry_price": _r.get("entry_price")}
+                                for _, _r in _grp_filt.iterrows()
+                            ])
+                            if _mr is None:
+                                _agg_row["% of Account"] = "∞"
+                            elif _mr is not None:
+                                _agg_row["% of Account"] = fmt_pct(_mr / acct_bal * 100)
+                        elif "_cur_val" in _grp_filt.columns and not np.all(np.isnan(_leg_cv)):
+                            _agg_row["% of Account"] = fmt_pct(_net_cv / acct_bal * 100)
+                    # Entry Value: net debit/credit basis across legs
+                    _leg_qty  = pd.to_numeric(_grp_filt["quantity"],    errors="coerce").to_numpy()
+                    _leg_ep   = pd.to_numeric(_grp_filt["entry_price"], errors="coerce").to_numpy()
+                    _leg_mult = pd.to_numeric(_grp_filt["multiplier"],  errors="coerce").fillna(1.0).to_numpy()
+                    _leg_ev   = _leg_qty * _leg_ep * _leg_mult
+                    if not np.all(np.isnan(_leg_ev)):
+                        _agg_row["Entry Value"] = fmt_price(float(np.nansum(_leg_ev * _val_signs)))
+                    # Acct P&L % from the summed P&L
+                    if acct_bal > 0 and pd.notna(_agg_pnl):
+                        _agg_row["Acct P&L %"] = fmt_signed_pct(_agg_pnl / acct_bal * 100)
+                    # Days in Trade: legs share an entry date — use the first leg's value
+                    if "Days in Trade" in _grp_rows.columns:
+                        _agg_row["Days in Trade"] = _grp_rows["Days in Trade"].iloc[0]
+                    # Net greeks: sum signed position greeks across legs
+                    if "_delta_pos" in _grp_filt.columns:
+                        _ds = pd.to_numeric(_grp_filt["_delta_pos"], errors="coerce")
+                        if _ds.notna().any():
+                            _agg_row["Delta"] = fmt_num(float(_ds.sum()), 2)
+                    if "_theta_pos" in _grp_filt.columns:
+                        _ts = pd.to_numeric(_grp_filt["_theta_pos"], errors="coerce")
+                        if _ts.notna().any():
+                            _agg_row["Theta"] = fmt_num(float(_ts.sum()), 2)
+
                     _agg_rows.append(_agg_row)
                     _agg_member_ids.append(_grp_filt["id"].tolist())
 
@@ -4584,54 +5664,6 @@ if page == "📋  Trading Log":
 
         # ── Spread Summaries ───────────────────────────────────────────────────
 
-        def _detect_spread_type(legs: pd.DataFrame) -> str:
-            """Infer spread type from leg structure.
-
-            Normalises by collapsing duplicate (side, strike, type, expiration) combos
-            first, so a vertical filled in two pieces is still detected as a Vertical.
-            """
-            if len(legs) < 2:
-                return "Single"
-
-            norm_cols = [c for c in ("side", "strike", "option_type", "expiration")
-                         if c in legs.columns]
-            if norm_cols:
-                norm = legs[norm_cols].dropna(subset=norm_cols).drop_duplicates()
-            else:
-                norm = legs
-
-            n_exps    = norm["expiration"].nunique()  if "expiration"   in norm.columns else 0
-            n_strikes = norm["strike"].nunique()      if "strike"       in norm.columns else 0
-            n_types   = norm["option_type"].nunique() if "option_type"  in norm.columns else 0
-
-            # ── Multi-expiry ──────────────────────────────────────────────────
-            if n_exps > 1:
-                # Same strike, different expirations → Calendar
-                # Different strikes, different expirations → Diagonal
-                return "Calendar" if n_strikes <= 1 else "Diagonal"
-
-            # ── Single expiry — classify by unique strikes and option types ───
-            if n_types <= 1:
-                # Single option type (all calls or all puts)
-                if n_strikes == 2:
-                    return "Vertical"       # bull/bear spread
-                if n_strikes == 3:
-                    return "Butterfly"      # classic 1-2-1
-                if n_strikes == 4:
-                    return "Condor"         # 1-1-1-1 same type
-            else:
-                # Mixed calls and puts
-                if n_strikes == 1:
-                    return "Straddle"       # same strike, call + put
-                if n_strikes == 2:
-                    return "Strangle"       # diff strikes, call + put
-                if n_strikes == 3:
-                    return "Iron Fly"       # put spread + call spread, shared middle
-                if n_strikes == 4:
-                    return "Iron Condor"    # put spread + call spread, 4 strikes
-
-            return "Multi-Leg"
-
         if "leg_group" in _pre_agg_filtered.columns:
             _spread_rows = _pre_agg_filtered[
                 _pre_agg_filtered["leg_group"].notna() & (_pre_agg_filtered["leg_group"].astype(str) != "")
@@ -4871,8 +5903,13 @@ if page == "📋  Trading Log":
                                        text="Exit", showarrow=False, xanchor="right",
                                        font=dict(color="#e67e22"), yshift=4)
 
-                # Overlays — normalised to underlying first-close
-                first_close = float(chart_df["Close"].iloc[0]) if not chart_df.empty else 1.0
+                # Overlays — plotted as % change from their first close on a
+                # dedicated right-hand axis. Previously they were rebased onto the
+                # underlying's price and shared the candlestick's y-axis, so any
+                # overlay whose range differed stretched the axis and squashed the
+                # candles. A separate %-axis lets the candles auto-scale on their
+                # own while the comparison stays clearly readable.
+                _overlay_drawn = False
                 for ov in selected_overlays:
                     ov_ticker = ov.split(" ")[0]
                     ov_df = load_chart_data(ov_ticker, chart_start, chart_end)
@@ -4881,14 +5918,17 @@ if page == "📋  Trading Log":
                     ov_first = float(ov_df["Close"].iloc[0])
                     if ov_first == 0:
                         continue
-                    norm = first_close / ov_first
+                    ov_pct = (ov_df["Close"] / ov_first - 1.0) * 100.0
                     fig.add_scatter(
                         x=ov_df.index,
-                        y=ov_df["Close"] * norm,
+                        y=ov_pct,
                         mode="lines",
-                        name=ov_ticker,
+                        name=f"{ov_ticker} %",
                         line=dict(width=1.5),
+                        yaxis="y2",
+                        hovertemplate="%{y:.2f}%<extra>" + ov_ticker + "</extra>",
                     )
+                    _overlay_drawn = True
 
                 # Add-to-position markers (triangles at each additional buy lot)
                 _chart_lots = load_trade_lots(int(chart_row["id"]))
@@ -4937,6 +5977,20 @@ if page == "📋  Trading Log":
                     hovermode="x unified",
                     height=520,
                 )
+                if _overlay_drawn:
+                    # Right-hand %-axis for the overlays; move the legend up so it
+                    # doesn't collide with the axis title.
+                    fig.update_layout(
+                        yaxis2=dict(
+                            title="Overlay % change",
+                            overlaying="y", side="right",
+                            showgrid=False, zeroline=True,
+                            zerolinecolor="rgba(255,255,255,0.18)",
+                            ticksuffix="%",
+                        ),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="left", x=0),
+                    )
                 st.plotly_chart(fig, width='stretch')
 
             # ── Chart notes ───────────────────────────────────────────────────
@@ -5539,15 +6593,23 @@ elif page == "📈  Equity Curve":
             _ec_df["twr_pct"] = (pd.Series(_period_ret + 1).cumprod() - 1) * 100
 
             # ── Controls row 1: benchmarks + view ────────────────────────────
-            _ctrl_l, _ctrl_r = st.columns([2, 1])
+            _ctrl_l, _ctrl_r, _ctrl_s = st.columns([2, 1, 1])
             with _ctrl_l:
-                bench_options       = ["SPY", "QQQ", "IWM", "LQD", "JNK"]
-                selected_benchmarks = st.multiselect("Benchmarks", bench_options, default=[],
-                                                      help="Normalised to same start for comparison")
+                bench_options       = ["SPY", "QQQ", "IWM", "LQD", "JNK", "^VIX"]
+                selected_benchmarks = st.multiselect(
+                    "Benchmarks", bench_options, default=[],
+                    format_func=lambda _t: "VIX" if _t == "^VIX" else _t,
+                    help="Normalised to the same start for comparison · VIX is shown on the right axis",
+                )
             with _ctrl_r:
                 _ec_view = st.radio(
                     "View", ["% Return (TWR)", "Balance ($)"],
                     horizontal=True, key="ec_view_mode",
+                )
+            with _ctrl_s:
+                _ec_smooth = st.slider(
+                    "Line smoothing", 0, 100, 0, 5, key="ec_smooth",
+                    help="Visually smooths the equity line — it does not average the data",
                 )
 
             # ── Controls row 2: date range ────────────────────────────────────
@@ -5587,9 +6649,24 @@ elif page == "📈  Equity Curve":
                 _ec_plot_df["MA20"] = _ma20_vals.values
 
                 fig = go.Figure()
+                if _ec_smooth > 0 and len(_ec_plot_df) >= 3:
+                    # Force ns resolution both ways — pandas 2.x may store the date
+                    # column as datetime64[us], and a unit mismatch on the round-trip
+                    # would map the smoothed dates back to 1970.
+                    _date_ns = _ec_plot_df["date"].astype("datetime64[ns]").astype("int64")
+                    _sx, _sy = smooth_line_xy(
+                        _date_ns.to_numpy(),
+                        np.asarray(_plot_series, dtype=float),
+                        _ec_smooth / 100.0,
+                    )
+                    _port_x   = pd.to_datetime(_sx.astype("int64"))  # _sx is in ns
+                    _port_y   = _sy
+                    _port_mode = "lines"
+                else:
+                    _port_x, _port_y, _port_mode = _ec_plot_df["date"], _plot_series, "lines+markers"
                 fig.add_scatter(
-                    x=_ec_plot_df["date"], y=_plot_series,
-                    mode="lines+markers", name="Portfolio",
+                    x=_port_x, y=_port_y,
+                    mode=_port_mode, name="Portfolio",
                     line=dict(color="#2ecc71", width=2, shape="spline", smoothing=1.2),
                     marker=dict(size=5),
                 )
@@ -5605,7 +6682,23 @@ elif page == "📈  Equity Curve":
                         font=dict(color="#f39c12", size=11), xshift=6,
                     )
 
+                _vix_drawn = False
                 for bench in selected_benchmarks:
+                    if bench == "^VIX":
+                        # VIX is a volatility index, not a price benchmark — plot its
+                        # raw level on the right axis instead of rebasing onto equity.
+                        vs = load_benchmark_series("^VIX", _ec_start_str, _ec_start_bal,
+                                                   normalize=False)
+                        if not vs.empty:
+                            fig.add_scatter(
+                                x=vs.index, y=vs.values, mode="lines", name="VIX",
+                                line=dict(color="#9b59b6", width=1.4, dash="dot",
+                                          shape="spline", smoothing=0.8),
+                                yaxis="y2",
+                                hovertemplate="VIX %{y:.2f}<extra></extra>",
+                            )
+                            _vix_drawn = True
+                        continue
                     bs = load_benchmark_series(bench, _ec_start_str, _ec_start_bal)
                     if not bs.empty:
                         if _show_twr:
@@ -5638,6 +6731,13 @@ elif page == "📈  Equity Curve":
                     xaxis=dict(gridcolor=_CHT_GRID),
                     yaxis=dict(gridcolor=_CHT_GRID),
                 )
+                if _vix_drawn:
+                    fig.update_layout(
+                        yaxis2=dict(
+                            title="VIX", overlaying="y", side="right",
+                            showgrid=False, rangemode="tozero",
+                        )
+                    )
                 st.plotly_chart(fig, width='stretch')
 
                 # ── Core scalars ──────────────────────────────────────────────
@@ -8386,6 +9486,88 @@ elif page == "🔗  Broker Sync":
                     st.rerun()
             else:
                 st.info("No trades found in the fetched data.")
+
+    # ── Find Duplicate Imports ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 🔍 Find Duplicate Imports")
+    st.caption(
+        "Scans your trade log for trades that look like the same fill imported "
+        "more than once — matching on ticker, side, entry date, quantity, and "
+        "entry price. Nothing is deleted until you review each group and confirm."
+    )
+
+    if st.button("🔍  Scan for duplicates", key="dupe_scan_btn"):
+        _groups = find_duplicate_trade_groups()
+        st.session_state["_dupe_groups"]  = _groups
+        st.session_state["_dupe_scanned"] = True
+        st.session_state["_dupe_del_confirm"] = False
+        # Seed deletion defaults once: keep the lowest-id copy, suggest deleting
+        # the rest. Seeding session_state (instead of passing value= alongside
+        # key=) keeps each checkbox sticky across reruns without warnings.
+        for _g in _groups:
+            for _mi, _m in enumerate(sorted(_g["trades"], key=lambda t: t["id"])):
+                st.session_state[f"_dupe_del_{_m['id']}"] = _mi > 0
+
+    if st.session_state.get("_dupe_scanned"):
+        _dupe_groups = st.session_state.get("_dupe_groups", [])
+        if not _dupe_groups:
+            st.success("No duplicate trades found. ✅")
+        else:
+            _n_extra = sum(len(g["trades"]) - 1 for g in _dupe_groups)
+            st.warning(
+                f"Found {len(_dupe_groups)} duplicate group(s) — {_n_extra} trade(s) "
+                "look like redundant copies. Review and check the ones to delete."
+            )
+            _del_ids: list = []
+            for _g in _dupe_groups:
+                _members = sorted(_g["trades"], key=lambda t: t["id"])
+                _head    = _members[0]
+                _exp_label = (
+                    f"**{_head['ticker']}** · {_head.get('side') or 'long'} · "
+                    f"{fmt_qty(_head['quantity'])} @ {fmt_price(_head['entry_price'])} · "
+                    f"{str(_head.get('entry_date') or '')[:10]} · {len(_members)} copies"
+                )
+                with st.expander(_exp_label, expanded=True):
+                    for _m in _members:
+                        _exit_txt = (
+                            f" · exit {str(_m['exit_date'])[:10]} @ {fmt_price(_m['exit_price'])}"
+                            if _m.get("exit_date") else " · open"
+                        )
+                        _note_txt = (_m.get("notes") or "").strip()
+                        if len(_note_txt) > 70:
+                            _note_txt = _note_txt[:70] + "…"
+                        _checked = st.checkbox(
+                            f"ID {_m['id']}{_exit_txt}" + (f" · {_note_txt}" if _note_txt else ""),
+                            key=f"_dupe_del_{_m['id']}",
+                        )
+                        if _checked:
+                            _del_ids.append(int(_m["id"]))
+
+            st.divider()
+            if _del_ids:
+                if not st.session_state.get("_dupe_del_confirm"):
+                    if st.button(f"🗑️  Delete {len(_del_ids)} selected duplicate(s)",
+                                 key="dupe_del_btn", type="primary"):
+                        st.session_state["_dupe_del_confirm"] = True
+                        st.rerun()
+                else:
+                    st.error(
+                        f"Permanently delete {len(_del_ids)} trade(s)? "
+                        "This also removes their lots, dividends, and tags. Cannot be undone."
+                    )
+                    _dcc1, _dcc2 = st.columns(2)
+                    if _dcc1.button("Yes, delete", key="dupe_del_yes"):
+                        bulk_delete_trades(_del_ids)
+                        st.session_state["_dupe_del_confirm"] = False
+                        st.session_state.pop("_dupe_groups",  None)
+                        st.session_state.pop("_dupe_scanned", None)
+                        st.success(f"Deleted {len(_del_ids)} duplicate trade(s).")
+                        st.rerun()
+                    if _dcc2.button("Cancel", key="dupe_del_no"):
+                        st.session_state["_dupe_del_confirm"] = False
+                        st.rerun()
+            else:
+                st.info("No copies checked — tick the trade(s) you want to remove above.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

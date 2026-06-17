@@ -5,5 +5,6 @@ plotly>=5.0
 yfinance>=0.2
 openpyxl>=3.1
 Pillow>=10.0
+reportlab>=4.0
 ib_insync>=0.9.86
 nest_asyncio>=1.5
