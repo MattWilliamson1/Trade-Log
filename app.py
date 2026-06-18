@@ -5873,6 +5873,22 @@ if page == "📋  Trading Log":
                     showlegend=True,
                 )
 
+                # Volume — colored bars on a dedicated bottom panel (yaxis y3)
+                if "Volume" in chart_df.columns and chart_df["Volume"].notna().any():
+                    _vol_colors = [
+                        "rgba(46, 204, 113, 0.45)" if c >= o else "rgba(231, 76, 60, 0.45)"
+                        for o, c in zip(chart_df["Open"], chart_df["Close"])
+                    ]
+                    fig.add_bar(
+                        x=chart_df.index,
+                        y=chart_df["Volume"],
+                        marker_color=_vol_colors,
+                        name="Volume",
+                        yaxis="y3",
+                        showlegend=False,
+                        hovertemplate="Vol %{y:,.0f}<extra></extra>",
+                    )
+
                 # Trade-window shading
                 # Pass dates as strings — plotly's annotation arithmetic breaks with Timestamps in pandas ≥2.x
                 trade_is_open = _is_open(chart_row)
@@ -5970,7 +5986,14 @@ if page == "📋  Trading Log":
                           f"  ({trade_status})",
                     xaxis_rangeslider_visible=False,
                     hovermode="x unified",
-                    height=520,
+                    height=600,
+                    # Price candles occupy the top ~75%; volume sits in the bottom panel
+                    yaxis=dict(domain=[0.26, 1.0], title="Price"),
+                    yaxis3=dict(
+                        domain=[0.0, 0.18], title="Volume",
+                        showgrid=False, side="left",
+                    ),
+                    bargap=0.1,
                 )
                 if _overlay_drawn:
                     # Right-hand %-axis for the overlays; move the legend up so it
