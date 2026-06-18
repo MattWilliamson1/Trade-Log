@@ -3657,6 +3657,23 @@ if page == "📋  Trading Log":
 
     with st.expander("➕  Add Trade", expanded=False):
 
+        # Green highlight + bordered box around the fields needed to log a trade
+        st.markdown(
+            "<style>"
+            ".st-key-add_need_ticker, .st-key-add_need_fields {"
+            "  border:1px solid rgba(46,204,113,0.55) !important;"
+            "  border-radius:10px !important; background:rgba(46,204,113,0.06) !important;"
+            "}"
+            ".st-key-add_need_ticker label, .st-key-add_need_fields label,"
+            ".st-key-add_need_fields .stMarkdown p,"
+            ".st-key-add_need_fields [data-testid='stCaptionContainer'],"
+            ".st-key-add_opt_tags label, .st-key-add_fut_tags label {"
+            "  color:#27ae60 !important; font-weight:700 !important;"
+            "}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+
         # Instrument type selector — outside form so it drives field layout
         ih1, ih2 = st.columns([3, 1])
         add_inst = ih1.selectbox(
@@ -3682,34 +3699,35 @@ if page == "📋  Trading Log":
         # Ticker + trailing stop — outside form so both react on each keystroke / click
         _at_inst = st.session_state.get("add_inst_type", "Stock")
         _at_lk_label = "Symbol" if _at_inst == "Future" else "Underlying Ticker" if _at_inst == "Option" else "Ticker"
-        if _at_inst == "Stock":
-            _tlk1, _tlk2, _tlk3 = st.columns([2, 3, 1])
-            _tlk3.checkbox("Trailing Stop", key="add_trailing_en", value=False)
-        else:
-            _tlk1, _tlk2 = st.columns([2, 3])
-        _at_tk_key = f"add_ticker_lookup_{st.session_state.get('_add_tk_seed', 0)}"
-        _at_ticker_raw = _tlk1.text_input(
-            _at_lk_label,
-            key=_at_tk_key,
-            placeholder="e.g. AAPL",
-            label_visibility="visible",
-        )
-        _at_ticker = _at_ticker_raw.strip().upper()
-        _at_exchange = st.session_state.get("add_stock_exchange", "") or ""
-        if _at_ticker:
-            _at_price = _get_single_live_price(_at_ticker, _at_exchange)
-            _at_yf_sym = _yf_symbol(_at_ticker, _at_exchange)
-            if _at_price is not None:
-                _sym_label = f" · via {_at_yf_sym}" if _at_yf_sym != _at_ticker else ""
-                _tlk2.markdown(
-                    f"<div style='padding-top:28px;font-size:1rem'>"
-                    f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
-                    f"${_at_price:,.2f}</span></div>",
-                    unsafe_allow_html=True,
-                )
+        with st.container(border=True, key="add_need_ticker"):
+            if _at_inst == "Stock":
+                _tlk1, _tlk2, _tlk3 = st.columns([2, 3, 1])
+                _tlk3.checkbox("Trailing Stop", key="add_trailing_en", value=False)
             else:
-                _sym_hint = f" ({_at_yf_sym})" if _at_yf_sym != _at_ticker else ""
-                _tlk2.caption(f"No price found{_sym_hint} — check the ticker or exchange code.")
+                _tlk1, _tlk2 = st.columns([2, 3])
+            _at_tk_key = f"add_ticker_lookup_{st.session_state.get('_add_tk_seed', 0)}"
+            _at_ticker_raw = _tlk1.text_input(
+                _at_lk_label,
+                key=_at_tk_key,
+                placeholder="e.g. AAPL",
+                label_visibility="visible",
+            )
+            _at_ticker = _at_ticker_raw.strip().upper()
+            _at_exchange = st.session_state.get("add_stock_exchange", "") or ""
+            if _at_ticker:
+                _at_price = _get_single_live_price(_at_ticker, _at_exchange)
+                _at_yf_sym = _yf_symbol(_at_ticker, _at_exchange)
+                if _at_price is not None:
+                    _sym_label = f" · via {_at_yf_sym}" if _at_yf_sym != _at_ticker else ""
+                    _tlk2.markdown(
+                        f"<div style='padding-top:28px;font-size:1rem'>"
+                        f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
+                        f"${_at_price:,.2f}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    _sym_hint = f" ({_at_yf_sym})" if _at_yf_sym != _at_ticker else ""
+                    _tlk2.caption(f"No price found{_sym_hint} — check the ticker or exchange code.")
 
         with st.form("add_trade", clear_on_submit=True):
             inst   = st.session_state.get("add_inst_type", "Stock")
@@ -3718,26 +3736,28 @@ if page == "📋  Trading Log":
             # ── STOCK ───────────────────────────────────────────────────────
             if inst == "Stock":
                 s_ticker = _at_ticker
-                c1, c2, c3 = st.columns(3)
-                entry_date  = c1.date_input("Entry Date *")
-                quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.0f", value=None)
-                entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
+                with st.container(border=True, key="add_need_fields"):
+                    st.caption("● Required to log a trade")
+                    c1, c2, c3 = st.columns(3)
+                    entry_date  = c1.date_input("Entry Date *")
+                    quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.0f", value=None)
+                    entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
+                    st.markdown("**Stop Loss**")
+                    _trailing_en = st.session_state.get("add_trailing_en", False)
+                    sc1, sc2 = st.columns([1, 2])
+                    stop_enabled = sc1.checkbox("Enabled", value=True)
+                    opening_stop = sc2.number_input("Opening Stop", min_value=0.0, step=0.01, format="%.2f", value=None)
+                    if _trailing_en:
+                        _tr1, _tr2 = st.columns(2)
+                        _add_trail_type   = _tr1.selectbox("Trail Unit", ["$", "%", "ATR"], key="add_trail_type")
+                        _add_trail_amount = _tr2.number_input("Trail Amount", min_value=0.0, step=0.01,
+                                                              format="%.2f", value=None, key="add_trail_amount")
+                    else:
+                        _add_trail_type, _add_trail_amount = "fixed", None
+                    sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
                 c5, c6 = st.columns(2)
                 exit_date  = c5.date_input("Exit Date", value=None)
                 exit_price = c6.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
-                sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
-                st.markdown("**Stop Loss**")
-                _trailing_en = st.session_state.get("add_trailing_en", False)
-                sc1, sc2 = st.columns([1, 2])
-                stop_enabled = sc1.checkbox("Enabled", value=True)
-                opening_stop = sc2.number_input("Opening Stop", min_value=0.0, step=0.01, format="%.2f", value=None)
-                if _trailing_en:
-                    _tr1, _tr2 = st.columns(2)
-                    _add_trail_type   = _tr1.selectbox("Trail Unit", ["$", "%", "ATR"], key="add_trail_type")
-                    _add_trail_amount = _tr2.number_input("Trail Amount", min_value=0.0, step=0.01,
-                                                          format="%.2f", value=None, key="add_trail_amount")
-                else:
-                    _add_trail_type, _add_trail_amount = "fixed", None
                 notes = st.text_area("Notes", height=68,
                                      placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
@@ -3804,7 +3824,7 @@ if page == "📋  Trading Log":
                 oe1, oe2 = st.columns(2)
                 opt_exit_dt    = oe1.date_input("Exit Date (all legs)", value=None)
                 opt_exit_price = oe2.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
-                sel_tag_names  = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
+                sel_tag_names  = st.multiselect("Tags", options=list(tag_name_to_id.keys()), key="add_opt_tags")
                 notes = st.text_area("Notes", height=68,
                                      placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
@@ -3830,7 +3850,7 @@ if page == "📋  Trading Log":
                 entry_date   = fe1.date_input("Entry Date *")
                 exit_date    = fe2.date_input("Exit Date", value=None)
                 exit_price   = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
-                sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
+                sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()), key="add_fut_tags")
                 notes = st.text_area("Notes", height=68,
                                      placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
