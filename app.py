@@ -5852,6 +5852,11 @@ if page == "📋  Trading Log":
 
             with _tf_cols[0]:
                 selected_overlays = st.multiselect("Overlays", overlay_opts, default=[], key="chart_overlays")
+                selected_smas = st.multiselect(
+                    "Moving averages (SMA)", [20, 50, 150, 200], default=[],
+                    key="chart_smas",
+                    help="Simple moving averages of the closing price, drawn on the price axis",
+                )
 
             chart_df = load_chart_data(chart_ticker, chart_start, chart_end)
 
@@ -5888,6 +5893,28 @@ if page == "📋  Trading Log":
                         showlegend=False,
                         hovertemplate="Vol %{y:,.0f}<extra></extra>",
                     )
+
+                # Simple moving averages — drawn on the price axis. Fetch extra
+                # history before the visible window so longer SMAs (e.g. 200) are
+                # valid from the chart's left edge instead of starting blank.
+                if selected_smas:
+                    _sma_colors = {20: "#f1c40f", 50: "#1abc9c", 150: "#9b59b6", 200: "#e84393"}
+                    _max_p = max(selected_smas)
+                    _sma_start = (
+                        pd.Timestamp(chart_start) - pd.Timedelta(days=int(_max_p * 1.6) + 15)
+                    ).strftime("%Y-%m-%d")
+                    _sma_src = load_chart_data(chart_ticker, _sma_start, chart_end)
+                    if not _sma_src.empty and "Close" in _sma_src.columns:
+                        _vis_start = pd.Timestamp(chart_start)
+                        for _p in sorted(selected_smas):
+                            _sma = _sma_src["Close"].rolling(_p).mean()
+                            _sma = _sma[_sma.index >= _vis_start]
+                            fig.add_scatter(
+                                x=_sma.index, y=_sma, mode="lines",
+                                name=f"SMA {_p}",
+                                line=dict(width=1.3, color=_sma_colors.get(_p)),
+                                hovertemplate=f"SMA {_p} " + "%{y:.2f}<extra></extra>",
+                            )
 
                 # Trade-window shading
                 # Pass dates as strings — plotly's annotation arithmetic breaks with Timestamps in pandas ≥2.x
