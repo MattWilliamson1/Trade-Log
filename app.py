@@ -3135,12 +3135,14 @@ input, textarea, select,
 [data-testid="stFileUploaderDropzoneInstructions"],
 [data-testid="stFileUploaderDropzoneInstructions"] * {{ color: {t['text_secondary']} !important; }}
 
-section[data-testid="stMain"] button[kind="secondary"] {{
+section[data-testid="stMain"] button[kind="secondary"],
+section[data-testid="stMain"] button[kind="secondaryFormSubmit"] {{
     background: {t['bg_select']} !important;
     color: {t['text_primary']} !important;
     border-color: {t['border_input']} !important;
 }}
-section[data-testid="stMain"] button[kind="secondary"]:hover {{
+section[data-testid="stMain"] button[kind="secondary"]:hover,
+section[data-testid="stMain"] button[kind="secondaryFormSubmit"]:hover {{
     background: {t['option_hover']} !important;
     color: {t['text_primary']} !important;
     border-color: {t['accent']} !important;
@@ -6139,7 +6141,7 @@ if page == "📋  Trading Log":
                 # Collapse non-trading days (weekends) so the chart tracks like a
                 # standard trading chart instead of showing flat weekend gaps.
                 fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, width='stretch', theme=None)
 
             # ── Chart notes ───────────────────────────────────────────────────
             st.markdown("#### Chart Notes")
@@ -6886,7 +6888,7 @@ elif page == "📈  Equity Curve":
                             showgrid=False, rangemode="tozero",
                         )
                     )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, width='stretch', theme=None)
 
                 # ── Core scalars ──────────────────────────────────────────────
                 _first_bal    = float(_ec_plot_df["balance"].iloc[0])
@@ -7027,7 +7029,7 @@ elif page == "📈  Equity Curve":
                         height=300,
                         margin=dict(t=20, b=40),
                     )
-                    st.plotly_chart(_hist_fig, width='stretch')
+                    st.plotly_chart(_hist_fig, width='stretch', theme=None)
                 else:
                     st.info("Need at least 3 data points to show the return distribution.")
 
@@ -8325,7 +8327,7 @@ elif page == "📊  Statistics":
                         title=f"Average Win / Loss ({_pnl_mode})",
                         **_chart_layout,
                     )
-                    _ch_left.plotly_chart(_fig_avg, width='stretch')
+                    _ch_left.plotly_chart(_fig_avg, width='stretch', theme=None)
 
                     # Right: Largest Winner / Largest Loser
                     _fig_ext = go.Figure()
@@ -8337,7 +8339,7 @@ elif page == "📊  Statistics":
                         title=f"Largest Win / Loss ({_pnl_mode})",
                         **_chart_layout,
                     )
-                    _ch_right.plotly_chart(_fig_ext, width='stretch')
+                    _ch_right.plotly_chart(_fig_ext, width='stretch', theme=None)
 
                 # Scatter plot — P&L over time, respects $ / % mode
                 if not pnl_avail.empty:
@@ -8406,7 +8408,7 @@ elif page == "📊  Statistics":
                                    ticksuffix=_sc_tick_sfx, tickformat=_sc_tick_fmt),
                         hovermode="closest",
                     )
-                    st.plotly_chart(_fig_sc, width='stretch')
+                    st.plotly_chart(_fig_sc, width='stretch', theme=None)
 
                 st.divider()
 
@@ -8480,7 +8482,7 @@ elif page == "📊  Statistics":
                             font=dict(color=_CHT_FONT),
                             legend=dict(bgcolor=_CHT_LEG),
                         )
-                        st.plotly_chart(_fig_pie, width='stretch')
+                        st.plotly_chart(_fig_pie, width='stretch', theme=None)
 
                 # ── Rolling Sharpe / Sortino chart ────────────────────────────
                 if len(pnl_series) >= 25:
@@ -8542,7 +8544,7 @@ elif page == "📊  Statistics":
                             yaxis=dict(gridcolor=_CHT_GRID),
                             legend=dict(bgcolor=_CHT_LEG),
                         )
-                        st.plotly_chart(_fig_roll, width='stretch')
+                        st.plotly_chart(_fig_roll, width='stretch', theme=None)
                         st.caption(
                             "Dashed lines = SPY (green) & QQQ (purple) Sharpe/Sortino over the same period. "
                             "Your rolling ratios beat the benchmark when above the reference lines."
