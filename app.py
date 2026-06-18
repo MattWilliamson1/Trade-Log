@@ -3738,6 +3738,8 @@ if page == "📋  Trading Log":
                                                           format="%.2f", value=None, key="add_trail_amount")
                 else:
                     _add_trail_type, _add_trail_amount = "fixed", None
+                notes = st.text_area("Notes", height=68,
+                                     placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
                     ca1, ca2 = st.columns(2)
                     stock_account    = ca1.selectbox("Account", options=all_accounts, key="add_stock_acct")
@@ -3750,7 +3752,6 @@ if page == "📋  Trading Log":
                         key="add_stock_exchange",
                         help="Leave as US / Default for NYSE, NASDAQ, and other US exchanges.",
                     )
-                    notes = st.text_area("Notes", height=60)
                     uploaded_files = st.file_uploader(
                         "Attachments", accept_multiple_files=True,
                         type=["png", "jpg", "jpeg", "gif", "pdf", "webp"],
@@ -3804,6 +3805,8 @@ if page == "📋  Trading Log":
                 opt_exit_dt    = oe1.date_input("Exit Date (all legs)", value=None)
                 opt_exit_price = oe2.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
                 sel_tag_names  = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
+                notes = st.text_area("Notes", height=68,
+                                     placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
                     oa1, oa2, oa3 = st.columns(3)
                     opt_account      = oa1.selectbox("Account", options=all_accounts, key="add_opt_acct")
@@ -3813,7 +3816,6 @@ if page == "📋  Trading Log":
                     opt_underlying_px = oa3.number_input("Underlying Price at Entry",
                                                          min_value=0.0, step=0.01, format="%.2f", value=None,
                                                          help="Price of the underlying stock/ETF at the time of entry.")
-                    notes = st.text_area("Notes", height=60)
                 uploaded_files = []
 
             # ── FUTURE ──────────────────────────────────────────────────────
@@ -3829,13 +3831,14 @@ if page == "📋  Trading Log":
                 exit_date    = fe2.date_input("Exit Date", value=None)
                 exit_price   = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
                 sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
+                notes = st.text_area("Notes", height=68,
+                                     placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
                     fa1, fa2 = st.columns(2)
                     fut_account    = fa1.selectbox("Account", options=all_accounts, key="add_fut_acct")
                     fut_commission = fa2.number_input("Commission ($)", min_value=0.0, step=0.01,
                                                       format="%.2f", value=_futures_commission, key="add_fut_comm",
                                                       help="Per-contract rate from Settings. Override as needed.")
-                    notes        = st.text_area("Notes", height=60)
                 uploaded_files = []
 
             st.caption("\\* Required  ·  Ctrl+Enter to submit")
@@ -5940,6 +5943,47 @@ if page == "📋  Trading Log":
                     fig.add_annotation(x=exit_s, y=1, xref="x", yref="paper",
                                        text="Exit", showarrow=False, xanchor="right",
                                        font=dict(color="#e67e22"), yshift=4)
+
+                # Mark entry / exit price levels. Skipped for option legs, which are
+                # priced in premium and don't sit on the underlying's price scale.
+                _chart_inst = str(chart_row.get("instrument_type") or "stock")
+                if _chart_inst != "option":
+                    _entry_px = chart_row.get("entry_price")
+                    if _entry_px is not None and not pd.isna(_entry_px):
+                        _entry_px = float(_entry_px)
+                        fig.add_shape(type="line", x0=entry_s, x1=exit_s,
+                                      y0=_entry_px, y1=_entry_px, xref="x", yref="y",
+                                      line=dict(dash="dot", color="#3498db", width=1))
+                        fig.add_scatter(
+                            x=[entry_d], y=[_entry_px], mode="markers",
+                            marker=dict(symbol="diamond", size=11, color="#3498db",
+                                        line=dict(color="#ffffff", width=1)),
+                            name="Entry price", showlegend=False,
+                            hovertemplate=f"Entry ${_entry_px:,.2f}<extra></extra>",
+                        )
+                        fig.add_annotation(x=entry_s, y=_entry_px, xref="x", yref="y",
+                                           text=f"Entry ${_entry_px:,.2f}", showarrow=False,
+                                           xanchor="right", xshift=-6,
+                                           font=dict(size=10, color="#3498db"),
+                                           bgcolor="rgba(0,0,0,0.35)")
+                    _exit_px = chart_row.get("exit_price")
+                    if not trade_is_open and _exit_px is not None and not pd.isna(_exit_px):
+                        _exit_px = float(_exit_px)
+                        fig.add_shape(type="line", x0=entry_s, x1=exit_s,
+                                      y0=_exit_px, y1=_exit_px, xref="x", yref="y",
+                                      line=dict(dash="dot", color="#e67e22", width=1))
+                        fig.add_scatter(
+                            x=[exit_d], y=[_exit_px], mode="markers",
+                            marker=dict(symbol="diamond", size=11, color="#e67e22",
+                                        line=dict(color="#ffffff", width=1)),
+                            name="Exit price", showlegend=False,
+                            hovertemplate=f"Exit ${_exit_px:,.2f}<extra></extra>",
+                        )
+                        fig.add_annotation(x=exit_s, y=_exit_px, xref="x", yref="y",
+                                           text=f"Exit ${_exit_px:,.2f}", showarrow=False,
+                                           xanchor="left", xshift=6,
+                                           font=dict(size=10, color="#e67e22"),
+                                           bgcolor="rgba(0,0,0,0.35)")
 
                 # Overlays — plotted as % change from their first close on a
                 # dedicated right-hand axis. Previously they were rebased onto the
