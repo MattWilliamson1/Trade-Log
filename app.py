@@ -3169,7 +3169,7 @@ st.iframe("""
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 
 _MAIN_PAGES  = ["📋  Trading Log", "📝  Trading Plan", "📊  Statistics", "📈  Equity Curve", "🛠️  Trading Tools"]
-_ADMIN_PAGES = ["🏷️  Tags", "🔗  Broker Sync", "⚙️  Settings"]
+_ADMIN_PAGES = ["🏷️  Tags", "🔗  Broker Sync", "⚙️  Settings", "📖  Glossary"]
 
 # ── Glossary content (edit freely — plain markdown) ─────────────────────────────
 GLOSSARY_MD = """
@@ -3271,11 +3271,6 @@ with st.sidebar:
                      type="primary" if _active else "secondary"):
             st.session_state["nav_page"] = _p
             st.rerun()
-
-    # ── Glossary ───────────────────────────────────────────────────────────────
-    st.markdown("---")
-    with st.expander("📖  Glossary"):
-        st.markdown(GLOSSARY_MD)
 
     # ── Export for Review (big, prominent) ──────────────────────────────────────
     st.markdown("---")
@@ -8542,6 +8537,11 @@ elif page == "📊  Statistics":
 # ════════════════════════════════════════════════════════════════════════════════
 # PAGE — TAGS
 # ════════════════════════════════════════════════════════════════════════════════
+
+elif page == "📖  Glossary":
+    st.title("📖  Glossary")
+    st.caption("Reference for the platforms, brokers, indicators, order types, metrics, and terms used throughout the app.")
+    st.markdown(GLOSSARY_MD)
 
 elif page == "🏷️  Tags":
     tag_list = _cached_load_tags(st.session_state["_v_tags"])
