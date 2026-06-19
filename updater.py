@@ -1,3 +1,4 @@
+import os
 import sys
 import subprocess
 import urllib.request
@@ -11,10 +12,17 @@ SOURCE_FILES = [
     "app.py",
     "db.py",
     "ib_client.py",
+    "launch.py",
     "requirements.txt",
     "updater.py",
     "VERSION",
 ]
+
+# The Windows launcher ships from installer/launch.bat as the app's launch.bat.
+# Refreshing it in place lets existing installs pick up launcher changes (e.g.
+# the theme-aware supervisor) without needing a brand-new install.
+_WIN_LAUNCHER_SRC = "installer/launch.bat"
+_WIN_LAUNCHER_DST = "launch.bat"
 
 
 def get_local_version() -> str:
@@ -47,8 +55,26 @@ def download_updates() -> "tuple[bool, str | None]":
     except Exception as e:
         return False, str(e)
 
+    # Best-effort: refresh the Windows launcher so the supervisor stays current.
+    # A failure here must not fail the update — the core files already downloaded.
+    launcher_data = None
+    if os.name == "nt":
+        try:
+            with urllib.request.urlopen(
+                f"{RAW_BASE}/{_WIN_LAUNCHER_SRC}", timeout=30
+            ) as r:
+                launcher_data = r.read()
+        except Exception:
+            launcher_data = None
+
     for name, data in downloaded.items():
         (APP_DIR / name).write_bytes(data)
+
+    if launcher_data is not None:
+        try:
+            (APP_DIR / _WIN_LAUNCHER_DST).write_bytes(launcher_data)
+        except Exception:
+            pass
 
     # Re-run pip only if requirements.txt changed
     new_reqs = downloaded.get("requirements.txt", b"")

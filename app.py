@@ -3292,6 +3292,34 @@ GLOSSARY_MD = """
 if "nav_page" not in st.session_state:
     st.session_state["nav_page"] = "📋  Trading Log"
 
+
+def _trigger_supervised_restart():
+    """Ask launch.py to relaunch us: inject a script that reloads the browser
+    tab once the server is back, then exit shortly after this run flushes so the
+    supervisor sees the sentinel and restarts. Only meaningful when supervised."""
+    st.iframe(
+        "<script>(function(){var p=window.parent,o=p.location.origin,down=false;"
+        "function poll(){fetch(o+'/',{cache:'no-store',mode:'no-cors'})"
+        ".then(function(){if(down){p.location.reload();}else{setTimeout(poll,500);}})"
+        ".catch(function(){down=true;setTimeout(poll,500);});}"
+        "setTimeout(poll,1000);})();</script>",
+        height=1,
+    )
+    if not st.session_state.get("_restart_thread_started"):
+        st.session_state["_restart_thread_started"] = True
+        import threading as _threading
+
+        def _delayed_restart():
+            _time_global.sleep(1.5)
+            try:
+                (Path(__file__).resolve().parent / ".restart_requested").touch()
+            except Exception:
+                pass
+            os._exit(0)
+
+        _threading.Thread(target=_delayed_restart, daemon=True).start()
+
+
 with st.sidebar:
     st.title("Trade Log")
 
@@ -3368,9 +3396,26 @@ with st.sidebar:
             if _ok:
                 st.session_state.pop("_upd_status", None)
                 st.session_state.pop("_upd_remote_ver", None)
+                st.session_state["_upd_installed"] = True
                 st.rerun()
             else:
                 st.error(f"Update failed: {_err}")
+
+    # After a successful update the new files are on disk, but imported modules
+    # stay cached until the process restarts — so prompt for a full restart.
+    if st.session_state.get("_upd_installed"):
+        if st.session_state.get("_upd_restart_running"):
+            st.info("🔄  Restarting to finish the update…")
+            _trigger_supervised_restart()
+        else:
+            st.success("✅  Update installed.")
+            if os.environ.get("TRADELOG_SUPERVISED") == "1":
+                if st.button("🔄  Restart to finish", width="stretch",
+                             key="sb_upd_restart", type="primary"):
+                    st.session_state["_upd_restart_running"] = True
+                    st.rerun()
+            else:
+                st.caption("Close and reopen Trade Log to finish applying it.")
 
     # ── Live data fetch (sidebar, always docked) ───────────────────────────
     st.markdown("---")
@@ -9792,27 +9837,7 @@ elif page == "⚙️  Settings":
         if st.session_state.get("_theme_restart_running"):
             st.info("🔄  Restarting Trade Log… this page will refresh automatically "
                     "in a few seconds.")
-            # Poll the server; once it goes down and comes back up, reload the tab.
-            st.iframe(
-                "<script>(function(){var p=window.parent,o=p.location.origin,down=false;"
-                "function poll(){fetch(o+'/',{cache:'no-store',mode:'no-cors'})"
-                ".then(function(){if(down){p.location.reload();}else{setTimeout(poll,500);}})"
-                ".catch(function(){down=true;setTimeout(poll,500);});}"
-                "setTimeout(poll,1000);})();</script>",
-                height=1,
-            )
-            # Kill this server shortly after the script flushes; launch.py relaunches.
-            if not st.session_state.get("_restart_thread_started"):
-                st.session_state["_restart_thread_started"] = True
-                import threading as _threading
-                def _delayed_restart():
-                    _time_global.sleep(1.5)
-                    try:
-                        (Path(__file__).resolve().parent / ".restart_requested").touch()
-                    except Exception:
-                        pass
-                    os._exit(0)
-                _threading.Thread(target=_delayed_restart, daemon=True).start()
+            _trigger_supervised_restart()
         elif _supervised:
             st.warning(
                 f"**{_rs_lbl}** is a different (light/dark) theme family. The data "
