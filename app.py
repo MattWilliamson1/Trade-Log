@@ -9799,7 +9799,7 @@ elif page == "⚙️  Settings":
                 ".then(function(){if(down){p.location.reload();}else{setTimeout(poll,500);}})"
                 ".catch(function(){down=true;setTimeout(poll,500);});}"
                 "setTimeout(poll,1000);})();</script>",
-                height=0,
+                height=1,
             )
             # Kill this server shortly after the script flushes; launch.py relaunches.
             if not st.session_state.get("_restart_thread_started"):
