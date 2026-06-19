@@ -564,8 +564,6 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
     else:
         root = root_or_xml
 
-    from collections import defaultdict
-
     # Collect all fills with normalised fields
     fills: list[dict] = []
     for node in root.iter("Trade"):
@@ -609,6 +607,23 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
         except Exception:
             pass
 
+    return fills_to_trades(fills, "Flex Query")
+
+
+def fills_to_trades(fills: list[dict], source_label: str = "broker") -> list[dict]:
+    """Aggregate normalised broker fills into add_trade()-compatible trade dicts.
+
+    Shared by the IB Flex parser and the Schwab transaction parser. Each fill is
+    a dict with: date, datetime, ticker, exchange, instrument_type, side,
+    quantity, price, expiration, strike, option_type, multiplier, open_close
+    ('O'/'C'/'C;O'), commission, fifo_pnl. Fills are bucketed by instrument,
+    split into trade cycles (each return-to-flat = one trade), and aggregated.
+
+    source_label is woven into the generated trade notes (e.g. "Flex Query",
+    "Schwab API").
+    """
+    from collections import defaultdict
+
     # Group by instrument key
     buckets: dict[str, list[dict]] = defaultdict(list)
     for f in sorted(fills, key=lambda x: x["datetime"]):
@@ -647,7 +662,7 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
     for key, all_bucket_fills in buckets.items():
       for bucket_fills in _split_cycles(all_bucket_fills):
         open_fills  = [f for f in bucket_fills if f["open_close"] == "O"]
-        # "C;O" = IB roll fill (closes existing lot, opens new one same session) — treat as close
+        # "C;O" = roll fill (closes existing lot, opens new one same session) — treat as close
         close_fills = [f for f in bucket_fills if f["open_close"] in ("C", "C;O")]
 
         if not open_fills:
@@ -655,12 +670,12 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
                 continue
             _itype_co = close_fills[0]["instrument_type"]
             if _itype_co == "option":
-                # Options combo legs: IB sometimes tags new-position fills as "C".
+                # Options combo legs: brokers sometimes tag new-position fills as "C".
                 # Treat as opening fills (legacy behaviour).
                 open_fills  = close_fills
                 close_fills = []
             else:
-                # Stock/future: the open fill is outside the Flex date range.
+                # Stock/future: the open fill is outside the fetched date range.
                 # Return a close_only record — the importer will find and update
                 # the matching open trade in the log without needing entry details.
                 _co_qty   = sum(f["quantity"] for f in close_fills)
@@ -668,7 +683,7 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
                              if _co_qty else 0)
                 _co_comm  = sum(f["commission"] for f in close_fills)
                 _co_pnl   = sum(f["fifo_pnl"] for f in close_fills)
-                _co_notes = ["Imported via Flex Query (close fill — open outside date range)"]
+                _co_notes = [f"Imported via {source_label} (close fill — open outside date range)"]
                 if _co_comm:
                     _co_notes.append(f"Commission: ${_co_comm:.4f}")
                 if _co_pnl:
@@ -721,7 +736,7 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
             close_commission = 0.0
 
         total_commission = open_commission + close_commission
-        notes_parts = [f"Imported via Flex Query"]
+        notes_parts = [f"Imported via {source_label}"]
         if total_commission:
             notes_parts.append(f"Commission: ${total_commission:.4f}")
         if close_fills:

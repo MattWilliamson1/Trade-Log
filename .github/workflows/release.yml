@@ -114,6 +114,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout (for VERSION)
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -126,13 +133,29 @@ jobs:
           name: mac-dist
           path: dist/mac
 
+      # The rolling "latest" release accumulates one asset per build because the
+      # old dated Windows zips never matched the new name. Clear every existing
+      # asset first so the release always shows exactly the current Windows +
+      # Mac downloads. (Safe for the in-app updater, which pulls source files —
+      # not these zips.)
+      - name: Clear old release assets
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' 2>/dev/null | while read -r asset; do
+            [ -n "$asset" ] && gh release delete-asset latest "$asset" \
+              --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "Trade Log — Latest"
+          name: "Trade Log — Latest (v${{ steps.ver.outputs.version }})"
           body: |
-            ## Latest build
+            ## Latest build — v${{ steps.ver.outputs.version }}
 
             ### Windows
             **Download the zip below**, extract it, and double-click

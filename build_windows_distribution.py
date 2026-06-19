@@ -2,7 +2,8 @@
 """
 Build the Windows distribution zip for Trade Log.
 
-Produces: dist/Trade Log <MM-DD-YYYY>.zip
+Produces: dist/Trade Log Windows.zip  (stable name so each release replaces the
+previous build instead of piling up dated zips on the GitHub release).
 
 The zip contains a single top-level folder "Trade Log" with exactly
 these items (nothing else — no .venv, no stale zips, no dev files):
@@ -28,7 +29,6 @@ Usage:
 """
 
 import zipfile
-from datetime import date
 from pathlib import Path
 
 SCRIPT_DIR   = Path(__file__).parent
@@ -61,7 +61,7 @@ INSTALLER_FOLDERS = [
 
 
 def build() -> None:
-    output = SCRIPT_DIR / "dist" / f"Trade Log {date.today().strftime('%#m-%#d-%Y')}.zip"
+    output = SCRIPT_DIR / "dist" / "Trade Log Windows.zip"
     output.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)

@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 from pathlib import Path
 from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
 import ib_client as _ib_mod
+import schwab_client as _schwab_mod
 import updater as _upd
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
@@ -62,6 +63,11 @@ DEFAULT_SETTINGS = {
     "ib_use_live_prices":   "0",
     "ib_auto_sync_balance": "0",
     "ib_auto_connect":      "0",
+    # Charles Schwab
+    "schwab_app_key":           "",
+    "schwab_secret":            "",
+    "schwab_callback":          "https://127.0.0.1:8182",
+    "schwab_account_number":    "",
     # Theme
     "app_theme":            "ocean_dark",
     # Onboarding / guided setup tour ("1" once completed or skipped)
@@ -309,7 +315,12 @@ def fmt_pnl(val) -> str:
 def fmt_qty(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
-    return f"{int(v):,}"
+    f = float(v)
+    # Whole numbers print clean (no trailing .0000); fractional shares keep up to
+    # 4 decimals with trailing zeros stripped (e.g. 10.5, 0.3333).
+    if f == int(f):
+        return f"{int(f):,}"
+    return f"{f:,.4f}".rstrip("0").rstrip(".")
 
 
 def fmt_pct(v) -> str:
@@ -2004,11 +2015,45 @@ def update_position(trade_id: int, add_qty: float, add_price: float, add_date: s
 
 
 def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_date):
+    """Record selling part of an open position.
+
+    Each call logs an "exit" lot and reduces the position's remaining open
+    quantity. The trade stays open (``exit_date`` NULL) while shares remain.
+    Once everything has been sold, the trade is closed with the size-weighted
+    average of all exit prices, and its quantity is restored to the full amount
+    held so realised P&L (exit − entry) × quantity is computed over the whole
+    position. Returns the remaining open quantity (0.0 when fully closed).
+    """
+    exit_date_str = (
+        exit_date.isoformat() if hasattr(exit_date, "isoformat") else (str(exit_date) if exit_date else None)
+    )
+    add_trade_lot(trade_id, exit_date_str or "", float(exit_qty), float(exit_price), lot_type="exit")
+
     with get_connection() as conn:
+        row = conn.execute("SELECT quantity FROM trades WHERE id=?", (trade_id,)).fetchone()
+        live_qty  = float(row["quantity"] or 0) if row else 0.0
+        remaining = live_qty - float(exit_qty)
+        # Tolerate floating-point dust from fractional shares.
+        if remaining <= 1e-9:
+            # Fully out — close the trade. Restore quantity to the total held
+            # (the sum of every exit piece) and use the size-weighted exit price
+            # so realised P&L = (avg exit − entry) × full size.
+            exits = [l for l in load_trade_lots(trade_id) if l["lot_type"] == "exit"]
+            sold  = sum(l["quantity"] for l in exits)
+            wavg_exit = (
+                sum(l["quantity"] * l["price"] for l in exits) / sold if sold else float(exit_price)
+            )
+            conn.execute(
+                "UPDATE trades SET exit_date=?, exit_price=?, quantity=? WHERE id=?",
+                (exit_date_str, wavg_exit, sold, trade_id),
+            )
+            return 0.0
+        # Still open — just shrink the live position; no exit price yet.
         conn.execute(
-            "UPDATE trades SET exit_date=?, exit_price=?, quantity=? WHERE id=?",
-            (exit_date.isoformat() if exit_date else None, float(exit_price) if exit_price is not None else None, exit_qty, trade_id),
+            "UPDATE trades SET quantity=?, exit_date=NULL, exit_price=NULL WHERE id=?",
+            (remaining, trade_id),
         )
+    return remaining
 
 
 def delete_trade(trade_id: int):
@@ -2112,6 +2157,25 @@ def bulk_delete_trades(trade_ids: list):
     _cached_load_trades.clear()
     _bust("_v_trades")
 
+# Position mutations (add-to / partial-exit) change trades.quantity and, on full
+# exit, the exit fields — the trade log reads through the cached loader, so they
+# must clear it the same way the create/edit/delete paths do. Without the
+# .clear() the table keeps serving the pre-mutation snapshot even though the DB
+# write succeeded (the action "confirms" but the log never updates).
+_raw_partial_exit_trade = partial_exit_trade
+def partial_exit_trade(*a, **kw):
+    r = _raw_partial_exit_trade(*a, **kw)
+    _cached_load_trades.clear()
+    _bust("_v_trades")
+    return r
+
+_raw_update_position = update_position
+def update_position(*a, **kw):
+    r = _raw_update_position(*a, **kw)
+    _cached_load_trades.clear()
+    _bust("_v_trades")
+    return r
+
 _raw_add_tag = add_tag
 def add_tag(*args, **kwargs):
     r = _raw_add_tag(*args, **kwargs)
@@ -2142,6 +2206,70 @@ def set_setting(key, value):
     _raw_set_setting(key, value)
     _cached_get_settings.clear()
     _bust("_v_settings")
+
+
+def import_parsed_trades(trade_list: list[dict]) -> dict:
+    """Import broker-parsed trade dicts (IB Flex or Schwab) into the log.
+
+    Mirrors the IB Flex import loop: handles close-only fills (whose open is
+    outside the fetched range), skips duplicates, and updates a matching open
+    trade with closing data when a closed fill duplicates an existing open one.
+    Returns counts {imported, closed, dupes, errors}.
+    """
+    imported = closed = dupes = 0
+    errors: list[str] = []
+    for td in trade_list:
+        try:
+            # Close-only: open fill was outside the date range — find the matching
+            # open trade by ticker+qty and close it.
+            if td.get("close_only"):
+                match = find_open_trade_by_ticker_qty(
+                    td.get("ticker", ""), td.get("quantity"),
+                    td.get("instrument_type", "stock"),
+                    td.get("expiration"), td.get("strike"),
+                )
+                if match:
+                    update_trade(match, exit_date=td["exit_date"], exit_price=td["exit_price"],
+                                 notes=td.get("notes"), current_stop=None,
+                                 stop_enabled=False, tag_ids=[])
+                    closed += 1
+                else:
+                    errors.append(f"{td.get('ticker','?')}: close fill found but no matching "
+                                  f"open trade (qty {td.get('quantity')})")
+                continue
+            if is_duplicate_trade(
+                td.get("ticker", ""), td.get("entry_date"), td.get("quantity"),
+                td.get("entry_price"), td.get("instrument_type", "stock"),
+                td.get("expiration"), td.get("strike"),
+            ):
+                # Already have the open leg — if this row also carries a close, apply it.
+                if td.get("exit_date") and td.get("exit_price") is not None:
+                    open_id = find_open_trade_id(
+                        td.get("ticker", ""), td.get("entry_date"), td.get("quantity"),
+                        td.get("entry_price"), td.get("instrument_type", "stock"),
+                        td.get("expiration"), td.get("strike"),
+                    )
+                    if open_id:
+                        update_trade(open_id, exit_date=td["exit_date"], exit_price=td["exit_price"],
+                                     notes=td.get("notes"), current_stop=None,
+                                     stop_enabled=False, tag_ids=[])
+                        closed += 1
+                    else:
+                        dupes += 1
+                else:
+                    dupes += 1
+            else:
+                add_trade(**{k: td[k] for k in [
+                    "entry_date", "ticker", "quantity", "entry_price", "exit_date",
+                    "exit_price", "notes", "stop_enabled", "opening_stop", "tag_ids",
+                    "current_stop", "instrument_type", "expiration", "strike",
+                    "option_type", "multiplier", "leg_group", "leg_label", "side",
+                    "exchange",
+                ] if k in td})
+                imported += 1
+        except Exception as e:
+            errors.append(f"{td.get('ticker','?')}: {e}")
+    return {"imported": imported, "closed": closed, "dupes": dupes, "errors": errors}
 
 _raw_add_account = add_account
 def add_account(name: str):
@@ -3249,7 +3377,7 @@ GLOSSARY_MD = """
 - **Moving Averages** — Smoothed average price over a window.
     - **SMA** — Simple Moving Average; equal weighting of all periods.
     - **EMA** — Exponential Moving Average; more weight to recent prices.
-- **MRSI** — Modified/Mean RSI variant.
+- **MRSI** — Mansfield Relative Strength Index; a stock's performance relative to a benchmark (e.g. SPY), measured as the % deviation of the price ratio from its own moving average. Above zero = outperforming; below zero = lagging.
 - **Bollinger Bands** — Volatility bands set a number of standard deviations around a moving average.
 - **ATR** — Average True Range; measure of volatility.
 
@@ -3828,7 +3956,8 @@ if page == "📋  Trading Log":
                     st.caption("● Required to log a trade")
                     c1, c2, c3 = st.columns(3)
                     entry_date  = c1.date_input("Entry Date *")
-                    quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.0f", value=None)
+                    quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.4f", value=None,
+                                                  help="Fractional shares are supported (e.g. 2.5).")
                     entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
                     st.markdown("**Stop Loss**")
                     _trailing_en = st.session_state.get("add_trailing_en", False)
@@ -4202,7 +4331,7 @@ if page == "📋  Trading Log":
                             f"<span style='color:#2ecc71;font-weight:700'>${_ep_live:,.2f}</span></div>",
                             unsafe_allow_html=True,
                         )
-                ep_qty   = st.number_input(f"Shares to Exit (max {fmt_qty(ep_max)})", min_value=0.0, max_value=ep_max, step=1.0, format="%.0f", value=None, key="ep_qty")
+                ep_qty   = st.number_input(f"Shares to Exit (max {fmt_qty(ep_max)})", min_value=0.0, max_value=ep_max, step=1.0, format="%.4f", value=None, key="ep_qty")
                 ep_price = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None, key="ep_price")
                 ep_date  = st.date_input("Exit Date", key="ep_date")
                 if st.button("Record Exit", key="ep_submit"):
@@ -4211,8 +4340,13 @@ if page == "📋  Trading Log":
                     elif ep_qty > ep_max:
                         st.error(f"Cannot exit more than {fmt_qty(ep_max)} shares.")
                     else:
-                        partial_exit_trade(ep_id, ep_qty, ep_price, ep_date)
-                        st.success(f"Recorded exit of {fmt_qty(ep_qty)} @ {fmt_price(ep_price)}")
+                        _remaining = partial_exit_trade(ep_id, ep_qty, ep_price, ep_date)
+                        _bust("_v_trades")
+                        if _remaining > 0:
+                            st.success(f"Exited {fmt_qty(ep_qty)} @ {fmt_price(ep_price)} · "
+                                       f"{fmt_qty(_remaining)} still open")
+                        else:
+                            st.success(f"Exited {fmt_qty(ep_qty)} @ {fmt_price(ep_price)} · position fully closed")
                         st.rerun()
 
     # ── Dividend Adjustment ───────────────────────────────────────────────────
@@ -5384,10 +5518,13 @@ if page == "📋  Trading Log":
                         for _, row in _grp.iterrows()
                     }
                     _open_lots_all = [l for l in _all_lots if l["lot_type"] != "exit"]
+                    _exit_lots     = [l for l in _all_lots if l["lot_type"] == "exit"]
                     _signed_lot_qty  = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _open_lots_all)
                     _signed_lot_cost = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) * l["price"] for l in _open_lots_all)
+                    # Partial exits reduce the open size but leave the per-share cost basis alone.
+                    _signed_exit_qty = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _exit_lots)
                     if _signed_lot_qty != 0:
-                        _total_qty = abs(_signed_lot_qty)
+                        _total_qty = abs(_signed_lot_qty - _signed_exit_qty)
                         _avg_cost  = _signed_lot_cost / _signed_lot_qty
                     else:
                         _total_qty = sum(l["quantity"] for l in _open_lots_all if _trade_side.get(int(l["trade_id"]), 1) == 1)
@@ -5969,6 +6106,39 @@ if page == "📋  Trading Log":
                     help="Simple moving averages of the closing price, drawn on the price axis",
                 )
 
+            # Indicator controls — variable-length EMA (price axis) and Mansfield
+            # Relative Strength Index (its own oscillator panel).
+            _ind_cols = st.columns([2, 1, 2, 2])
+            with _ind_cols[0]:
+                ema_length = st.number_input(
+                    "EMA length", min_value=2, max_value=400, value=None, step=1,
+                    key="chart_ema_len",
+                    help="Exponential moving average of the close, drawn on the price axis. Leave blank to hide.",
+                )
+            with _ind_cols[1]:
+                mrsi_on = st.checkbox(
+                    "MRSI", value=False, key="chart_mrsi_on",
+                    help="Mansfield Relative Strength Index — the stock's performance "
+                         "relative to a benchmark, plotted in its own panel around a zero line.",
+                )
+            # Benchmark options for MRSI mirror the overlay tickers (SPY/QQQ/sector).
+            _mrsi_bench_opts = ["SPY", "QQQ"] + (
+                [f"{sector_etf} ({sector})"] if sector_etf and sector_etf not in ("SPY", "QQQ") else []
+            )
+            with _ind_cols[2]:
+                mrsi_bench_lbl = st.selectbox(
+                    "MRSI benchmark", _mrsi_bench_opts, index=0,
+                    key="chart_mrsi_bench", disabled=not mrsi_on,
+                    help="Index/ETF the stock's relative strength is measured against.",
+                )
+            with _ind_cols[3]:
+                mrsi_length = st.number_input(
+                    "MRSI length", min_value=10, max_value=400, value=200, step=1,
+                    key="chart_mrsi_len", disabled=not mrsi_on,
+                    help="Lookback for the relative-strength moving average. "
+                         "Stan Weinstein's default is ~52 weeks (≈200 trading days).",
+                )
+
             chart_df = load_chart_data(chart_ticker, chart_start, chart_end)
 
             if chart_df.empty:
@@ -6026,6 +6196,25 @@ if page == "📋  Trading Log":
                                 line=dict(width=1.3, color=_sma_colors.get(_p)),
                                 hovertemplate=f"SMA {_p} " + "%{y:.2f}<extra></extra>",
                             )
+
+                # Variable-length EMA — drawn on the price axis. Fetch warm-up
+                # history before the visible window so the average has converged by
+                # the chart's left edge instead of starting cold.
+                if ema_length:
+                    _ema_p = int(ema_length)
+                    _ema_start = (
+                        pd.Timestamp(chart_start) - pd.Timedelta(days=int(_ema_p * 4) + 15)
+                    ).strftime("%Y-%m-%d")
+                    _ema_src = load_chart_data(chart_ticker, _ema_start, chart_end)
+                    if not _ema_src.empty and "Close" in _ema_src.columns:
+                        _ema = _ema_src["Close"].ewm(span=_ema_p, adjust=False).mean()
+                        _ema = _ema[_ema.index >= pd.Timestamp(chart_start)]
+                        fig.add_scatter(
+                            x=_ema.index, y=_ema, mode="lines",
+                            name=f"EMA {_ema_p}",
+                            line=dict(width=1.3, color="#00bcd4", dash="dot"),
+                            hovertemplate=f"EMA {_ema_p} " + "%{y:.2f}<extra></extra>",
+                        )
 
                 # Trade-window shading
                 # Pass dates as strings — plotly's annotation arithmetic breaks with Timestamps in pandas ≥2.x
@@ -6157,6 +6346,54 @@ if page == "📋  Trading Log":
                         hovertemplate="%{text}<extra></extra>",
                     )
 
+                # Mansfield Relative Strength Index — the stock's close divided by
+                # the benchmark's close (the "relative strength" ratio), expressed
+                # as a % deviation from its own moving average. Above zero = the
+                # stock is outperforming the benchmark; below zero = lagging.
+                _mrsi_drawn = False
+                if mrsi_on:
+                    _mrsi_p = int(mrsi_length)
+                    _mrsi_bench = mrsi_bench_lbl.split(" ")[0]
+                    # Warm-up history so the ratio's moving average is valid at the
+                    # left edge, same approach as the SMA/EMA overlays.
+                    _mrsi_start = (
+                        pd.Timestamp(chart_start) - pd.Timedelta(days=int(_mrsi_p * 1.6) + 15)
+                    ).strftime("%Y-%m-%d")
+                    _stk_src = load_chart_data(chart_ticker, _mrsi_start, chart_end)
+                    _bnch_src = load_chart_data(_mrsi_bench, _mrsi_start, chart_end)
+                    if (not _stk_src.empty and not _bnch_src.empty
+                            and "Close" in _stk_src.columns and "Close" in _bnch_src.columns):
+                        _rs = (_stk_src["Close"] / _bnch_src["Close"]).dropna()
+                        _rs_ma = _rs.rolling(_mrsi_p).mean()
+                        _mrsi = (_rs / _rs_ma - 1.0) * 100.0
+                        _mrsi = _mrsi[_mrsi.index >= pd.Timestamp(chart_start)].dropna()
+                        if not _mrsi.empty:
+                            fig.add_scatter(
+                                x=_mrsi.index, y=_mrsi, mode="lines",
+                                name=f"MRSI {_mrsi_p} vs {_mrsi_bench}",
+                                line=dict(width=1.4, color="#9b59b6"),
+                                yaxis="y4",
+                                hovertemplate="MRSI %{y:.2f}%<extra>vs " + _mrsi_bench + "</extra>",
+                            )
+                            # Zero reference line on the MRSI panel.
+                            fig.add_shape(
+                                type="line", x0=0, x1=1, xref="paper",
+                                y0=0, y1=0, yref="y4",
+                                line=dict(color=_CHT_FONT, width=1, dash="dash"),
+                            )
+                            _mrsi_drawn = True
+
+                # Panel layout — stack price / (MRSI) / volume vertically. Reserve a
+                # slice for the MRSI oscillator only when it's actually drawn so the
+                # price panel keeps its full height otherwise.
+                if _mrsi_drawn:
+                    _price_dom = [0.46, 1.0]
+                    _mrsi_dom  = [0.20, 0.40]
+                    _vol_dom   = [0.0, 0.14]
+                else:
+                    _price_dom = [0.26, 1.0]
+                    _vol_dom   = [0.0, 0.18]
+
                 trade_status = "Open" if trade_is_open else "Closed"
                 fig.update_layout(
                     title=f"{chart_ticker}  ·  "
@@ -6169,15 +6406,24 @@ if page == "📋  Trading Log":
                     # Match the active app theme instead of Streamlit's fixed dark base
                     paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
                     font=dict(color=_CHT_FONT),
-                    # Price candles occupy the top ~75%; volume sits in the bottom panel
+                    # Price candles occupy the top panel; volume sits at the bottom,
+                    # with the MRSI oscillator (if enabled) sandwiched between them.
                     xaxis=dict(gridcolor=_CHT_GRID),
-                    yaxis=dict(domain=[0.26, 1.0], title="Price", gridcolor=_CHT_GRID),
+                    yaxis=dict(domain=_price_dom, title="Price", gridcolor=_CHT_GRID),
                     yaxis3=dict(
-                        domain=[0.0, 0.18], title="Volume",
+                        domain=_vol_dom, title="Volume",
                         showgrid=False, side="left",
                     ),
                     bargap=0.1,
                 )
+                if _mrsi_drawn:
+                    fig.update_layout(
+                        yaxis4=dict(
+                            domain=_mrsi_dom, title="MRSI %",
+                            gridcolor=_CHT_GRID, side="left",
+                            zeroline=False, ticksuffix="%",
+                        ),
+                    )
                 if _overlay_drawn:
                     # Right-hand %-axis for the overlays; move the legend up so it
                     # doesn't collide with the axis title.
@@ -9018,11 +9264,10 @@ elif page == "🔗  Broker Sync":
         key="broker_ib_btn",
     )
     _schwab_selected = _bc2.button(
-        "Charles Schwab",
+        "✅  Charles Schwab" if _cur_broker == "schwab" else "Charles Schwab",
         width='stretch',
-        disabled=True,
+        type="primary" if _cur_broker == "schwab" else "secondary",
         key="broker_schwab_btn",
-        help="Schwab integration — coming soon.",
     )
     _fidelity_selected = _bc3.button(
         "Fidelity",
@@ -9035,11 +9280,14 @@ elif page == "🔗  Broker Sync":
     if _ib_selected and _cur_broker != "ib":
         set_setting("broker", "ib")
         st.rerun()
+    if _schwab_selected and _cur_broker != "schwab":
+        set_setting("broker", "schwab")
+        st.rerun()
 
     # Future broker note
     st.markdown(
-        "> **📅 Coming Soon:** **Charles Schwab** and **Fidelity** integrations are planned for a future release. "
-        "Balance sync, trade import, and live price feeds will be supported via their respective APIs."
+        "> **📅 Coming Soon:** **Fidelity** integration is planned for a future release. "
+        "Balance sync, trade import, and live price feeds will be supported via their API."
     )
 
     if _cur_broker == "ib":
@@ -9102,523 +9350,482 @@ elif page == "🔗  Broker Sync":
                 icon="💡",
             )
 
-    st.divider()
+        st.divider()
 
-    if not _ib_mod.is_available():
-        st.warning("ib_insync is not installed. Run `pip install ib_insync nest_asyncio` then restart the app.")
-        st.info("Flex Query (HTTP-based) does not require ib_insync and will still work below.")
-
-    # ── IB Connection Settings ────────────────────────────────────────────────
-    st.markdown("#### Connection Settings")
-    bs_ib_host        = settings.get("ib_host",              "127.0.0.1")
-    bs_ib_port        = int(settings.get("ib_port",          "7497") or 7497)
-    bs_ib_cid         = int(settings.get("ib_client_id",     "1")    or 1)
-    bs_ib_live        = settings.get("ib_use_live_prices",   "0") == "1"
-    bs_ib_sync        = settings.get("ib_auto_sync_balance", "0") == "1"
-    bs_ib_autoconnect = settings.get("ib_auto_connect",      "0") == "1"
-
-    with st.form("ib_conn_form"):
-        ib_c1, ib_c2, ib_c3 = st.columns([3, 2, 1])
-        new_ib_host = ib_c1.text_input("IB Host", value=bs_ib_host,
-                                        help="TWS / Gateway host — usually 127.0.0.1")
-        new_ib_port = ib_c2.number_input("Port", value=bs_ib_port,
-                                          min_value=1, max_value=65535, step=1, format="%d",
-                                          help="7497 = paper, 7496 = live (TWS) | 4002 = paper, 4001 = live (Gateway)")
-        new_ib_cid  = ib_c3.number_input("Client ID", value=bs_ib_cid,
-                                          min_value=0, max_value=999, step=1, format="%d")
-        new_ib_autoconnect = st.toggle(
-            "Auto-connect to IB on launch",
-            value=bs_ib_autoconnect,
-            help="Attempt a connection test automatically when the app starts.",
-        )
-        new_ib_live = st.toggle("Use IB for live prices (falls back to Yahoo Finance)",
-                                 value=bs_ib_live)
-        new_ib_sync = st.toggle("Auto-sync account balance from IB on page load",
-                                 value=bs_ib_sync)
-        ib_form_cols = st.columns([1, 1])
-        _save_ib = ib_form_cols[0].form_submit_button("💾  Save IB Settings", width='stretch')
-        _test_ib = ib_form_cols[1].form_submit_button("🔌  Test Connection",  width='stretch')
-
-        if _save_ib:
-            set_setting("ib_host",              new_ib_host)
-            set_setting("ib_port",              str(int(new_ib_port)))
-            set_setting("ib_client_id",         str(int(new_ib_cid)))
-            set_setting("ib_use_live_prices",   "1" if new_ib_live else "0")
-            set_setting("ib_auto_sync_balance", "1" if new_ib_sync else "0")
-            set_setting("ib_auto_connect",      "1" if new_ib_autoconnect else "0")
-            st.session_state["_ib_cfg"] = {
-                "host": new_ib_host, "port": int(new_ib_port),
-                "cid": int(new_ib_cid), "use_live": new_ib_live,
-            }
-            st.session_state.pop("_ib_auto_synced",       None)
-            st.session_state.pop("_ib_auto_connect_done", None)  # re-run auto-connect on next load
-            st.success("IB settings saved.")
-            st.rerun()
-
-        if _test_ib:
-            if not _ib_mod.is_available():
-                st.error("ib_insync is not installed.")
-            else:
-                _ok, _msg = _ib_mod.test_connection(new_ib_host, int(new_ib_port), int(new_ib_cid))
-                if _ok:
-                    st.success(_msg)
-                else:
-                    st.error(_msg)
-
-    st.divider()
-
-    # ── Flex Query ────────────────────────────────────────────────────────────
-    st.markdown("#### Flex Query")
-    st.caption(
-        "Fetch historical account data (balance, deposits, withdrawals, dividends) "
-        "directly from IB via a Flex Query — no TWS connection required. "
-        "Set up a Flex Query in [IB Account Management](https://www.interactivebrokers.com/en/software/am3/am3.htm) "
-        "under **Reports → Flex Queries**, then paste the token and query ID below."
-    )
-
-    bs_flex_token    = settings.get("flex_token",    "")
-    bs_flex_query_id = settings.get("flex_query_id", "")
-
-    with st.form("flex_settings_form"):
-        fx_c1, fx_c2 = st.columns([3, 2])
-        new_flex_token    = fx_c1.text_input("Flex Token",  value=bs_flex_token,
-                                              type="password",
-                                              help="Found in IB Account Management → Reports → Flex Queries → Create/Manage Tokens")
-        new_flex_query_id = fx_c2.text_input("Query ID",    value=bs_flex_query_id,
-                                              help="The numeric ID of your Flex Query")
-        fl_c1, fl_c2 = st.columns([1, 1])
-        _save_flex  = fl_c1.form_submit_button("💾  Save Flex Settings", width='stretch')
-        _fetch_flex = fl_c2.form_submit_button("📥  Fetch via Flex Query", width='stretch')
-
-        if _save_flex:
-            set_setting("flex_token",    new_flex_token)
-            set_setting("flex_query_id", new_flex_query_id)
-            st.success("Flex Query settings saved.")
-
-        if _fetch_flex:
-            if not new_flex_token.strip() or not new_flex_query_id.strip():
-                st.error("Enter both a Flex Token and Query ID before fetching.")
-            else:
-                with st.spinner("Contacting IB Flex Web Service… this can take up to 2 minutes."):
-                    _flex_result = _ib_mod.fetch_flex_report(
-                        new_flex_token.strip(), new_flex_query_id.strip()
-                    )
-                if _flex_result.get("error"):
-                    st.error(f"Flex Query error: {_flex_result['error']}")
-                    st.info("If this keeps failing, use **Upload XML File** below — "
-                            "download the report from IB's portal and upload it directly.")
-                else:
-                    st.session_state["_flex_result"] = _flex_result
-                    st.success("Flex report fetched successfully.")
-
-    # Manual XML upload — reliable fallback when the live API is uncooperative
-    st.markdown("##### Or Upload XML Directly")
-    st.caption(
-        "Download your Flex Statement XML from "
-        "[IB Account Management](https://www.interactivebrokers.com/en/software/am3/am3.htm) "
-        "→ Reports → Flex Queries → Run, then upload it here."
-    )
-    _xml_file = st.file_uploader("Upload Flex Statement XML", type=["xml"],
-                                  key="flex_xml_upload", label_visibility="collapsed")
-    if _xml_file is not None:
-        _uploaded_xml = _xml_file.read().decode("utf-8", errors="replace")
-        _upload_result = _ib_mod._parse_flex_xml(_uploaded_xml)
-        if _upload_result.get("error"):
-            st.error(f"XML parse error: {_upload_result['error']}")
-        else:
-            st.session_state["_flex_result"] = _upload_result
-
-    # Display Flex results outside the form so buttons inside work
-    _flex_data = st.session_state.get("_flex_result")
-    if _flex_data:
-        _fa = _flex_data.get("account_summary", {})
-        _ft = _flex_data.get("cash_transactions", [])
-
-        # Metrics row
-        fm1, fm2, fm3, fm4 = st.columns(4)
-        fm1.metric("Net Liquidation",  f"${_fa.get('net_liquidation', 0):,.2f}")
-        fm2.metric("Cash",             f"${_fa.get('cash', 0):,.2f}")
-        fm3.metric("Total Deposits",   f"${_fa.get('total_deposits', 0):,.2f}")
-        fm4.metric("Total Withdrawals",f"${_fa.get('total_withdrawals', 0):,.2f}")
-
-        if st.button("⬆️  Update Account Balance from Flex Data", key="flex_update_bal"):
-            _nl = _fa.get("net_liquidation", 0)
-            if _nl:
-                set_setting("account_balance", str(_nl))
-                st.session_state["_live_balance_set"] = True
-                st.success(f"Account balance updated: ${_nl:,.2f}")
-                st.rerun()
-            else:
-                st.warning("Net liquidation value is zero or missing in the Flex report.")
-
-        if _ft:
-            st.markdown("##### Cash Transactions")
-            st.dataframe(
-                pd.DataFrame(_ft),
-                width='stretch',
-                hide_index=True,
-                column_config={
-                    "date":        st.column_config.TextColumn("Date",        width="small"),
-                    "type":        st.column_config.TextColumn("Type",        width="medium"),
-                    "amount":      st.column_config.NumberColumn("Amount",    format="$%.2f", width="small"),
-                    "currency":    st.column_config.TextColumn("Currency",    width="small"),
-                    "description": st.column_config.TextColumn("Description", width="large"),
-                },
-            )
-        else:
-            st.info("No cash transactions found in this Flex report.")
-
-        st.caption("Trade import is in the **Import Trades from IB** section below.")
-
-    st.divider()
-
-    # ── Account Balance Sync (live API) ───────────────────────────────────────
-    st.markdown("#### Account Balance Sync")
-    st.caption(
-        "Pulls the current net liquidation value directly from TWS/Gateway (requires active connection). "
-        + ("**📴 Offline mode:** this button is available but auto-sync is disabled." if is_demo else "")
-    )
-    if st.button("⬇️  Pull Account Balance from IB", width='content'):
         if not _ib_mod.is_available():
-            st.error("ib_insync is not installed.")
-        else:
-            try:
-                with _ib_mod.IBClient(bs_ib_host, bs_ib_port, bs_ib_cid) as _ib:
-                    _acct = _ib.get_account_summary()
-                if _acct.get("net_liquidation"):
-                    set_setting("account_balance", str(_acct["net_liquidation"]))
+            st.warning("ib_insync is not installed. Run `pip install ib_insync nest_asyncio` then restart the app.")
+            st.info("Flex Query (HTTP-based) does not require ib_insync and will still work below.")
+
+        # ── IB Connection Settings ────────────────────────────────────────────────
+        st.markdown("#### Connection Settings")
+        bs_ib_host        = settings.get("ib_host",              "127.0.0.1")
+        bs_ib_port        = int(settings.get("ib_port",          "7497") or 7497)
+        bs_ib_cid         = int(settings.get("ib_client_id",     "1")    or 1)
+        bs_ib_live        = settings.get("ib_use_live_prices",   "0") == "1"
+        bs_ib_sync        = settings.get("ib_auto_sync_balance", "0") == "1"
+        bs_ib_autoconnect = settings.get("ib_auto_connect",      "0") == "1"
+
+        with st.form("ib_conn_form"):
+            ib_c1, ib_c2, ib_c3 = st.columns([3, 2, 1])
+            new_ib_host = ib_c1.text_input("IB Host", value=bs_ib_host,
+                                            help="TWS / Gateway host — usually 127.0.0.1")
+            new_ib_port = ib_c2.number_input("Port", value=bs_ib_port,
+                                              min_value=1, max_value=65535, step=1, format="%d",
+                                              help="7497 = paper, 7496 = live (TWS) | 4002 = paper, 4001 = live (Gateway)")
+            new_ib_cid  = ib_c3.number_input("Client ID", value=bs_ib_cid,
+                                              min_value=0, max_value=999, step=1, format="%d")
+            new_ib_autoconnect = st.toggle(
+                "Auto-connect to IB on launch",
+                value=bs_ib_autoconnect,
+                help="Attempt a connection test automatically when the app starts.",
+            )
+            new_ib_live = st.toggle("Use IB for live prices (falls back to Yahoo Finance)",
+                                     value=bs_ib_live)
+            new_ib_sync = st.toggle("Auto-sync account balance from IB on page load",
+                                     value=bs_ib_sync)
+            ib_form_cols = st.columns([1, 1])
+            _save_ib = ib_form_cols[0].form_submit_button("💾  Save IB Settings", width='stretch')
+            _test_ib = ib_form_cols[1].form_submit_button("🔌  Test Connection",  width='stretch')
+
+            if _save_ib:
+                set_setting("ib_host",              new_ib_host)
+                set_setting("ib_port",              str(int(new_ib_port)))
+                set_setting("ib_client_id",         str(int(new_ib_cid)))
+                set_setting("ib_use_live_prices",   "1" if new_ib_live else "0")
+                set_setting("ib_auto_sync_balance", "1" if new_ib_sync else "0")
+                set_setting("ib_auto_connect",      "1" if new_ib_autoconnect else "0")
+                st.session_state["_ib_cfg"] = {
+                    "host": new_ib_host, "port": int(new_ib_port),
+                    "cid": int(new_ib_cid), "use_live": new_ib_live,
+                }
+                st.session_state.pop("_ib_auto_synced",       None)
+                st.session_state.pop("_ib_auto_connect_done", None)  # re-run auto-connect on next load
+                st.success("IB settings saved.")
+                st.rerun()
+
+            if _test_ib:
+                if not _ib_mod.is_available():
+                    st.error("ib_insync is not installed.")
+                else:
+                    _ok, _msg = _ib_mod.test_connection(new_ib_host, int(new_ib_port), int(new_ib_cid))
+                    if _ok:
+                        st.success(_msg)
+                    else:
+                        st.error(_msg)
+
+        st.divider()
+
+        # ── Flex Query ────────────────────────────────────────────────────────────
+        st.markdown("#### Flex Query")
+        st.caption(
+            "Fetch historical account data (balance, deposits, withdrawals, dividends) "
+            "directly from IB via a Flex Query — no TWS connection required. "
+            "Set up a Flex Query in [IB Account Management](https://www.interactivebrokers.com/en/software/am3/am3.htm) "
+            "under **Reports → Flex Queries**, then paste the token and query ID below."
+        )
+
+        bs_flex_token    = settings.get("flex_token",    "")
+        bs_flex_query_id = settings.get("flex_query_id", "")
+
+        with st.form("flex_settings_form"):
+            fx_c1, fx_c2 = st.columns([3, 2])
+            new_flex_token    = fx_c1.text_input("Flex Token",  value=bs_flex_token,
+                                                  type="password",
+                                                  help="Found in IB Account Management → Reports → Flex Queries → Create/Manage Tokens")
+            new_flex_query_id = fx_c2.text_input("Query ID",    value=bs_flex_query_id,
+                                                  help="The numeric ID of your Flex Query")
+            fl_c1, fl_c2 = st.columns([1, 1])
+            _save_flex  = fl_c1.form_submit_button("💾  Save Flex Settings", width='stretch')
+            _fetch_flex = fl_c2.form_submit_button("📥  Fetch via Flex Query", width='stretch')
+
+            if _save_flex:
+                set_setting("flex_token",    new_flex_token)
+                set_setting("flex_query_id", new_flex_query_id)
+                st.success("Flex Query settings saved.")
+
+            if _fetch_flex:
+                if not new_flex_token.strip() or not new_flex_query_id.strip():
+                    st.error("Enter both a Flex Token and Query ID before fetching.")
+                else:
+                    with st.spinner("Contacting IB Flex Web Service… this can take up to 2 minutes."):
+                        _flex_result = _ib_mod.fetch_flex_report(
+                            new_flex_token.strip(), new_flex_query_id.strip()
+                        )
+                    if _flex_result.get("error"):
+                        st.error(f"Flex Query error: {_flex_result['error']}")
+                        st.info("If this keeps failing, use **Upload XML File** below — "
+                                "download the report from IB's portal and upload it directly.")
+                    else:
+                        st.session_state["_flex_result"] = _flex_result
+                        st.success("Flex report fetched successfully.")
+
+        # Manual XML upload — reliable fallback when the live API is uncooperative
+        st.markdown("##### Or Upload XML Directly")
+        st.caption(
+            "Download your Flex Statement XML from "
+            "[IB Account Management](https://www.interactivebrokers.com/en/software/am3/am3.htm) "
+            "→ Reports → Flex Queries → Run, then upload it here."
+        )
+        _xml_file = st.file_uploader("Upload Flex Statement XML", type=["xml"],
+                                      key="flex_xml_upload", label_visibility="collapsed")
+        if _xml_file is not None:
+            _uploaded_xml = _xml_file.read().decode("utf-8", errors="replace")
+            _upload_result = _ib_mod._parse_flex_xml(_uploaded_xml)
+            if _upload_result.get("error"):
+                st.error(f"XML parse error: {_upload_result['error']}")
+            else:
+                st.session_state["_flex_result"] = _upload_result
+
+        # Display Flex results outside the form so buttons inside work
+        _flex_data = st.session_state.get("_flex_result")
+        if _flex_data:
+            _fa = _flex_data.get("account_summary", {})
+            _ft = _flex_data.get("cash_transactions", [])
+
+            # Metrics row
+            fm1, fm2, fm3, fm4 = st.columns(4)
+            fm1.metric("Net Liquidation",  f"${_fa.get('net_liquidation', 0):,.2f}")
+            fm2.metric("Cash",             f"${_fa.get('cash', 0):,.2f}")
+            fm3.metric("Total Deposits",   f"${_fa.get('total_deposits', 0):,.2f}")
+            fm4.metric("Total Withdrawals",f"${_fa.get('total_withdrawals', 0):,.2f}")
+
+            if st.button("⬆️  Update Account Balance from Flex Data", key="flex_update_bal"):
+                _nl = _fa.get("net_liquidation", 0)
+                if _nl:
+                    set_setting("account_balance", str(_nl))
                     st.session_state["_live_balance_set"] = True
-                    st.success(f"Account balance updated: ${_acct['net_liquidation']:,.2f}")
+                    st.success(f"Account balance updated: ${_nl:,.2f}")
                     st.rerun()
                 else:
-                    st.warning("Could not retrieve NetLiquidation from IB.")
-            except Exception as _e:
-                st.error(f"IB error: {_e}")
+                    st.warning("Net liquidation value is zero or missing in the Flex report.")
 
-    st.divider()
+            if _ft:
+                st.markdown("##### Cash Transactions")
+                st.dataframe(
+                    pd.DataFrame(_ft),
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "date":        st.column_config.TextColumn("Date",        width="small"),
+                        "type":        st.column_config.TextColumn("Type",        width="medium"),
+                        "amount":      st.column_config.NumberColumn("Amount",    format="$%.2f", width="small"),
+                        "currency":    st.column_config.TextColumn("Currency",    width="small"),
+                        "description": st.column_config.TextColumn("Description", width="large"),
+                    },
+                )
+            else:
+                st.info("No cash transactions found in this Flex report.")
 
-    # ── Import Trades from IB ─────────────────────────────────────────────────
-    st.markdown("#### Import Trades from IB")
-    st.caption("Two ways to get your IB trades into the log — pick based on what you need.")
+            st.caption("Trade import is in the **Import Trades from IB** section below.")
 
-    # ── Option 1: Today's session ──────────────────────────────────────────
-    with st.container(border=True):
-        st.markdown("##### 🕐 Today's Trades (Current Session)")
-        st.markdown(
-            "Connects directly to TWS/Gateway right now and pulls every fill from "
-            "**your current session** — typically just today's trades.\n\n"
-            "**Important limitation:** IB's live connection can only see trades made "
-            "since you last opened TWS or Gateway. It has no access to yesterday, last "
-            "week, or any earlier history. If you need older trades, use Full History below.\n\n"
-            "*Requires TWS or IB Gateway to be open and connected (see settings above).*"
+        st.divider()
+
+        # ── Account Balance Sync (live API) ───────────────────────────────────────
+        st.markdown("#### Account Balance Sync")
+        st.caption(
+            "Pulls the current net liquidation value directly from TWS/Gateway (requires active connection). "
+            + ("**📴 Offline mode:** this button is available but auto-sync is disabled." if is_demo else "")
         )
-        if st.button("📥  Fetch Today's Fills", key="ib_fetch_btn", width='content'):
+        if st.button("⬇️  Pull Account Balance from IB", width='content'):
             if not _ib_mod.is_available():
                 st.error("ib_insync is not installed.")
             else:
                 try:
                     with _ib_mod.IBClient(bs_ib_host, bs_ib_port, bs_ib_cid) as _ib:
-                        _execs, _exec_errors = _ib.get_executions(
-                            str(pd.Timestamp.today().date())
-                        )
-                    if _exec_errors:
-                        st.warning(
-                            f"{len(_exec_errors)} fill(s) could not be processed:\n" +
-                            "\n".join(f"• {e}" for e in _exec_errors)
-                        )
-                    if not _execs:
-                        st.info("No fills found in the current session.")
+                        _acct = _ib.get_account_summary()
+                    if _acct.get("net_liquidation"):
+                        set_setting("account_balance", str(_acct["net_liquidation"]))
+                        st.session_state["_live_balance_set"] = True
+                        st.success(f"Account balance updated: ${_acct['net_liquidation']:,.2f}")
+                        st.rerun()
                     else:
-                        _trade_previews = _ib_mod.parse_ib_executions_to_trades(_execs)
-                        st.session_state["_ib_preview"] = _trade_previews
-                        st.success(
-                            f"Found {len(_trade_previews)} trade(s) from "
-                            f"{len(_execs)} fill(s). Review below and click Import."
-                        )
+                        st.warning("Could not retrieve NetLiquidation from IB.")
                 except Exception as _e:
                     st.error(f"IB error: {_e}")
 
-        _preview = st.session_state.get("_ib_preview")
-        if _preview:
-            st.caption(f"{len(_preview)} trade(s) ready to import:")
-            _prev_df = pd.DataFrame(_preview).drop(
-                columns=["notes", "stop_enabled", "opening_stop", "tag_ids",
-                         "current_stop", "side", "leg_label"], errors="ignore"
+        st.divider()
+
+        # ── Import Trades from IB ─────────────────────────────────────────────────
+        st.markdown("#### Import Trades from IB")
+        st.caption("Two ways to get your IB trades into the log — pick based on what you need.")
+
+        # ── Option 1: Today's session ──────────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("##### 🕐 Today's Trades (Current Session)")
+            st.markdown(
+                "Connects directly to TWS/Gateway right now and pulls every fill from "
+                "**your current session** — typically just today's trades.\n\n"
+                "**Important limitation:** IB's live connection can only see trades made "
+                "since you last opened TWS or Gateway. It has no access to yesterday, last "
+                "week, or any earlier history. If you need older trades, use Full History below.\n\n"
+                "*Requires TWS or IB Gateway to be open and connected (see settings above).*"
             )
-            st.dataframe(_prev_df, width='stretch', hide_index=True)
-            _imp_c1, _imp_c2 = st.columns(2)
-            if _imp_c1.button("✅  Import All Trades", width='stretch', key="ib_import_all"):
-                _imported = 0
-                _ib_dupes = 0
-                for _td in _preview:
+            if st.button("📥  Fetch Today's Fills", key="ib_fetch_btn", width='content'):
+                if not _ib_mod.is_available():
+                    st.error("ib_insync is not installed.")
+                else:
                     try:
-                        if is_duplicate_trade(
-                            _td.get("ticker", ""),
-                            _td.get("entry_date"),
-                            _td.get("quantity"),
-                            _td.get("entry_price"),
-                            _td.get("instrument_type", "stock"),
-                            _td.get("expiration"),
-                            _td.get("strike"),
-                        ):
-                            _ib_dupes += 1
+                        with _ib_mod.IBClient(bs_ib_host, bs_ib_port, bs_ib_cid) as _ib:
+                            _execs, _exec_errors = _ib.get_executions(
+                                str(pd.Timestamp.today().date())
+                            )
+                        if _exec_errors:
+                            st.warning(
+                                f"{len(_exec_errors)} fill(s) could not be processed:\n" +
+                                "\n".join(f"• {e}" for e in _exec_errors)
+                            )
+                        if not _execs:
+                            st.info("No fills found in the current session.")
                         else:
-                            add_trade(**{k: _td[k] for k in [
-                                "entry_date", "ticker", "quantity", "entry_price",
-                                "exit_date", "exit_price", "notes", "stop_enabled",
-                                "opening_stop", "tag_ids", "current_stop",
-                                "instrument_type", "expiration", "strike",
-                                "option_type", "multiplier", "leg_group", "leg_label", "side",
-                            ] if k in _td})
-                            _imported += 1
-                    except Exception:
-                        pass
-                st.session_state.pop("_ib_preview", None)
-                if _ib_dupes:
-                    st.info(f"{_ib_dupes} duplicate(s) skipped — already in the log.")
-                st.success(f"Imported {_imported} trade(s).")
-                st.rerun()
-            if _imp_c2.button("✕  Cancel", width='stretch', key="ib_import_cancel"):
-                st.session_state.pop("_ib_preview", None)
-                st.rerun()
+                            _trade_previews = _ib_mod.parse_ib_executions_to_trades(_execs)
+                            st.session_state["_ib_preview"] = _trade_previews
+                            st.success(
+                                f"Found {len(_trade_previews)} trade(s) from "
+                                f"{len(_execs)} fill(s). Review below and click Import."
+                            )
+                    except Exception as _e:
+                        st.error(f"IB error: {_e}")
 
-    # ── Option 2: Full History ─────────────────────────────────────────────
-    with st.container(border=True):
-        st.markdown("##### 📅 Full History (Any Date Range)")
-        st.markdown(
-            "Pulls your complete trade history directly from **IB's servers** — last "
-            "week, last month, or further back. **TWS does not need to be running.**\n\n"
-            "IB has a feature called a **Flex Report** — think of it as a secure "
-            "export of your account history that you can request any time from IB's "
-            "website. You set it up once, and then this button fetches it automatically "
-            "whenever you need it."
-        )
-
-        _flex_tok = settings.get("flex_token", "").strip()
-        _flex_qid = settings.get("flex_query_id", "").strip()
-        _flex_configured = bool(_flex_tok) and bool(_flex_qid)
-
-        with st.expander(
-            "⚙️  Setup — " + ("configured ✓" if _flex_configured else "required before first use")
-        ):
-            st.markdown(
-                "**One-time setup — takes about 2 minutes:**\n\n"
-                "1. Log in to your IB account at "
-                "[interactivebrokers.com](https://www.interactivebrokers.com)\n"
-                "2. Go to **Reports → Flex Queries → Create New Flex Query**\n"
-                "3. Give it a name, add the **Trades** section, and save. "
-                "Note the **Query ID** number shown next to it.\n"
-                "4. Go to **Reports → Flex Queries → Manage Tokens**, "
-                "create a new token, and copy it.\n"
-                "5. Paste both below and click Save — you're done."
-            )
-            with st.form("flex_settings_import_form"):
-                _fsi_c1, _fsi_c2 = st.columns([3, 2])
-                _new_flex_tok = _fsi_c1.text_input(
-                    "Flex Token", value=_flex_tok, type="password",
-                    help="From IB: Reports → Flex Queries → Manage Tokens"
+            _preview = st.session_state.get("_ib_preview")
+            if _preview:
+                st.caption(f"{len(_preview)} trade(s) ready to import:")
+                _prev_df = pd.DataFrame(_preview).drop(
+                    columns=["notes", "stop_enabled", "opening_stop", "tag_ids",
+                             "current_stop", "side", "leg_label"], errors="ignore"
                 )
-                _new_flex_qid = _fsi_c2.text_input(
-                    "Query ID", value=_flex_qid,
-                    help="The numeric ID shown next to your Flex Query"
-                )
-                if st.form_submit_button("💾  Save", width='content'):
-                    set_setting("flex_token",    _new_flex_tok)
-                    set_setting("flex_query_id", _new_flex_qid)
-                    st.success("Saved.")
-                    st.rerun()
-
-            st.markdown("---")
-            st.markdown(
-                "**Can't get the automatic fetch to work?** "
-                "Download the XML file manually from IB "
-                "(Reports → Flex Queries → Run → Download) and upload it here:"
-            )
-            _xml_file_imp = st.file_uploader(
-                "Upload Flex Statement XML", type=["xml"],
-                key="flex_xml_upload_imp", label_visibility="collapsed"
-            )
-            if _xml_file_imp is not None:
-                _xml_imp_result = _ib_mod._parse_flex_xml(
-                    _xml_file_imp.read().decode("utf-8", errors="replace")
-                )
-                if _xml_imp_result.get("error"):
-                    st.error(f"XML error: {_xml_imp_result['error']}")
-                else:
-                    st.session_state["_flex_result"] = _xml_imp_result
-                    st.success("File loaded. Set a date range below and import.")
-                    st.rerun()
-
-        _flex_today = pd.Timestamp.today().date()
-        _imp2_date_from = st.session_state.get(
-            "flex_filter_from", _flex_today - pd.Timedelta(days=30)
-        )
-        _imp2_date_to = st.session_state.get("flex_filter_to", _flex_today)
-
-        if _flex_configured or st.session_state.get("_flex_result"):
-            _fpr1, _fpr2, _fpr3, _fpr4 = st.columns(4)
-            if _fpr1.button("Last Week",  key="imp2_preset_week",  width='stretch'):
-                st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(weeks=1)
-                st.session_state["flex_filter_to"]   = _flex_today
-                st.rerun()
-            if _fpr2.button("Last Month", key="imp2_preset_month", width='stretch'):
-                st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(days=30)
-                st.session_state["flex_filter_to"]   = _flex_today
-                st.rerun()
-            if _fpr3.button("Last 3 Mo",  key="imp2_preset_3m",   width='stretch'):
-                st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(days=90)
-                st.session_state["flex_filter_to"]   = _flex_today
-                st.rerun()
-            if _fpr4.button("All Time",   key="imp2_preset_all",  width='stretch'):
-                st.session_state["flex_filter_from"] = pd.Timestamp("2010-01-01").date()
-                st.session_state["flex_filter_to"]   = _flex_today
-                st.rerun()
-
-            _flt2_c1, _flt2_c2 = st.columns(2)
-            _imp2_date_from = _flt2_c1.date_input(
-                "From",
-                value=_imp2_date_from,
-                key="flex_filter_from",
-            )
-            _imp2_date_to = _flt2_c2.date_input(
-                "To",
-                value=_imp2_date_to,
-                key="flex_filter_to",
-            )
-
-            _fetch2_col, _ = st.columns([1, 2])
-            if _fetch2_col.button("📥  Fetch Full History", width='stretch', key="imp2_fetch_btn"):
-                if not _flex_configured:
-                    st.error("Complete the setup above (token + query ID) first.")
-                else:
-                    with st.spinner(
-                        "Contacting IB's servers… this can take up to 2 minutes."
-                    ):
-                        _new_flex = _ib_mod.fetch_flex_report(_flex_tok, _flex_qid)
-                    if _new_flex.get("error"):
-                        st.error(f"Fetch error: {_new_flex['error']}")
-                        st.info(
-                            "If this keeps failing, download the XML from IB manually "
-                            "and upload it via the Setup section above."
-                        )
-                    else:
-                        st.session_state["_flex_result"] = _new_flex
-                        st.success("History fetched. Review below and click Import.")
-                        st.rerun()
-        else:
-            st.info("Complete the setup above to enable full history import.")
-
-        _flex_imp_data = st.session_state.get("_flex_result")
-        if _flex_imp_data:
-            _flex_trades_all = _flex_imp_data.get("trades", [])
-            if _flex_trades_all:
-                def _flex_in_range(t):
-                    d = t.get("entry_date")
-                    if d is None:
-                        return True
-                    try:
-                        d_iso = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
-                        return str(_imp2_date_from) <= d_iso <= str(_imp2_date_to)
-                    except Exception:
-                        return True
-
-                _flex_trades = [t for t in _flex_trades_all if _flex_in_range(t)]
-                st.caption(
-                    f"{len(_flex_trades)} of {len(_flex_trades_all)} trade(s) in range "
-                    f"({_imp2_date_from} → {_imp2_date_to}). "
-                    "Open positions have no exit date/price."
-                )
-                _flex_trades_df = pd.DataFrame(_flex_trades).drop(
-                    columns=["notes", "stop_enabled", "opening_stop", "current_stop",
-                             "tag_ids", "leg_group", "leg_label"], errors="ignore"
-                ) if _flex_trades else pd.DataFrame()
-                if not _flex_trades_df.empty:
-                    st.dataframe(_flex_trades_df, width='stretch', hide_index=True)
-                else:
-                    st.info("No trades in the selected date range.")
-
-                _import_label2 = (
-                    f"✅  Import {len(_flex_trades)} Trade(s)"
-                    if len(_flex_trades) < len(_flex_trades_all)
-                    else f"✅  Import All {len(_flex_trades_all)} Trade(s)"
-                )
-                _fc1, _fc2 = st.columns(2)
-                if _flex_trades and _fc1.button(_import_label2, width='stretch', key="flex_import_trades"):
-                    import time as _t
-                    from pathlib import Path as _Path
-                    try:
-                        _imp_dir = _Path(__file__).parent / "imports"
-                        _imp_dir.mkdir(exist_ok=True)
-                        _ts_str = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
-                        pd.DataFrame(_flex_trades).to_csv(
-                            _imp_dir / f"flex_{_ts_str}.csv", index=False
-                        )
-                    except Exception:
-                        pass
-                    _total         = len(_flex_trades)
-                    _flex_imported = 0
-                    _flex_errors   = []
-                    _prog          = st.progress(0, text="Starting import…")
-                    _eta_txt       = st.empty()
-                    _start         = _t.time()
-                    _flex_dupes    = 0
-                    _flex_closed   = 0
-                    for _i, _ftd in enumerate(_flex_trades):
+                st.dataframe(_prev_df, width='stretch', hide_index=True)
+                _imp_c1, _imp_c2 = st.columns(2)
+                if _imp_c1.button("✅  Import All Trades", width='stretch', key="ib_import_all"):
+                    _imported = 0
+                    _ib_dupes = 0
+                    for _td in _preview:
                         try:
-                            # Close-only: open fill was outside the Flex date range.
-                            # Find the existing open trade by ticker+qty and close it.
-                            if _ftd.get("close_only"):
-                                _co_match = find_open_trade_by_ticker_qty(
-                                    _ftd.get("ticker", ""),
-                                    _ftd.get("quantity"),
-                                    _ftd.get("instrument_type", "stock"),
-                                    _ftd.get("expiration"),
-                                    _ftd.get("strike"),
-                                )
-                                if _co_match:
-                                    update_trade(
-                                        _co_match,
-                                        exit_date=_ftd["exit_date"],
-                                        exit_price=_ftd["exit_price"],
-                                        notes=_ftd.get("notes"),
-                                        current_stop=None,
-                                        stop_enabled=False,
-                                        tag_ids=[],
-                                    )
-                                    _flex_closed += 1
-                                else:
-                                    _flex_errors.append(
-                                        f"{_ftd.get('ticker','?')}: close fill found "
-                                        f"but no matching open trade (qty {_ftd.get('quantity')})"
-                                    )
-                                _done    = _i + 1
-                                _elapsed = _t.time() - _start
-                                _eta     = (_elapsed / _done) * (_total - _done)
-                                _prog.progress(_done / _total, text=f"Importing {_done}/{_total} — {_ftd.get('ticker','')}")
-                                _eta_txt.caption(f"Elapsed: {_elapsed:.1f}s  ·  ETA: {_eta:.0f}s remaining")
-                                continue
                             if is_duplicate_trade(
-                                _ftd.get("ticker", ""),
-                                _ftd.get("entry_date"),
-                                _ftd.get("quantity"),
-                                _ftd.get("entry_price"),
-                                _ftd.get("instrument_type", "stock"),
-                                _ftd.get("expiration"),
-                                _ftd.get("strike"),
+                                _td.get("ticker", ""),
+                                _td.get("entry_date"),
+                                _td.get("quantity"),
+                                _td.get("entry_price"),
+                                _td.get("instrument_type", "stock"),
+                                _td.get("expiration"),
+                                _td.get("strike"),
                             ):
-                                if _ftd.get("exit_date") and _ftd.get("exit_price") is not None:
-                                    _open_id = find_open_trade_id(
+                                _ib_dupes += 1
+                            else:
+                                add_trade(**{k: _td[k] for k in [
+                                    "entry_date", "ticker", "quantity", "entry_price",
+                                    "exit_date", "exit_price", "notes", "stop_enabled",
+                                    "opening_stop", "tag_ids", "current_stop",
+                                    "instrument_type", "expiration", "strike",
+                                    "option_type", "multiplier", "leg_group", "leg_label", "side",
+                                ] if k in _td})
+                                _imported += 1
+                        except Exception:
+                            pass
+                    st.session_state.pop("_ib_preview", None)
+                    if _ib_dupes:
+                        st.info(f"{_ib_dupes} duplicate(s) skipped — already in the log.")
+                    st.success(f"Imported {_imported} trade(s).")
+                    st.rerun()
+                if _imp_c2.button("✕  Cancel", width='stretch', key="ib_import_cancel"):
+                    st.session_state.pop("_ib_preview", None)
+                    st.rerun()
+
+        # ── Option 2: Full History ─────────────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("##### 📅 Full History (Any Date Range)")
+            st.markdown(
+                "Pulls your complete trade history directly from **IB's servers** — last "
+                "week, last month, or further back. **TWS does not need to be running.**\n\n"
+                "IB has a feature called a **Flex Report** — think of it as a secure "
+                "export of your account history that you can request any time from IB's "
+                "website. You set it up once, and then this button fetches it automatically "
+                "whenever you need it."
+            )
+
+            _flex_tok = settings.get("flex_token", "").strip()
+            _flex_qid = settings.get("flex_query_id", "").strip()
+            _flex_configured = bool(_flex_tok) and bool(_flex_qid)
+
+            with st.expander(
+                "⚙️  Setup — " + ("configured ✓" if _flex_configured else "required before first use")
+            ):
+                st.markdown(
+                    "**One-time setup — takes about 2 minutes:**\n\n"
+                    "1. Log in to your IB account at "
+                    "[interactivebrokers.com](https://www.interactivebrokers.com)\n"
+                    "2. Go to **Reports → Flex Queries → Create New Flex Query**\n"
+                    "3. Give it a name, add the **Trades** section, and save. "
+                    "Note the **Query ID** number shown next to it.\n"
+                    "4. Go to **Reports → Flex Queries → Manage Tokens**, "
+                    "create a new token, and copy it.\n"
+                    "5. Paste both below and click Save — you're done."
+                )
+                with st.form("flex_settings_import_form"):
+                    _fsi_c1, _fsi_c2 = st.columns([3, 2])
+                    _new_flex_tok = _fsi_c1.text_input(
+                        "Flex Token", value=_flex_tok, type="password",
+                        help="From IB: Reports → Flex Queries → Manage Tokens"
+                    )
+                    _new_flex_qid = _fsi_c2.text_input(
+                        "Query ID", value=_flex_qid,
+                        help="The numeric ID shown next to your Flex Query"
+                    )
+                    if st.form_submit_button("💾  Save", width='content'):
+                        set_setting("flex_token",    _new_flex_tok)
+                        set_setting("flex_query_id", _new_flex_qid)
+                        st.success("Saved.")
+                        st.rerun()
+
+                st.markdown("---")
+                st.markdown(
+                    "**Can't get the automatic fetch to work?** "
+                    "Download the XML file manually from IB "
+                    "(Reports → Flex Queries → Run → Download) and upload it here:"
+                )
+                _xml_file_imp = st.file_uploader(
+                    "Upload Flex Statement XML", type=["xml"],
+                    key="flex_xml_upload_imp", label_visibility="collapsed"
+                )
+                if _xml_file_imp is not None:
+                    _xml_imp_result = _ib_mod._parse_flex_xml(
+                        _xml_file_imp.read().decode("utf-8", errors="replace")
+                    )
+                    if _xml_imp_result.get("error"):
+                        st.error(f"XML error: {_xml_imp_result['error']}")
+                    else:
+                        st.session_state["_flex_result"] = _xml_imp_result
+                        st.success("File loaded. Set a date range below and import.")
+                        st.rerun()
+
+            _flex_today = pd.Timestamp.today().date()
+            _imp2_date_from = st.session_state.get(
+                "flex_filter_from", _flex_today - pd.Timedelta(days=30)
+            )
+            _imp2_date_to = st.session_state.get("flex_filter_to", _flex_today)
+
+            if _flex_configured or st.session_state.get("_flex_result"):
+                _fpr1, _fpr2, _fpr3, _fpr4 = st.columns(4)
+                if _fpr1.button("Last Week",  key="imp2_preset_week",  width='stretch'):
+                    st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(weeks=1)
+                    st.session_state["flex_filter_to"]   = _flex_today
+                    st.rerun()
+                if _fpr2.button("Last Month", key="imp2_preset_month", width='stretch'):
+                    st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(days=30)
+                    st.session_state["flex_filter_to"]   = _flex_today
+                    st.rerun()
+                if _fpr3.button("Last 3 Mo",  key="imp2_preset_3m",   width='stretch'):
+                    st.session_state["flex_filter_from"] = _flex_today - pd.Timedelta(days=90)
+                    st.session_state["flex_filter_to"]   = _flex_today
+                    st.rerun()
+                if _fpr4.button("All Time",   key="imp2_preset_all",  width='stretch'):
+                    st.session_state["flex_filter_from"] = pd.Timestamp("2010-01-01").date()
+                    st.session_state["flex_filter_to"]   = _flex_today
+                    st.rerun()
+
+                _flt2_c1, _flt2_c2 = st.columns(2)
+                _imp2_date_from = _flt2_c1.date_input(
+                    "From",
+                    value=_imp2_date_from,
+                    key="flex_filter_from",
+                )
+                _imp2_date_to = _flt2_c2.date_input(
+                    "To",
+                    value=_imp2_date_to,
+                    key="flex_filter_to",
+                )
+
+                _fetch2_col, _ = st.columns([1, 2])
+                if _fetch2_col.button("📥  Fetch Full History", width='stretch', key="imp2_fetch_btn"):
+                    if not _flex_configured:
+                        st.error("Complete the setup above (token + query ID) first.")
+                    else:
+                        with st.spinner(
+                            "Contacting IB's servers… this can take up to 2 minutes."
+                        ):
+                            _new_flex = _ib_mod.fetch_flex_report(_flex_tok, _flex_qid)
+                        if _new_flex.get("error"):
+                            st.error(f"Fetch error: {_new_flex['error']}")
+                            st.info(
+                                "If this keeps failing, download the XML from IB manually "
+                                "and upload it via the Setup section above."
+                            )
+                        else:
+                            st.session_state["_flex_result"] = _new_flex
+                            st.success("History fetched. Review below and click Import.")
+                            st.rerun()
+            else:
+                st.info("Complete the setup above to enable full history import.")
+
+            _flex_imp_data = st.session_state.get("_flex_result")
+            if _flex_imp_data:
+                _flex_trades_all = _flex_imp_data.get("trades", [])
+                if _flex_trades_all:
+                    def _flex_in_range(t):
+                        d = t.get("entry_date")
+                        if d is None:
+                            return True
+                        try:
+                            d_iso = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
+                            return str(_imp2_date_from) <= d_iso <= str(_imp2_date_to)
+                        except Exception:
+                            return True
+
+                    _flex_trades = [t for t in _flex_trades_all if _flex_in_range(t)]
+                    st.caption(
+                        f"{len(_flex_trades)} of {len(_flex_trades_all)} trade(s) in range "
+                        f"({_imp2_date_from} → {_imp2_date_to}). "
+                        "Open positions have no exit date/price."
+                    )
+                    _flex_trades_df = pd.DataFrame(_flex_trades).drop(
+                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
+                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
+                    ) if _flex_trades else pd.DataFrame()
+                    if not _flex_trades_df.empty:
+                        st.dataframe(_flex_trades_df, width='stretch', hide_index=True)
+                    else:
+                        st.info("No trades in the selected date range.")
+
+                    _import_label2 = (
+                        f"✅  Import {len(_flex_trades)} Trade(s)"
+                        if len(_flex_trades) < len(_flex_trades_all)
+                        else f"✅  Import All {len(_flex_trades_all)} Trade(s)"
+                    )
+                    _fc1, _fc2 = st.columns(2)
+                    if _flex_trades and _fc1.button(_import_label2, width='stretch', key="flex_import_trades"):
+                        import time as _t
+                        from pathlib import Path as _Path
+                        try:
+                            _imp_dir = _Path(__file__).parent / "imports"
+                            _imp_dir.mkdir(exist_ok=True)
+                            _ts_str = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+                            pd.DataFrame(_flex_trades).to_csv(
+                                _imp_dir / f"flex_{_ts_str}.csv", index=False
+                            )
+                        except Exception:
+                            pass
+                        _total         = len(_flex_trades)
+                        _flex_imported = 0
+                        _flex_errors   = []
+                        _prog          = st.progress(0, text="Starting import…")
+                        _eta_txt       = st.empty()
+                        _start         = _t.time()
+                        _flex_dupes    = 0
+                        _flex_closed   = 0
+                        for _i, _ftd in enumerate(_flex_trades):
+                            try:
+                                # Close-only: open fill was outside the Flex date range.
+                                # Find the existing open trade by ticker+qty and close it.
+                                if _ftd.get("close_only"):
+                                    _co_match = find_open_trade_by_ticker_qty(
                                         _ftd.get("ticker", ""),
-                                        _ftd.get("entry_date"),
                                         _ftd.get("quantity"),
-                                        _ftd.get("entry_price"),
                                         _ftd.get("instrument_type", "stock"),
                                         _ftd.get("expiration"),
                                         _ftd.get("strike"),
                                     )
-                                    if _open_id:
+                                    if _co_match:
                                         update_trade(
-                                            _open_id,
+                                            _co_match,
                                             exit_date=_ftd["exit_date"],
                                             exit_price=_ftd["exit_price"],
                                             notes=_ftd.get("notes"),
@@ -9628,73 +9835,410 @@ elif page == "🔗  Broker Sync":
                                         )
                                         _flex_closed += 1
                                     else:
+                                        _flex_errors.append(
+                                            f"{_ftd.get('ticker','?')}: close fill found "
+                                            f"but no matching open trade (qty {_ftd.get('quantity')})"
+                                        )
+                                    _done    = _i + 1
+                                    _elapsed = _t.time() - _start
+                                    _eta     = (_elapsed / _done) * (_total - _done)
+                                    _prog.progress(_done / _total, text=f"Importing {_done}/{_total} — {_ftd.get('ticker','')}")
+                                    _eta_txt.caption(f"Elapsed: {_elapsed:.1f}s  ·  ETA: {_eta:.0f}s remaining")
+                                    continue
+                                if is_duplicate_trade(
+                                    _ftd.get("ticker", ""),
+                                    _ftd.get("entry_date"),
+                                    _ftd.get("quantity"),
+                                    _ftd.get("entry_price"),
+                                    _ftd.get("instrument_type", "stock"),
+                                    _ftd.get("expiration"),
+                                    _ftd.get("strike"),
+                                ):
+                                    if _ftd.get("exit_date") and _ftd.get("exit_price") is not None:
+                                        _open_id = find_open_trade_id(
+                                            _ftd.get("ticker", ""),
+                                            _ftd.get("entry_date"),
+                                            _ftd.get("quantity"),
+                                            _ftd.get("entry_price"),
+                                            _ftd.get("instrument_type", "stock"),
+                                            _ftd.get("expiration"),
+                                            _ftd.get("strike"),
+                                        )
+                                        if _open_id:
+                                            update_trade(
+                                                _open_id,
+                                                exit_date=_ftd["exit_date"],
+                                                exit_price=_ftd["exit_price"],
+                                                notes=_ftd.get("notes"),
+                                                current_stop=None,
+                                                stop_enabled=False,
+                                                tag_ids=[],
+                                            )
+                                            _flex_closed += 1
+                                        else:
+                                            _flex_dupes += 1
+                                    else:
                                         _flex_dupes += 1
                                 else:
-                                    _flex_dupes += 1
-                            else:
-                                add_trade(**{k: _ftd[k] for k in [
-                                    "entry_date", "ticker", "quantity", "entry_price",
-                                    "exit_date", "exit_price", "notes", "stop_enabled",
-                                    "opening_stop", "tag_ids", "current_stop",
-                                    "instrument_type", "expiration", "strike",
-                                    "option_type", "multiplier", "leg_group", "leg_label", "side",
-                                    "exchange",
-                                ] if k in _ftd})
-                                _flex_imported += 1
-                        except Exception as _e:
-                            _flex_errors.append(f"{_ftd.get('ticker','?')}: {_e}")
-                        _done    = _i + 1
-                        _elapsed = _t.time() - _start
-                        _eta     = (_elapsed / _done) * (_total - _done)
-                        _prog.progress(
-                            _done / _total,
-                            text=f"Importing {_done}/{_total} — {_ftd.get('ticker','')}"
-                        )
-                        _eta_txt.caption(
-                            f"Elapsed: {_elapsed:.1f}s  ·  ETA: {_eta:.0f}s remaining"
-                        )
-                    _prog.progress(1.0, text="Import complete.")
-                    _eta_txt.empty()
-                    if _flex_errors:
-                        st.warning(
-                            f"{len(_flex_errors)} trade(s) failed:\n" +
-                            "\n".join(f"• {e}" for e in _flex_errors[:5])
-                        )
-                    if _flex_dupes:
-                        st.info(f"{_flex_dupes} duplicate(s) skipped — already in the log.")
-                    if _flex_closed:
-                        st.info(
-                            f"{_flex_closed} existing open trade(s) updated with closing data."
-                        )
-                    st.success(f"Imported {_flex_imported} trade(s).")
-                    # Check which newly-imported non-US tickers can't be resolved on Yahoo Finance.
-                    # Those positions will show no live P&L until a closing price is entered manually.
-                    _unvalidated = []
-                    _seen_for_validation: set = set()
-                    for _ftd in _flex_trades:
-                        if _ftd.get("close_only"):
-                            continue
-                        _vtk  = _ftd.get("ticker", "")
-                        _vexc = _ftd.get("exchange", "")
-                        _vkey = (_vtk, _vexc)
-                        if _vtk and _vexc and _vkey not in _seen_for_validation:
-                            _seen_for_validation.add(_vkey)
-                            if not validate_ticker(_vtk, _vexc):
-                                _unvalidated.append(f"{_vtk} ({_vexc})")
-                    if _unvalidated:
-                        st.warning(
-                            "The following tickers could not be validated on Yahoo Finance — "
-                            "live prices won't be available for these positions. "
-                            "You will need to enter the closing price manually. "
-                            "These trades will be excluded from P&L results until a closing price is recorded.\n\n"
-                            + "\n".join(f"• {t}" for t in _unvalidated)
-                        )
-                    st.rerun()
-                if _fc2.button("🗑️  Clear", width='stretch', key="flex_clear"):
-                    del st.session_state["_flex_result"]
-                    st.rerun()
+                                    add_trade(**{k: _ftd[k] for k in [
+                                        "entry_date", "ticker", "quantity", "entry_price",
+                                        "exit_date", "exit_price", "notes", "stop_enabled",
+                                        "opening_stop", "tag_ids", "current_stop",
+                                        "instrument_type", "expiration", "strike",
+                                        "option_type", "multiplier", "leg_group", "leg_label", "side",
+                                        "exchange",
+                                    ] if k in _ftd})
+                                    _flex_imported += 1
+                            except Exception as _e:
+                                _flex_errors.append(f"{_ftd.get('ticker','?')}: {_e}")
+                            _done    = _i + 1
+                            _elapsed = _t.time() - _start
+                            _eta     = (_elapsed / _done) * (_total - _done)
+                            _prog.progress(
+                                _done / _total,
+                                text=f"Importing {_done}/{_total} — {_ftd.get('ticker','')}"
+                            )
+                            _eta_txt.caption(
+                                f"Elapsed: {_elapsed:.1f}s  ·  ETA: {_eta:.0f}s remaining"
+                            )
+                        _prog.progress(1.0, text="Import complete.")
+                        _eta_txt.empty()
+                        if _flex_errors:
+                            st.warning(
+                                f"{len(_flex_errors)} trade(s) failed:\n" +
+                                "\n".join(f"• {e}" for e in _flex_errors[:5])
+                            )
+                        if _flex_dupes:
+                            st.info(f"{_flex_dupes} duplicate(s) skipped — already in the log.")
+                        if _flex_closed:
+                            st.info(
+                                f"{_flex_closed} existing open trade(s) updated with closing data."
+                            )
+                        st.success(f"Imported {_flex_imported} trade(s).")
+                        # Check which newly-imported non-US tickers can't be resolved on Yahoo Finance.
+                        # Those positions will show no live P&L until a closing price is entered manually.
+                        _unvalidated = []
+                        _seen_for_validation: set = set()
+                        for _ftd in _flex_trades:
+                            if _ftd.get("close_only"):
+                                continue
+                            _vtk  = _ftd.get("ticker", "")
+                            _vexc = _ftd.get("exchange", "")
+                            _vkey = (_vtk, _vexc)
+                            if _vtk and _vexc and _vkey not in _seen_for_validation:
+                                _seen_for_validation.add(_vkey)
+                                if not validate_ticker(_vtk, _vexc):
+                                    _unvalidated.append(f"{_vtk} ({_vexc})")
+                        if _unvalidated:
+                            st.warning(
+                                "The following tickers could not be validated on Yahoo Finance — "
+                                "live prices won't be available for these positions. "
+                                "You will need to enter the closing price manually. "
+                                "These trades will be excluded from P&L results until a closing price is recorded.\n\n"
+                                + "\n".join(f"• {t}" for t in _unvalidated)
+                            )
+                        st.rerun()
+                    if _fc2.button("🗑️  Clear", width='stretch', key="flex_clear"):
+                        del st.session_state["_flex_result"]
+                        st.rerun()
+                else:
+                    st.info("No trades found in the fetched data.")
+
+    elif _cur_broker == "schwab":
+        import datetime as _dt
+
+        sc_app_key  = settings.get("schwab_app_key", "")
+        sc_secret   = settings.get("schwab_secret", "")
+        sc_callback = settings.get("schwab_callback", "https://127.0.0.1:8182")
+        sc_acct_num = settings.get("schwab_account_number", "")
+
+        _tok = _schwab_mod.token_status()
+
+        # ── Connection status badge ────────────────────────────────────────────
+        if _tok["connected"] and _tok["refresh_valid"]:
+            st.success(
+                f"Connected to Schwab — authorisation valid for about "
+                f"{_tok['refresh_days_left']} more day(s)."
+            )
+        elif _tok["connected"]:
+            st.warning("Schwab authorisation has expired (7-day limit). Re-authorise below.")
+        else:
+            st.info("Not connected to Schwab yet. Enter your credentials and authorise below.")
+
+        # ── How-to-connect explainer ──────────────────────────────────────────
+        with st.expander("🛟  How to connect — step by step", expanded=not _tok["connected"]):
+            st.success(
+                "**Read-only & secure.** Trade Log uses Schwab's official API with the "
+                "App Key and Secret from your own developer app. You log in on Schwab's "
+                "own website — Trade Log never sees your Schwab username or password, and "
+                "it asks only to **read** your accounts and trades. It can never place "
+                "trades or move money.",
+                icon="🔒",
+            )
+            st.markdown(
+                "There are **two parts**. You only do **Part A once** — after that, "
+                "reconnecting takes about a minute.\n\n"
+                "⏱️ **Hands-on time:** roughly **15 minutes**, with a **1–2 day wait** in "
+                "the middle while Schwab approves your app. You can walk away during the "
+                "wait. ☕"
+            )
+
+            # ── Visual overview of the journey ────────────────────────────────
+            _wt_cards = [
+                ("1", "Sign up at",       "developer.schwab.com"),
+                ("2", "Create an app",    "(Accounts & Trading)"),
+                ("3", "Wait for approval","about 1–2 days"),
+                ("4", "Copy your",        "Key & Secret"),
+                ("5", "Paste here &",     "log in"),
+            ]
+            _wt_xs = [25, 205, 385, 565, 745]
+            _wt_body = ""
+            for (_n, _l1, _l2), _x in zip(_wt_cards, _wt_xs):
+                _cx = _x + 75
+                _wt_body += (
+                    f'<rect x="{_x}" y="40" rx="12" width="150" height="100" '
+                    f'fill="#eef3fa" stroke="#c2d4ec" stroke-width="1.5"/>'
+                    f'<circle cx="{_cx}" cy="70" r="15" fill="#2f6fb3"/>'
+                    f'<text x="{_cx}" y="75" text-anchor="middle" font-size="16" '
+                    f'font-weight="700" fill="#ffffff">{_n}</text>'
+                    f'<text x="{_cx}" y="103" text-anchor="middle" font-size="13.5" '
+                    f'font-weight="600" fill="#20324a">{_l1}</text>'
+                    f'<text x="{_cx}" y="122" text-anchor="middle" font-size="13.5" '
+                    f'font-weight="600" fill="#20324a">{_l2}</text>'
+                )
+            for _x in _wt_xs[:-1]:
+                _wt_body += (
+                    f'<path d="M {_x+154} 90 L {_x+176} 90" stroke="#8aa6c8" '
+                    f'stroke-width="2.5" fill="none" marker-end="url(#arr)"/>'
+                )
+            _wt_svg = (
+                '<div style="margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif">'
+                '<svg viewBox="0 0 920 175" width="100%" preserveAspectRatio="xMidYMid meet" '
+                'xmlns="http://www.w3.org/2000/svg">'
+                '<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="5" refY="3" '
+                'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8aa6c8"/></marker></defs>'
+                '<text x="460" y="22" text-anchor="middle" font-size="15" font-weight="600" '
+                'fill="#6f8db5">Your one-time setup — then you’re done</text>'
+                + _wt_body +
+                '</svg></div>'
+            )
+            st.iframe(_wt_svg, height=200)
+
+            st.markdown(
+                "### 🛠️ Part A — Set up your Schwab app  *(one time)*\n\n"
+                "**A1. Sign up at the Schwab developer site.**  ⏱️ *~3 min*  \n"
+                "Go to **developer.schwab.com**, click **Register**, and verify your email.\n\n"
+                "**A2. Create a new app.**  ⏱️ *~1 min*  \n"
+                "Sign in, then click **Dashboard → Create App**.\n\n"
+                "**A3. Fill in the form** with these exact values, then click **Create**:  ⏱️ *~3 min*  \n"
+                "• **API Product:** *Accounts and Trading Production*  \n"
+                "• **Order Limit:** `120`  *(any number is fine)*  \n"
+                "• **App Name:** anything, e.g. *My Trade Log*  \n"
+                "• **Callback URL:** `https://127.0.0.1:8182`  ⚠️ *must match exactly*\n\n"
+                "**A4. Wait for Schwab to approve it.**  ⏱️ *usually 1–2 days*  \n"
+                "You'll get an email and the app will show **“Approved.”** There's nothing "
+                "else to do meanwhile — close everything and come back when it's ready.\n\n"
+                "**A5. Copy your two codes.**  ⏱️ *~1 min*  \n"
+                "Open the approved app and copy the **App Key** and the **Secret**. "
+                "Treat them like passwords — keep them private."
+            )
+
+            st.markdown(
+                "### 🔗 Part B — Connect Trade Log  *(about 3 minutes)*\n\n"
+                "**B1. Paste the two codes** into the **App Key** and **Secret** boxes "
+                "below, then click **💾 Save**.\n\n"
+                "**B2. Leave the Callback URL** as `https://127.0.0.1:8182`.\n\n"
+                "**B3. Click “🔐 Open Schwab login.”**  \n"
+                "Log in with your **normal** Schwab username and password, then click **Allow**.\n\n"
+                "**B4. Copy the web address it sends you to.**  \n"
+                "Your browser jumps to a page starting with `127.0.0.1` that looks "
+                "**broken or blank — that's completely normal.** Click the address bar, "
+                "select the **whole** address, and copy it.\n\n"
+                "**B5. Paste it back** into **“Paste the redirected URL here”** below and "
+                "click **✅ Complete Authorization.**  🎉 You're connected!"
+            )
+
+            st.info(
+                "A green **Connected** banner means you're done. You'll only repeat "
+                "**Part B** every 7 days (about a minute). No Schwab account? You can "
+                "ignore this whole section and enter trades by hand.",
+                icon="✅",
+            )
+
+        if not _schwab_mod.is_available():
+            st.warning("The 'requests' library is not installed. Run `pip install requests` and restart.")
+
+        st.divider()
+
+        # ── Credentials ────────────────────────────────────────────────────────
+        st.markdown("#### Schwab Credentials")
+        with st.form("schwab_creds_form"):
+            new_sc_key = st.text_input(
+                "App Key (Client ID)", value=sc_app_key,
+                help="From developer.schwab.com → your app → App Key",
+            )
+            new_sc_secret = st.text_input(
+                "Secret", value=sc_secret, type="password",
+                help="From developer.schwab.com → your app → Secret",
+            )
+            new_sc_callback = st.text_input(
+                "Callback URL", value=sc_callback,
+                help="Must match exactly what you registered at Schwab",
+            )
+            if st.form_submit_button("💾  Save Schwab Credentials", width='stretch'):
+                set_setting("schwab_app_key",  new_sc_key.strip())
+                set_setting("schwab_secret",   new_sc_secret.strip())
+                set_setting("schwab_callback", new_sc_callback.strip())
+                st.success("Schwab credentials saved.")
+                st.rerun()
+
+        st.divider()
+
+        # ── Authorize ──────────────────────────────────────────────────────────
+        st.markdown("#### Authorize")
+        if not sc_app_key or not sc_secret:
+            st.warning("Enter and save your App Key and Secret first.")
+        else:
+            _auth_url = _schwab_mod.build_auth_url(sc_app_key, sc_callback)
+            st.link_button("🔐  Open Schwab login", _auth_url, width='content')
+            st.caption(
+                "Log in, approve access, then copy the full URL you land on "
+                "(the page itself won't load — that's normal)."
+            )
+            _redir = st.text_input(
+                "Paste the redirected URL here",
+                key="schwab_redirect_url",
+                placeholder="https://127.0.0.1:8182/?code=...&session=...",
+            )
+            _ac1, _ac2, _ac3 = st.columns(3)
+            if _ac1.button("✅  Complete Authorization", width='stretch', key="schwab_complete_auth"):
+                if not _redir.strip():
+                    st.error("Paste the redirected URL first.")
+                else:
+                    with st.spinner("Exchanging authorization code…"):
+                        _ok, _msg = _schwab_mod.exchange_code(sc_app_key, sc_secret, sc_callback, _redir)
+                    if _ok:
+                        st.session_state.pop("_schwab_hashes", None)
+                        st.success(_msg)
+                        st.rerun()
+                    else:
+                        st.error(_msg)
+            if _ac2.button("🔌  Test Connection", width='stretch', key="schwab_test_conn"):
+                _ok, _msg = _schwab_mod.test_connection(sc_app_key, sc_secret)
+                (st.success if _ok else st.error)(_msg)
+            if _ac3.button("🔓  Disconnect", width='stretch', key="schwab_disconnect"):
+                _schwab_mod.clear_token()
+                st.session_state.pop("_schwab_hashes", None)
+                st.session_state.pop("_schwab_result", None)
+                st.success("Disconnected — Schwab token cleared.")
+                st.rerun()
+
+        # ── Account + data (only when usable) ─────────────────────────────────
+        if _tok["connected"] and _tok["refresh_valid"] and sc_app_key and sc_secret:
+            st.divider()
+            st.markdown("#### Account")
+
+            _ah1, _ah2 = st.columns([4, 1])
+            if _ah2.button("🔄  Refresh", width='stretch', key="schwab_refresh_accts"):
+                st.session_state.pop("_schwab_hashes", None)
+                st.rerun()
+            if "_schwab_hashes" not in st.session_state:
+                _h, _herr = _schwab_mod.get_account_hashes(sc_app_key, sc_secret)
+                st.session_state["_schwab_hashes"]     = _h
+                st.session_state["_schwab_hashes_err"] = _herr
+            _hashes = st.session_state.get("_schwab_hashes", [])
+            _herr   = st.session_state.get("_schwab_hashes_err", "")
+
+            _sel_hash = ""
+            if _herr:
+                _ah1.error(_herr)
+            elif not _hashes:
+                _ah1.warning("No accounts found for this Schwab login.")
             else:
-                st.info("No trades found in the fetched data.")
+                _nums = [h.get("accountNumber", "") for h in _hashes]
+                if len(_nums) > 1:
+                    _default_idx = _nums.index(sc_acct_num) if sc_acct_num in _nums else 0
+                    _chosen = _ah1.selectbox("Schwab account", _nums, index=_default_idx,
+                                             key="schwab_acct_select")
+                else:
+                    _chosen = _nums[0]
+                    _ah1.caption(f"Account: {_chosen}")
+                if _chosen != sc_acct_num:
+                    set_setting("schwab_account_number", _chosen)
+                _sel_hash = next((h.get("hashValue", "") for h in _hashes
+                                  if h.get("accountNumber") == _chosen), "")
+
+            st.divider()
+            st.markdown("#### Fetch Account Data & Trades")
+            st.caption(
+                "Pulls your current balance and executed trades from Schwab for the date "
+                "range below (max one year per fetch)."
+            )
+            _today = _dt.date.today()
+            _dc1, _dc2, _dc3 = st.columns([2, 2, 2])
+            _sd = _dc1.date_input("From", value=_today - _dt.timedelta(days=90), key="schwab_from")
+            _ed = _dc2.date_input("To", value=_today, key="schwab_to")
+            _dc3.write("")
+            if _dc3.button("📥  Fetch from Schwab", width='stretch', key="schwab_fetch"):
+                if not _sel_hash:
+                    st.error("Select a valid account first.")
+                elif _sd > _ed:
+                    st.error("'From' date must be on or before 'To' date.")
+                else:
+                    with st.spinner("Contacting Schwab…"):
+                        _res = _schwab_mod.fetch_schwab_report(sc_app_key, sc_secret, _sel_hash, _sd, _ed)
+                    if _res.get("error"):
+                        st.error(_res["error"])
+                    else:
+                        st.session_state["_schwab_result"] = _res
+                        st.rerun()
+
+            _sres = st.session_state.get("_schwab_result")
+            if _sres:
+                _sa = _sres.get("account_summary", {})
+                _m1, _m2 = st.columns(2)
+                _m1.metric("Net Liquidation", f"${_sa.get('net_liquidation', 0):,.2f}")
+                _m2.metric("Cash",            f"${_sa.get('cash', 0):,.2f}")
+
+                if st.button("⬆️  Update Account Balance from Schwab", key="schwab_update_bal"):
+                    _nl = _sa.get("net_liquidation", 0)
+                    if _nl:
+                        set_setting("account_balance", str(_nl))
+                        st.session_state["_live_balance_set"] = True
+                        st.success(f"Account balance updated: ${_nl:,.2f}")
+                        st.rerun()
+                    else:
+                        st.warning("Net liquidation value is zero or missing.")
+
+                _strades = _sres.get("trades", [])
+                st.markdown("##### Trades")
+                if _strades:
+                    _sdf = pd.DataFrame(_strades).drop(
+                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
+                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
+                    )
+                    st.dataframe(_sdf, width='stretch', hide_index=True)
+                    _ic1, _ic2 = st.columns(2)
+                    if _ic1.button(f"✅  Import {len(_strades)} Trade(s)", width='stretch',
+                                   key="schwab_import"):
+                        with st.spinner("Importing…"):
+                            _counts = import_parsed_trades(_strades)
+                        if _counts["errors"]:
+                            st.warning(
+                                f"{len(_counts['errors'])} trade(s) failed:\n" +
+                                "\n".join(f"• {e}" for e in _counts["errors"][:5])
+                            )
+                        if _counts["dupes"]:
+                            st.info(f"{_counts['dupes']} duplicate(s) skipped — already in the log.")
+                        if _counts["closed"]:
+                            st.info(f"{_counts['closed']} existing open trade(s) updated with closing data.")
+                        st.success(f"Imported {_counts['imported']} trade(s).")
+                        st.rerun()
+                    if _ic2.button("🗑️  Clear", width='stretch', key="schwab_clear"):
+                        del st.session_state["_schwab_result"]
+                        st.rerun()
+                else:
+                    st.info("No trades found in the selected date range.")
 
     # ── Find Duplicate Imports ─────────────────────────────────────────────────
     st.divider()

@@ -43,6 +43,7 @@ desktop.ini
 .env
 .env.local
 .streamlit/secrets.toml
+schwab_token.json
 
 # Trade Log launcher restart sentinel
 .restart_requested
