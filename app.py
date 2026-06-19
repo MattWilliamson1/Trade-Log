@@ -15,7 +15,15 @@ import plotly.graph_objects as go
 from pathlib import Path
 from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
 import ib_client as _ib_mod
-import schwab_client as _schwab_mod
+try:
+    import schwab_client as _schwab_mod
+except Exception as _schwab_import_err:
+    # The Schwab integration is optional. If its module (or a dependency) is
+    # missing — e.g. a packaged build that didn't bundle schwab_client.py — the
+    # whole app must still start so the user can reach Settings → Check for
+    # updates and self-heal. The Broker Sync → Schwab tab handles _schwab_mod
+    # being None gracefully.
+    _schwab_mod = None
 import updater as _upd
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
@@ -9943,6 +9951,13 @@ elif page == "🔗  Broker Sync":
                         st.rerun()
                 else:
                     st.info("No trades found in the fetched data.")
+
+    elif _cur_broker == "schwab" and _schwab_mod is None:
+        st.error(
+            "The Schwab integration module (`schwab_client.py`) is missing from this "
+            "install, so Schwab sync is unavailable. Open **⚙️ Settings → Check for "
+            "updates** to repair the install, or reinstall the latest build."
+        )
 
     elif _cur_broker == "schwab":
         import datetime as _dt

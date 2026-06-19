@@ -12,6 +12,7 @@ these items (nothing else — no .venv, no stale zips, no dev files):
     app.py
     db.py
     ib_client.py
+    schwab_client.py
     requirements.txt
     launch.bat
     INSTALL - Double-Click This First.bat
@@ -40,6 +41,7 @@ ROOT_FILES = [
     "app.py",
     "db.py",
     "ib_client.py",
+    "schwab_client.py",
     "updater.py",
     "launch.py",
     "requirements.txt",

@@ -12,6 +12,7 @@ SOURCE_FILES = [
     "app.py",
     "db.py",
     "ib_client.py",
+    "schwab_client.py",
     "launch.py",
     "requirements.txt",
     "updater.py",
