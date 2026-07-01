@@ -426,6 +426,18 @@ def _get_live_ticker(row) -> str:
     return _yf_symbol(row["ticker"], row.get("exchange") or "")
 
 
+def _live_tickers(df: pd.DataFrame) -> pd.Series:
+    """Live-price symbols for each row, always as a Series.
+
+    DataFrame.apply(..., axis=1) on an EMPTY frame returns an empty *DataFrame*
+    (rows×cols), not a Series — which then broadcasts wrong in np.where and
+    crashes the display build. Short-circuit the empty case to a real Series.
+    """
+    if df.empty:
+        return pd.Series([], dtype=object, index=df.index)
+    return df.apply(_get_live_ticker, axis=1)
+
+
 def _contract_sym(row) -> str:
     if str(row.get("instrument_type") or "stock").lower() == "option":
         exp    = row.get("expiration")
@@ -4721,11 +4733,15 @@ if page == "📋  Trading Log":
         date_col_sel = fr2c2.selectbox("Filter date", ["Entry Date", "Exit Date"], key="filter_date_col")
         date_range   = fr2c3.date_input("Date range", key="filter_date_range")
         fr2c4.markdown("<div style='margin-top:1.6rem'></div>", unsafe_allow_html=True)
-        if fr2c4.button("↺ Reset", key="reset_filters", help="Reset all filters to defaults",
-                        width='stretch'):
+        def _reset_filters():
+            # Runs as an on_click callback: fires before any widget is instantiated
+            # on the next rerun, so assigning to widget-backed keys is legal here.
+            # (Doing it inline after the widgets are created raises StreamlitAPIException.)
             for _fk, _fv in _FILTER_DEFAULTS.items():
                 st.session_state[_fk] = _fv
-            st.rerun()
+
+        fr2c4.button("↺ Reset", key="reset_filters", help="Reset all filters to defaults",
+                     width='stretch', on_click=_reset_filters)
 
         # ── Apply filters ─────────────────────────────────────────────────────
 
@@ -4778,11 +4794,11 @@ if page == "📋  Trading Log":
             return _open & ~_expired
 
         # Build live tickers for display (filtered view)
-        live_ticker_ser  = filtered.apply(_get_live_ticker, axis=1)
+        live_ticker_ser  = _live_tickers(filtered)
         _eligible_mask   = _live_eligible_mask(filtered)
         # Fetch prices for ALL open positions (not just the filtered subset) so
         # the cache is complete regardless of which filters are currently active.
-        _all_live_ser    = trades.apply(_get_live_ticker, axis=1)
+        _all_live_ser    = _live_tickers(trades)
         _all_elig_mask   = _live_eligible_mask(trades)
         live_symbols     = tuple(_all_live_ser[_all_elig_mask].dropna().unique())
 
@@ -4818,11 +4834,11 @@ if page == "📋  Trading Log":
             if pnl_filter == "Profit (+)":
                 filtered = filtered[pnl_vals[filtered.index] > 0]
                 is_open_mask    = _make_is_open_mask(filtered)
-                live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+                live_ticker_ser = _live_tickers(filtered)
             elif pnl_filter == "Loss (-)":
                 filtered = filtered[pnl_vals[filtered.index] < 0]
                 is_open_mask    = _make_is_open_mask(filtered)
-                live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+                live_ticker_ser = _live_tickers(filtered)
 
         # ── View toggle (Positions / Trades) + expand legs ────────────────────
 
@@ -5057,7 +5073,7 @@ if page == "📋  Trading Log":
             ).drop(columns=["_grp_sort", "_strike_sort"]).reset_index(drop=True)
             # reset_index changes the integer index — recompute positional masks
             is_open_mask    = _make_is_open_mask(filtered)
-            live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+            live_ticker_ser = _live_tickers(filtered)
 
         display = filtered.copy()
         display["Status"] = np.where(is_open_mask, "Open", "Closed")
@@ -8789,7 +8805,7 @@ elif page == "📊  Statistics":
                 _sf_exp     = pd.to_datetime(sf["expiration"], errors="coerce")
                 _sf_expired = _sf_exp.notna() & (_sf_exp.dt.normalize() < pd.Timestamp.today().normalize())
                 _sf_open    = _sf_open & ~_sf_expired
-            open_t_st  = tuple(sf.loc[_sf_open].apply(_get_live_ticker, axis=1).dropna().unique())
+            open_t_st  = tuple(_live_tickers(sf.loc[_sf_open]).dropna().unique())
             ld_st      = get_live_data(open_t_st) if open_t_st else {}
             sf["_pnl"] = sf.apply(lambda r: _pnl_numeric(r, ld_st), axis=1)
             sf["_date"] = sf["exit_date"].where(sf["exit_date"].notna(), sf["entry_date"])
