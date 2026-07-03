@@ -24,6 +24,12 @@ except Exception as _schwab_import_err:
     # updates and self-heal. The Broker Sync → Schwab tab handles _schwab_mod
     # being None gracefully.
     _schwab_mod = None
+try:
+    import fidelity_client as _fidelity_mod
+except Exception:
+    # Optional, same rationale as Schwab above — the Broker Sync → Fidelity tab
+    # handles _fidelity_mod being None gracefully.
+    _fidelity_mod = None
 import updater as _upd
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
@@ -242,8 +248,8 @@ THEMES: dict[str, dict] = {
 }
 
 DEFAULT_COLS = [
-    "Trade ID", "Status", "Instrument", "Entry Date", "Ticker", "Quantity",
-    "Spread Type", "Entry Price", "Exit Date", "Exit Price", "Live Price", "P&L",
+    "Entry Date", "Ticker", "Quantity", "Entry Price", "Live Price",
+    "P&L", "Unrealized P&L %", "Open Risk", "Opening Risk", "% of Account", "Tags",
 ]
 ALL_COLS = [
     "Trade ID", "Status", "Instrument", "Entry Date", "Ticker", "Quantity",
@@ -973,7 +979,12 @@ def get_ticker_info(ticker: str, exchange: str = "") -> dict | None:
         info = yf.Ticker(_yf_symbol(ticker, exchange)).info
         name = info.get("longName") or info.get("shortName")
         exch = info.get("fullExchangeName") or info.get("exchange")
-        return {"name": name, "exchange": exch} if name else None
+        return {
+            "name":     name,
+            "exchange": exch,
+            "sector":   info.get("sector"),
+            "industry": info.get("industry"),
+        } if name else None
     except Exception:
         return None
 
@@ -3952,7 +3963,9 @@ if page == "📋  Trading Log":
     if lookup_val.strip():
         info = get_ticker_info(lookup_val.strip().upper())
         if info and info.get("name"):
-            tl_col.caption(f"✅ **{info['name']}** · {info.get('exchange', '—')}")
+            _si = " · ".join(x for x in (info.get("sector"), info.get("industry")) if x)
+            tl_col.caption(f"✅ **{info['name']}** · {info.get('exchange', '—')}"
+                           + (f"  \n🏢 {_si}" if _si else ""))
         else:
             tl_col.caption("⚠️ Not found on Yahoo Finance")
 
@@ -4035,10 +4048,19 @@ if page == "📋  Trading Log":
                 _at_yf_sym = _yf_symbol(_at_ticker, _at_exchange)
                 if _at_price is not None:
                     _sym_label = f" · via {_at_yf_sym}" if _at_yf_sym != _at_ticker else ""
+                    # Company name / sector / industry (cached .info lookup)
+                    _at_info = get_ticker_info(_at_ticker, _at_exchange) or {}
+                    _at_meta_bits = [x for x in (_at_info.get("name"),
+                                                 _at_info.get("sector"),
+                                                 _at_info.get("industry")) if x]
+                    _at_meta = (
+                        "<div style='font-size:0.82rem;color:#888;margin-top:2px'>"
+                        + " · ".join(_at_meta_bits) + "</div>"
+                    ) if _at_meta_bits else ""
                     _tlk2.markdown(
                         f"<div style='padding-top:28px;font-size:1rem'>"
                         f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
-                        f"${_at_price:,.2f}</span></div>",
+                        f"${_at_price:,.2f}</span>{_at_meta}</div>",
                         unsafe_allow_html=True,
                     )
                 else:
@@ -4636,8 +4658,8 @@ if page == "📋  Trading Log":
             if _open_pos.empty:
                 st.caption("No open positions.")
             else:
-                st.caption("Enter an exit price and click Close — exit date defaults to today. "
-                           "Live price (stocks) pre-fills the exit field.")
+                st.caption("Enter an exit price and click Close — exit date defaults to today "
+                           "but can be overridden. Live price (stocks) pre-fills the exit field.")
                 _close_today = pd.Timestamp.today().date()
                 for _, _op in _open_pos.iterrows():
                     _opid   = int(_op["id"])
@@ -4656,7 +4678,7 @@ if page == "📋  Trading Log":
                         _opupnl = -_raw if _opside == "short" else _raw
 
                     with st.form(f"close_pos_{_opid}", clear_on_submit=False):
-                        cpa, cpb, cpc, cpd, cpe = st.columns([2.1, 0.9, 1.3, 1.3, 1.4])
+                        cpa, cpb, cpc, cpd, cpf, cpe = st.columns([2.0, 0.8, 1.2, 1.2, 1.3, 1.2])
                         _lbl = f"**{_op['ticker']}**" + (f" · {_opinst}" if _opinst != "stock" else "")
                         cpa.markdown(
                             f"{_lbl}<br><span style='color:#888;font-size:0.85rem'>"
@@ -4685,6 +4707,9 @@ if page == "📋  Trading Log":
                             value=float(_oplive) if _oplive is not None else None,
                             key=f"cp_px_{_opid}",
                         )
+                        _cp_date = cpf.date_input(
+                            "Exit Date", value=_close_today, key=f"cp_dt_{_opid}",
+                        )
                         cpe.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                         if cpe.form_submit_button("Close", width='stretch', type="primary"):
                             if not _cp_price:
@@ -4696,7 +4721,7 @@ if page == "📋  Trading Log":
                                           else None)
                                 update_trade(
                                     _opid,
-                                    _close_today,
+                                    _cp_date or _close_today,
                                     float(_cp_price),
                                     _op.get("notes") or None,
                                     _cp_cs,
@@ -4879,14 +4904,6 @@ if page == "📋  Trading Log":
             _saved_vc = get_setting("col_order")
             _vc0 = _json.loads(_saved_vc) if _saved_vc else list(DEFAULT_COLS)
             _vc0 = [c for c in _vc0 if c in ALL_COLS] or list(DEFAULT_COLS)
-            # One-time: surface the Spread Type column for layouts saved before it
-            # existed. Guarded by a flag so a later manual removal stays removed.
-            if get_setting("_spread_type_col_seeded", "") != "1":
-                if "Spread Type" not in _vc0:
-                    _ins = (_vc0.index("Quantity") + 1) if "Quantity" in _vc0 else len(_vc0)
-                    _vc0.insert(_ins, "Spread Type")
-                set_setting("col_order", _json.dumps(_vc0))
-                set_setting("_spread_type_col_seeded", "1")
             st.session_state["visible_cols"] = _vc0
 
         # Apply a deferred column removal here — BEFORE the multiselect widget is
@@ -8789,7 +8806,13 @@ elif page == "📊  Statistics":
                 _sf_exp     = pd.to_datetime(sf["expiration"], errors="coerce")
                 _sf_expired = _sf_exp.notna() & (_sf_exp.dt.normalize() < pd.Timestamp.today().normalize())
                 _sf_open    = _sf_open & ~_sf_expired
-            open_t_st  = tuple(sf.loc[_sf_open].apply(_get_live_ticker, axis=1).dropna().unique())
+            _sf_open_rows = sf.loc[_sf_open]
+            # DataFrame.apply(axis=1) on an empty frame returns a DataFrame (no
+            # .unique()), so guard the no-open-trades case explicitly.
+            if _sf_open_rows.empty:
+                open_t_st = ()
+            else:
+                open_t_st = tuple(_sf_open_rows.apply(_get_live_ticker, axis=1).dropna().unique())
             ld_st      = get_live_data(open_t_st) if open_t_st else {}
             sf["_pnl"] = sf.apply(lambda r: _pnl_numeric(r, ld_st), axis=1)
             sf["_date"] = sf["exit_date"].where(sf["exit_date"].notna(), sf["entry_date"])
@@ -8914,6 +8937,30 @@ elif page == "📊  Statistics":
                 st.markdown(f"**{len(pnl_avail)} trade(s) in analysis**  "
                             f"{_mode_label}  "
                             f"{'· 10% trimmed mean (per group)' if _use_trimmed else ''}")
+
+                # ── Total Return ──────────────────────────────────────────────
+                # Total net P&L across the trades in the current filter, plus that
+                # as a % of starting capital (falls back to account balance).
+                _total_ret   = float(pnl_series.sum())
+                _start_eq    = float(settings.get("starting_equity", 0) or 0)
+                _ret_base    = _start_eq if _start_eq > 0 else acct_bal
+                _total_ret_pct = (_total_ret / _ret_base * 100) if _ret_base else None
+                _base_label  = "starting equity" if _start_eq > 0 else "account balance"
+                st.markdown("##### Total Return")
+                _tr_cols = st.columns(2)
+                _tr_cols[0].metric(
+                    "Total Return ($)", fmt_price(_total_ret),
+                    delta=f"{_total_ret_pct:+.2f}%" if _total_ret_pct is not None else None,
+                    help="Sum of net P&L (after commission if that toggle is on) across "
+                         "every trade in the current filter, including unrealized P&L on "
+                         "any open trades shown.",
+                )
+                _tr_cols[1].metric(
+                    "Total Return (%)",
+                    f"{_total_ret_pct:,.2f}%" if _total_ret_pct is not None else "N/A",
+                    help=f"Total Return ($) ÷ {_base_label} ({fmt_price(_ret_base)}). "
+                         "Set your starting equity in ⚙️ Settings for a true return-on-capital figure.",
+                )
 
                 # ── Performance ───────────────────────────────────────────────
                 st.markdown("##### Performance")
@@ -9567,17 +9614,53 @@ elif page == "🏷️  Tags":
                     _be_caption += f" ({_n_spreads} spread{'s' if _n_spreads != 1 else ''} collapsed — tags apply to all legs)"
                 st.caption(_be_caption + ".")
 
-                _be_edited = st.data_editor(
-                    _be_display,
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=["Date", "Ticker", "Type", "Status", "Detail"],
-                    column_config={
-                        _t["name"]: st.column_config.CheckboxColumn(_t["name"], default=False)
-                        for _t in tag_list
-                    },
-                    key=f"bulk_tag_editor_{_be_status}_{_be_ticker}_{_be_tag_sel}",
-                )
+                # Freeze Date + Ticker to the left so the row stays identifiable
+                # while scrolling right through many tag columns.
+                _be_id_cols = ["Date", "Ticker", "Type", "Status", "Detail"]
+                _be_pinned_cols = ["Date", "Ticker"]
+                # Keyed container → DOM gets a `.st-key-be_grid_box` class we can
+                # target from JS to scope the drag-select guard to this table only.
+                with st.container(key="be_grid_box"):
+                    _be_edited = st.data_editor(
+                        _be_display,
+                        use_container_width=True,
+                        hide_index=True,
+                        disabled=_be_id_cols,
+                        column_config={
+                            **{
+                                _c: st.column_config.Column(_c, pinned=True)
+                                for _c in _be_pinned_cols
+                            },
+                            **{
+                                _t["name"]: st.column_config.CheckboxColumn(_t["name"], default=False)
+                                for _t in tag_list
+                            },
+                        },
+                        key=f"bulk_tag_editor_{_be_status}_{_be_ticker}_{_be_tag_sel}",
+                    )
+
+                # Disable click-drag range selection in the editor above while
+                # keeping wheel/scrollbar scrolling and single-click toggles.
+                # glide-data-grid exposes no Streamlit option for this, so we
+                # swallow mouse-drag pointermove events inside the grid's
+                # container (capture phase, before the grid's own handlers).
+                st.iframe("""
+<script>
+(function(){
+    var pwin = window.parent, doc = pwin.document;
+    if (pwin.__beGridDragGuard) return;   // attach once per page session
+    pwin.__beGridDragGuard = true;
+    doc.addEventListener('pointermove', function(e){
+        if (e.pointerType && e.pointerType !== 'mouse') return;  // keep touch scroll
+        if (!e.buttons) return;                                  // only while dragging
+        var t = e.target;
+        if (t && t.closest && t.closest('.st-key-be_grid_box')) {
+            e.stopPropagation();
+        }
+    }, true);
+})();
+</script>
+""", height=1)  # JS-only injector
 
                 if st.button("💾  Save Changes", type="primary", key="be_save"):
                     with st.spinner("Saving…"):
@@ -9637,11 +9720,11 @@ elif page == "🔗  Broker Sync":
         key="broker_schwab_btn",
     )
     _fidelity_selected = _bc3.button(
-        "Fidelity",
+        "✅  Fidelity" if _cur_broker == "fidelity" else "Fidelity",
         width='stretch',
-        disabled=True,
+        type="primary" if _cur_broker == "fidelity" else "secondary",
         key="broker_fidelity_btn",
-        help="Fidelity integration — coming soon.",
+        help="Import a Fidelity statement PDF (trades, balances, deposits, withdrawals).",
     )
 
     if _ib_selected and _cur_broker != "ib":
@@ -9650,12 +9733,9 @@ elif page == "🔗  Broker Sync":
     if _schwab_selected and _cur_broker != "schwab":
         set_setting("broker", "schwab")
         st.rerun()
-
-    # Future broker note
-    st.markdown(
-        "> **📅 Coming Soon:** **Fidelity** integration is planned for a future release. "
-        "Balance sync, trade import, and live price feeds will be supported via their API."
-    )
+    if _fidelity_selected and _cur_broker != "fidelity":
+        set_setting("broker", "fidelity")
+        st.rerun()
 
     if _cur_broker == "ib":
         # Show connection status badge
@@ -10613,6 +10693,132 @@ elif page == "🔗  Broker Sync":
                         st.rerun()
                 else:
                     st.info("No trades found in the selected date range.")
+
+    elif _cur_broker == "fidelity":
+        st.divider()
+        st.markdown("#### Fidelity Statement Import")
+        if _fidelity_mod is None or not _fidelity_mod.is_available():
+            st.error(
+                "PDF reading isn't available in this build — the `pdfplumber` "
+                "library is missing. It's listed in requirements.txt; reinstall "
+                "dependencies to enable Fidelity statement import."
+            )
+        else:
+            st.caption(
+                "Drop in a Fidelity **monthly statement PDF**. It reads the trades "
+                "(scale-ins and scale-outs are combined into one averaged position "
+                "per cycle, exactly like the IB and Schwab imports), the month-end "
+                "account value, and any deposits or withdrawals — then lets you "
+                "review everything before importing."
+            )
+            _fid_file = st.file_uploader(
+                "Fidelity statement (PDF)", type=["pdf"], key="fidelity_pdf",
+                accept_multiple_files=False,
+            )
+            if _fid_file is not None and st.button(
+                "📄  Parse Statement", width='stretch', type="primary", key="fidelity_parse"
+            ):
+                with st.spinner("Reading the statement…"):
+                    _fres = _fidelity_mod.parse_statement(_fid_file.getvalue(), _fid_file.name)
+                if _fres.get("error"):
+                    st.error(_fres["error"])
+                else:
+                    st.session_state["_fidelity_result"] = _fres
+                    st.rerun()
+
+            _fres = st.session_state.get("_fidelity_result")
+            if _fres:
+                _fa = _fres.get("account_summary", {})
+                _period = _fa.get("period") or (None, None)
+                if _period[0] or _period[1]:
+                    st.markdown(
+                        f"**Statement period:** {_period[0] or '?'} → {_period[1] or '?'}"
+                    )
+                _fm1, _fm2, _fm3, _fm4 = st.columns(4)
+                _fm1.metric("Ending Value",  f"${_fa.get('net_liquidation', 0):,.2f}")
+                _fm2.metric("Beginning Value", f"${_fa.get('beginning_value', 0):,.2f}")
+                _fm3.metric("Deposits",      f"${_fa.get('total_deposits', 0):,.2f}")
+                _fm4.metric("Withdrawals",   f"${_fa.get('total_withdrawals', 0):,.2f}")
+
+                if _fa.get("net_liquidation"):
+                    if st.button("⬆️  Update Account Balance from Statement",
+                                 key="fidelity_update_bal"):
+                        set_setting("account_balance", str(_fa["net_liquidation"]))
+                        st.session_state["_live_balance_set"] = True
+                        st.success(f"Account balance updated: ${_fa['net_liquidation']:,.2f}")
+                        st.rerun()
+
+                # ── Trades ────────────────────────────────────────────────────
+                _ftrades = _fres.get("trades", [])
+                st.markdown(f"##### Trades  ·  {len(_ftrades)} position(s) from "
+                            f"{_fres.get('fill_count', 0)} fill(s)")
+                if _ftrades:
+                    _fdf = pd.DataFrame(_ftrades).drop(
+                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
+                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
+                    )
+                    st.dataframe(_fdf, width='stretch', hide_index=True)
+                    if st.button(f"✅  Import {len(_ftrades)} Trade(s)", width='stretch',
+                                 key="fidelity_import_trades"):
+                        with st.spinner("Importing…"):
+                            _counts = import_parsed_trades(_ftrades)
+                        if _counts["errors"]:
+                            st.warning(
+                                f"{len(_counts['errors'])} trade(s) failed:\n" +
+                                "\n".join(f"• {e}" for e in _counts["errors"][:5])
+                            )
+                        if _counts["dupes"]:
+                            st.info(f"{_counts['dupes']} duplicate(s) skipped — already in the log.")
+                        if _counts["closed"]:
+                            st.info(f"{_counts['closed']} existing open trade(s) updated with closing data.")
+                        st.success(f"Imported {_counts['imported']} trade(s).")
+                        st.rerun()
+                else:
+                    st.info(
+                        "No trades were recognised. Check the **Raw statement text** "
+                        "expander below to see what was read — the buy/sell wording or "
+                        "layout may differ from what the parser expects."
+                    )
+
+                # ── Cash flow ─────────────────────────────────────────────────
+                _fcash = _fres.get("cash_transactions", [])
+                if _fcash:
+                    st.markdown(f"##### Deposits & Withdrawals  ·  {len(_fcash)}")
+                    _fcdf = pd.DataFrame(_fcash)[["date", "type", "amount", "description"]].copy()
+                    _fcdf.columns = ["Date", "Type", "Amount ($)", "Description"]
+                    st.dataframe(_fcdf, width='stretch', hide_index=True)
+
+                # ── Equity / month-end balance ────────────────────────────────
+                _fnav = _fres.get("daily_nav", [])
+                if _fnav:
+                    st.markdown("##### Account Balance & Cash Flow → Equity Curve")
+                    _fnavdf = pd.DataFrame(_fnav)[["date", "balance", "contributions", "withdrawals"]].copy()
+                    _fnavdf.columns = ["Date", "Balance ($)", "Contributions ($)", "Withdrawals ($)"]
+                    st.dataframe(_fnavdf, width='stretch', hide_index=True)
+                    st.caption(
+                        "Imports the month-end account value (plus this month's deposits "
+                        "and withdrawals) as one equity-curve entry. Import one statement "
+                        "per month to build the full curve."
+                    )
+                    if st.button(f"✅  Import {len(_fnav)} Balance Entry(ies)", width='stretch',
+                                 key="fidelity_import_nav"):
+                        for _nr in _fnav:
+                            upsert_equity_entry(
+                                _nr["date"], float(_nr["balance"]),
+                                float(_nr.get("contributions", 0.0)),
+                                float(_nr.get("withdrawals", 0.0)),
+                            )
+                        _cached_load_equity_entries.clear()
+                        _bust("_v_equity")
+                        st.success(f"Imported {len(_fnav)} equity entry(ies).")
+                        st.rerun()
+
+                # ── Debug + clear ─────────────────────────────────────────────
+                with st.expander("🔎  Raw statement text (for troubleshooting)"):
+                    st.text((_fres.get("raw_text") or "")[:20000])
+                if st.button("🗑️  Clear", key="fidelity_clear"):
+                    st.session_state.pop("_fidelity_result", None)
+                    st.rerun()
 
     # ── Find Duplicate Imports ─────────────────────────────────────────────────
     st.divider()

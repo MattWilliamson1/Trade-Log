@@ -95,6 +95,8 @@ with get_connection() as conn:
         "starting_date":        iso(START),
         "euro_dates":           "0",
         "app_mode":             "demo",
+        "app_theme":            "warm_sand",
+        "col_order":            '["Entry Date", "Ticker", "Quantity", "Entry Price", "Live Price", "P&L", "Unrealized P&L %", "Open Risk", "Opening Risk", "% of Account", "Tags"]',
         "native_currency":      "USD",
         "currency_mode":        "0",
         "pct_account_yellow":   "5",
