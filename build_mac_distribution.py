@@ -160,23 +160,29 @@ kill "$STREAMLIT_PID" 2>/dev/null
 wait "$STREAMLIT_PID" 2>/dev/null
 """
 
-# ── Backup .command launcher ─────────────────────────────────────────────────
+# ── Primary .command launcher ────────────────────────────────────────────────
 # Placed next to the .app at the top level of the distribution folder (mode 0o755).
 #
-# Some Mac setups can't launch the .app cleanly (Finder's launch environment trips
-# up uv's first-run setup). A double-clickable .command opens Terminal and runs the
-# SAME launcher inside a normal shell — the path a user reported as the reliable
-# workaround — so it just works, with no digging into "Show Package Contents".
+# This is the RECOMMENDED way to start Trade Log. A .command is a plain script
+# that Finder always runs on double-click — it never depends on macOS recognising
+# the .app as a bundle. That matters because a .app built off-Mac and shipped in a
+# .tar.gz is often extracted as a plain folder (no "Show Package Contents", won't
+# launch); the .command sidesteps that entirely. It also clears the download
+# quarantine from the whole folder, so the .app itself becomes launchable after
+# one run for users who prefer it.
 COMMAND_FALLBACK = r"""#!/bin/bash
-# Trade Log — backup launcher.
+# Trade Log — launcher (recommended).
 #
-# Use this ONLY if double-clicking "Trade Log.app" shows an error such as
-# "Could not create a Python environment." It runs the exact same app from a
-# Terminal window, which avoids some macOS launch quirks on certain setups.
+# Double-click this to start Trade Log. It runs the app from a Terminal window,
+# which works on every Mac — including ones where double-clicking "Trade Log.app"
+# only opens a folder or is blocked by macOS security.
 #
-# First time: macOS may say it "cannot verify the developer." If so, right-click
-# this file -> Open -> Open.
+# First time only: macOS may say it "cannot verify the developer." If so,
+# right-click this file -> Open -> Open.
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# Trust everything we shipped here: clear the download quarantine so neither this
+# script, the app bundle, nor the bundled tools get blocked by Gatekeeper.
+xattr -dr com.apple.quarantine "$DIR" 2>/dev/null || true
 exec "$DIR/Trade Log.app/Contents/MacOS/launcher"
 """
 
@@ -215,6 +221,7 @@ SOURCE_FILES = [
     "app.py",
     "db.py",
     "ib_client.py",
+    "schwab_client.py",
     "updater.py",
     "launch.py",
     "requirements.txt",
@@ -245,6 +252,18 @@ def add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes, mode: int = 0o644)
     info.size = len(data)
     info.mode = mode
     tf.addfile(info, io.BytesIO(data))
+
+
+def add_dir(tf: tarfile.TarFile, arcname: str, mode: int = 0o755) -> None:
+    """Write an explicit directory entry. Bundles extract more reliably when the
+    .app / Contents / MacOS / Resources dirs are present as real entries rather
+    than implied by their files — some unarchivers (and Finder's bundle
+    detection) don't treat an implicitly-created .app as a package."""
+    info = tarfile.TarInfo(name=arcname.rstrip("/") + "/")
+    info.type = tarfile.DIRTYPE
+    info.mode = mode
+    info.size = 0
+    tf.addfile(info)
 
 
 # ── uv download / cache ──────────────────────────────────────────────────────
@@ -298,19 +317,39 @@ def build() -> None:
 
     with tarfile.open(OUTPUT, "w:gz") as tf:
 
+        # Explicit directory entries for the bundle tree — added first so the
+        # .app is recognised as a package rather than extracted as a plain folder.
+        for d in (
+            TOP,
+            f"{TOP}/Trade Log.app",
+            f"{BUNDLE}",
+            f"{BUNDLE}/MacOS",
+            f"{BUNDLE}/Resources",
+            f"{BUNDLE}/Resources/.streamlit",
+            f"{BUNDLE}/Resources/_uv",
+            *(f"{BUNDLE}/Resources/_uv/{arch}" for arch in UV_MAC_URLS),
+        ):
+            add_dir(tf, d)
+        print("  + (bundle directory entries)")
+
         # Launcher — executable
         add_str(tf, f"{BUNDLE}/MacOS/launcher", LAUNCHER, mode=0o755)
         print("  + MacOS/launcher")
 
-        # Backup .command launcher next to the .app (for setups where Finder
-        # can't launch the .app cleanly)
-        fallback_name = f"{TOP}/Open Trade Log (if the app won't open).command"
-        add_str(tf, fallback_name, COMMAND_FALLBACK, mode=0o755)
-        print(f"  + {fallback_name}")
+        # Primary .command launcher next to the .app — the recommended,
+        # bundle-recognition-proof way to start the app.
+        command_name = f"{TOP}/Start Trade Log.command"
+        add_str(tf, command_name, COMMAND_FALLBACK, mode=0o755)
+        print(f"  + {command_name}")
 
         # App metadata
         add_str(tf, f"{BUNDLE}/Info.plist", INFO_PLIST)
         print("  + Info.plist")
+
+        # PkgInfo — legacy bundle type marker; helps LaunchServices classify the
+        # .app as an application package (APPL) rather than a folder.
+        add_str(tf, f"{BUNDLE}/PkgInfo", "APPL????")
+        print("  + PkgInfo")
 
         # Source files
         for name in SOURCE_FILES:
@@ -352,21 +391,20 @@ def build() -> None:
     print()
     print("  1. Double-click 'Trade Log Mac.tar.gz' to extract")
     print("  2. Open the 'Trade Log Mac' folder")
-    print("  3. Double-click 'Trade Log.app'")
+    print("  3. Double-click 'Start Trade Log.command'  (recommended)")
     print("  4. macOS security prompt:")
-    print("       macOS 12 or earlier:  right-click -> Open -> Open")
-    print("       macOS 13-14:          right-click -> Open -> Open")
-    print("       macOS 15 (Sequoia):   System Settings -> Privacy & Security")
-    print("                             -> scroll down -> 'Open Anyway'")
+    print("       right-click 'Start Trade Log.command' -> Open -> Open")
+    print("       (macOS 15 Sequoia: System Settings -> Privacy & Security")
+    print("        -> scroll down -> 'Open Anyway')")
     print("  5. First launch only: Trade Log installs itself (~1–2 min)")
     print("     No Python required — everything is included.")
     print("  6. Your browser opens Trade Log automatically.")
     print("  7. Click 'Quit' in the dialog to stop the app.")
     print()
-    print("  If 'Trade Log.app' won't open (e.g. 'Could not create a Python")
-    print("  environment'), double-click")
-    print("  'Open Trade Log (if the app won't open).command' instead — it runs")
-    print("  the same app from Terminal and works on setups the .app trips on.")
+    print("  'Start Trade Log.command' is the reliable path — it works even when")
+    print("  macOS shows 'Trade Log.app' as a plain folder. It also clears the")
+    print("  download quarantine, so 'Trade Log.app' can be double-clicked")
+    print("  directly on later launches if preferred.")
     print("  Setup errors are logged to ~/Library/Logs/Trade Log Setup.log")
     print("-" * 60)
     print()

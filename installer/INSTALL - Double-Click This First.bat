@@ -4,6 +4,49 @@ title Trade Log — First-Time Setup
 color 0A
 cd /d "%~dp0"
 
+:: ── Relocate to a per-user, no-admin, non-synced home ────────────────────────
+:: Trade Log is a portable app: it builds a .venv, writes its database, and
+:: self-updates by rewriting its own files — all *inside* this folder. Program
+:: Files needs admin for every one of those writes, and OneDrive / Downloads /
+:: Documents (cloud-synced) break the Python install. So before doing anything
+:: else we copy ourselves to %LOCALAPPDATA%\TradeLog — which is per-user, never
+:: needs admin, and is never cloud-synced — and continue setup from there, no
+:: matter where the user extracted the zip. Existing trade data is migrated.
+set "TARGET=%LOCALAPPDATA%\TradeLog"
+if /i "%~dp0"=="%TARGET%\" goto :in_home
+
+echo.
+echo   Setting up Trade Log in your user folder:
+echo     %TARGET%
+echo.
+
+if not exist "%TARGET%" mkdir "%TARGET%"
+
+:: Copy the program files. Exclude the venv (rebuilt fresh in the new home) and
+:: the data folders + database (migrated separately below so we never clobber
+:: trades that already live in the target).
+robocopy "%~dp0." "%TARGET%" /E /XD ".venv" ".git" "__pycache__" "backups" "attachments" "plan_attachments" "imports" /XF "_write_test.tmp" "tradelog.db" >nul
+if %ERRORLEVEL% GEQ 8 (
+    echo   [!] Could not copy Trade Log to your user folder — possibly blocked
+    echo       by antivirus. Falling back to installing in this folder instead.
+    echo.
+    goto :in_home
+)
+
+:: Migrate existing user data, but only when the target has none yet (never
+:: overwrite trades already living in the user folder).
+if not exist "%TARGET%\tradelog.db" if exist "%~dp0tradelog.db" copy /y "%~dp0tradelog.db" "%TARGET%\tradelog.db" >nul
+for %%D in (backups attachments plan_attachments imports) do (
+    if not exist "%TARGET%\%%D" if exist "%~dp0%%D" robocopy "%~dp0%%D" "%TARGET%\%%D" /E >nul
+)
+
+echo   [OK] Continuing setup from your user folder...
+echo.
+start "" "%TARGET%\INSTALL - Double-Click This First.bat"
+exit /b 0
+
+:in_home
+
 :: ── Force uv to copy, never hardlink ─────────────────────────────────────────
 :: OneDrive / Dropbox / Google Drive sync turns folders into cloud placeholders,
 :: and hardlinking into (or out of) those fails with "os error 396". Copy mode
@@ -176,21 +219,31 @@ if errorlevel 1 (
 echo  [OK] Trade Log installed.
 echo.
 
+:: ── Desktop shortcut ─────────────────────────────────────────────────────────
+echo  [..] Creating a Desktop shortcut...
+powershell -NoProfile -Command "$d=[Environment]::GetFolderPath('Desktop'); $s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Trade Log.lnk')); $s.TargetPath='%~dp0launch.bat'; $s.WorkingDirectory='%~dp0'; $s.IconLocation='%SystemRoot%\System32\shell32.dll,220'; $s.Save()" >nul 2>&1
+if not errorlevel 1 (
+    echo  [OK] Desktop shortcut "Trade Log" created.
+) else (
+    echo  [--] Could not create a Desktop shortcut ^(not essential^).
+)
+echo.
+
 echo  ============================================================
 echo.
 echo   All done!
 echo.
-echo   To open Trade Log from now on:
+echo   Trade Log now lives in your user folder:
 echo.
-echo     In THIS SAME FOLDER, double-click the file named
+echo        %~dp0
 echo.
-echo        launch.bat
+echo   To open it, double-click the "Trade Log" shortcut on your
+echo   Desktop. (You can also double-click launch.bat in the folder
+echo   above.) Your browser will open automatically. Leave the black
+echo   window open while you use the app - closing it stops Trade Log.
 echo.
-echo   (It sits right next to this installer.) Your browser will
-echo   open automatically. Leave the black window open while you
-echo   use the app - closing it stops Trade Log.
-echo.
-echo   You do NOT need to run this installer again.
+echo   You do NOT need to run this installer again, and you can delete
+echo   the folder you originally unzipped.
 echo.
 echo  ============================================================
 echo.
