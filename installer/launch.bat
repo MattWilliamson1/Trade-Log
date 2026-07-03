@@ -4,7 +4,18 @@ title Trade Log
 color 0E
 cd /d "%~dp0"
 
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
+:: Locate the installed app. Normally the venv sits next to this launcher, but
+:: the installer relocates a fresh install to %LOCALAPPDATA%\TradeLog. If this
+:: copy has no venv — e.g. this is the launch.bat still sitting in the folder you
+:: unzipped — fall back to that per-user install so double-clicking here works.
+set "APP_DIR=%~dp0"
+set "PYTHON=%APP_DIR%.venv\Scripts\python.exe"
+if not exist "%PYTHON%" (
+    if exist "%LOCALAPPDATA%\TradeLog\.venv\Scripts\python.exe" (
+        set "APP_DIR=%LOCALAPPDATA%\TradeLog\"
+        set "PYTHON=%LOCALAPPDATA%\TradeLog\.venv\Scripts\python.exe"
+    )
+)
 
 if not exist "%PYTHON%" (
     cls
@@ -70,7 +81,10 @@ start /min "" cmd /c "timeout /t 5 /nobreak >nul & start http://localhost:%PORT%
 :: ── Run Trade Log (keeps this window open until it stops) ────────────────────
 :: launch.py supervises Streamlit: it picks a light/dark theme base matching the
 :: saved theme, and relaunches automatically when the app requests a restart.
-"%PYTHON%" "%~dp0launch.py" --port %PORT% --no-browser
+:: Run the installed copy's launch.py (APP_DIR) so its data/venv paths resolve
+:: to the real install, not this possibly-empty extract folder.
+cd /d "%APP_DIR%"
+"%PYTHON%" "%APP_DIR%launch.py" --port %PORT% --no-browser
 
 echo.
 echo  Trade Log has stopped. You can close this window.
