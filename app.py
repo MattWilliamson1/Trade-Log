@@ -10697,6 +10697,14 @@ elif page == "🔗  Broker Sync":
     elif _cur_broker == "fidelity":
         st.divider()
         st.markdown("#### Fidelity Statement Import")
+        st.warning(
+            "🧪 **Beta** — Fidelity statement import is new and still being tuned "
+            "against real-world statement layouts. **Always review the parsed trades, "
+            "balances, and cash flow below before importing**, and check the raw-text "
+            "panel if anything looks off. Please report any statement that doesn't parse "
+            "cleanly so it can be improved.",
+            icon="⚠️",
+        )
         if _fidelity_mod is None or not _fidelity_mod.is_available():
             st.error(
                 "PDF reading isn't available in this build — the `pdfplumber` "
