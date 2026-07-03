@@ -9,3 +9,4 @@ reportlab>=4.0
 ib_insync>=0.9.86
 nest_asyncio>=1.5
 requests>=2.28
+pdfplumber>=0.11

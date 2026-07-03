@@ -13,6 +13,7 @@ SOURCE_FILES = [
     "db.py",
     "ib_client.py",
     "schwab_client.py",
+    "fidelity_client.py",
     "launch.py",
     "requirements.txt",
     "updater.py",

@@ -42,6 +42,7 @@ ROOT_FILES = [
     "db.py",
     "ib_client.py",
     "schwab_client.py",
+    "fidelity_client.py",
     "updater.py",
     "launch.py",
     "requirements.txt",
