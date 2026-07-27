@@ -82,6 +82,9 @@ DEFAULT_SETTINGS = {
     "schwab_secret":            "",
     "schwab_callback":          "https://127.0.0.1:8182",
     "schwab_account_number":    "",
+    # JSON {schwab account number: Trade Log account name} — Schwab's API doesn't
+    # expose the nicknames set on schwab.com, so the mapping is kept locally.
+    "schwab_account_aliases":   "{}",
     # Theme
     "app_theme":            "ocean_dark",
     # Onboarding / guided setup tour ("1" once completed or skipped)
@@ -430,6 +433,18 @@ def _get_live_ticker(row) -> str:
                 row["ticker"], exp, float(strike), row.get("option_type") or "C"
             )
     return _yf_symbol(row["ticker"], row.get("exchange") or "")
+
+
+def _live_ticker_series(df: pd.DataFrame) -> pd.Series:
+    """Row-wise _get_live_ticker as a Series, safe on empty frames.
+
+    ``df.apply(func, axis=1)`` on a 0-row DataFrame returns the original
+    DataFrame (shape (0, n_cols)) instead of an empty Series, which then
+    breaks downstream np.where broadcasts. Short-circuit that case.
+    """
+    if df.empty:
+        return pd.Series([], index=df.index, dtype=object)
+    return df.apply(_get_live_ticker, axis=1)
 
 
 def _contract_sym(row) -> str:
@@ -4803,11 +4818,11 @@ if page == "📋  Trading Log":
             return _open & ~_expired
 
         # Build live tickers for display (filtered view)
-        live_ticker_ser  = filtered.apply(_get_live_ticker, axis=1)
+        live_ticker_ser  = _live_ticker_series(filtered)
         _eligible_mask   = _live_eligible_mask(filtered)
         # Fetch prices for ALL open positions (not just the filtered subset) so
         # the cache is complete regardless of which filters are currently active.
-        _all_live_ser    = trades.apply(_get_live_ticker, axis=1)
+        _all_live_ser    = _live_ticker_series(trades)
         _all_elig_mask   = _live_eligible_mask(trades)
         live_symbols     = tuple(_all_live_ser[_all_elig_mask].dropna().unique())
 
@@ -4843,11 +4858,11 @@ if page == "📋  Trading Log":
             if pnl_filter == "Profit (+)":
                 filtered = filtered[pnl_vals[filtered.index] > 0]
                 is_open_mask    = _make_is_open_mask(filtered)
-                live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+                live_ticker_ser = _live_ticker_series(filtered)
             elif pnl_filter == "Loss (-)":
                 filtered = filtered[pnl_vals[filtered.index] < 0]
                 is_open_mask    = _make_is_open_mask(filtered)
-                live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+                live_ticker_ser = _live_ticker_series(filtered)
 
         # ── View toggle (Positions / Trades) + expand legs ────────────────────
 
@@ -5074,7 +5089,7 @@ if page == "📋  Trading Log":
             ).drop(columns=["_grp_sort", "_strike_sort"]).reset_index(drop=True)
             # reset_index changes the integer index — recompute positional masks
             is_open_mask    = _make_is_open_mask(filtered)
-            live_ticker_ser = filtered.apply(_get_live_ticker, axis=1)
+            live_ticker_ser = _live_ticker_series(filtered)
 
         display = filtered.copy()
         display["Status"] = np.where(is_open_mask, "Open", "Closed")
@@ -8735,7 +8750,7 @@ elif page == "📊  Statistics":
         # ── Display options ───────────────────────────────────────────────────
         _opt_c1, _opt_c2, _opt_c3, _opt_c4 = st.columns(4)
         _pnl_mode = _opt_c1.radio(
-            "P&L Display", ["$", "%", "Acct. %"],
+            "P&L Display", ["$", "%", "Acct. %", "R"],
             index=1, horizontal=True, key="st_pnl_mode",
             help=(
                 "**$** — raw dollar P&L. Best for a pure stock portfolio where all "
@@ -8746,7 +8761,12 @@ elif page == "📊  Statistics":
                 "**Acct. %** — return as a % of your total account balance. Puts every "
                 "trade on the same playing field regardless of size or instrument — ideal "
                 "for a mixed portfolio of stocks and options, because it shows how much "
-                "each trade actually moved the needle for your account."
+                "each trade actually moved the needle for your account.\n\n"
+                "**R** — P&L as a multiple of the risk you took at entry "
+                "(|entry − opening stop| × qty × multiplier). +2R means you made twice "
+                "what you were willing to lose. Measures reward relative to risk, so a "
+                "small win on a tight stop can score better than a big win on a loose "
+                "one. **Only trades with an opening stop are included.**"
             ),
         )
         _use_pct = _pnl_mode != "$"
@@ -8763,6 +8783,35 @@ elif page == "📊  Statistics":
                                        help="Subtract commission from P&L in all stats")
         _agg_spreads = _opt_c4.toggle("Aggregate Spreads",  value=True,  key="st_agg_spreads",
                                        help="Combine spread legs into one trade for all stats")
+
+        # ── R unit ────────────────────────────────────────────────────────────
+        # Trades carry a stop-based risk only if an opening stop was recorded —
+        # broker-imported trades never are. This fixed dollar figure is the
+        # fallback denominator so those trades still get an R.
+        _r_unit = float(settings.get("r_unit_dollars", 0) or 0)
+        if _r_unit <= 0:
+            _r_unit = round(acct_bal * 0.01, 2) if acct_bal else 100.0
+        # Always create the container, even outside R mode: Streamlit matches
+        # st.columns blocks by position, so an element that appears in only one
+        # mode shifts every later block and strands their children on switch.
+        _r_unit_box = st.container()
+        if _pnl_mode == "R":
+            _ru_c1, _ru_c2 = _r_unit_box.columns([1, 3])
+            _r_unit_new = _ru_c1.number_input(
+                "1R = ($)", min_value=0.01, step=25.0, value=_r_unit, format="%.2f",
+                key="st_r_unit",
+                help=(
+                    "The dollar risk that counts as 1R for trades with **no opening "
+                    "stop recorded** — which is every broker-imported trade. Set it to "
+                    "the amount you normally risk per position.\n\n"
+                    "Trades that *do* have an opening stop always use their own "
+                    "|entry − stop| × qty × multiplier instead of this number."
+                ),
+            )
+            if abs(_r_unit_new - _r_unit) > 1e-9:
+                set_setting("r_unit_dollars", str(_r_unit_new))
+                st.rerun()
+            _r_unit = _r_unit_new
 
         st.caption(f"Using account balance: **{fmt_price(acct_bal)}** — change in ⚙️ Settings tab.")
         st.divider()
@@ -8812,10 +8861,21 @@ elif page == "📊  Statistics":
             if _sf_open_rows.empty:
                 open_t_st = ()
             else:
-                open_t_st = tuple(_sf_open_rows.apply(_get_live_ticker, axis=1).dropna().unique())
+                open_t_st = tuple(_live_ticker_series(_sf_open_rows).dropna().unique())
             ld_st      = get_live_data(open_t_st) if open_t_st else {}
             sf["_pnl"] = sf.apply(lambda r: _pnl_numeric(r, ld_st), axis=1)
             sf["_date"] = sf["exit_date"].where(sf["exit_date"].notna(), sf["entry_date"])
+
+            # Opening risk (the "1R" denominator): what the trade stood to lose at
+            # entry if the opening stop had been hit. Falls back to the fixed _r_unit
+            # when no opening stop was recorded, so imported trades still get an R.
+            _rk_ep   = pd.to_numeric(sf["entry_price"],  errors="coerce")
+            _rk_stop = pd.to_numeric(sf["opening_stop"], errors="coerce")
+            _rk_qty  = pd.to_numeric(sf["quantity"],     errors="coerce")
+            _rk_mul  = pd.to_numeric(sf["multiplier"],   errors="coerce").fillna(1.0)
+            sf["_risk_stop"] = ((_rk_ep - _rk_stop).abs() * _rk_qty.abs() * _rk_mul).where(
+                lambda s: s > 0)
+            sf["_risk"] = sf["_risk_stop"].fillna(_r_unit if _pnl_mode == "R" else np.nan)
 
             # Commission deduction
             if _net_comm and "commission" in sf.columns:
@@ -8833,6 +8893,13 @@ elif page == "📊  Statistics":
                     rep = legs.iloc[0].copy()
                     rep["_pnl"]  = agg_pnl
                     rep["_date"] = agg_date
+                    # Summing stop-based risk is only valid when every leg has a stop;
+                    # a partial sum would understate the spread. Otherwise the whole
+                    # spread is one position risking one _r_unit — not one per leg.
+                    rep["_risk_stop"] = (legs["_risk_stop"].sum()
+                                         if legs["_risk_stop"].notna().all() else np.nan)
+                    rep["_risk"] = (rep["_risk_stop"] if pd.notna(rep["_risk_stop"])
+                                    else (_r_unit if _pnl_mode == "R" else np.nan))
                     # Merge tags from all legs so the aggregated row is fully tagged
                     _merged_tags = ", ".join(sorted({
                         t.strip()
@@ -8863,20 +8930,45 @@ elif page == "📊  Statistics":
                     base = abs(float(ep) * float(qty) * mult) if ep and qty else None
                     return (pnl_val / base * 100) if base and pnl_val is not None else None
 
+                # Mode-dependent notices live in an always-created container for the
+                # same reason as _r_unit_box above — a conditional element here would
+                # shift the Total Return / Performance column blocks below it.
+                _mode_msg = st.container()
                 if _pnl_mode == "%":
                     pnl_avail["_pnl_disp"] = pnl_avail.apply(
                         lambda r: _pct_of_trade(r, r["_pnl"]), axis=1)
                 elif _pnl_mode == "Acct. %":
                     if not acct_bal:
-                        st.warning("Set your account balance in ⚙️ Settings to use Acct. % mode.")
+                        _mode_msg.warning("Set your account balance in ⚙️ Settings to use Acct. % mode.")
                     pnl_avail["_pnl_disp"] = pnl_avail["_pnl"].apply(
                         lambda v: (v / acct_bal * 100) if acct_bal and v is not None else None)
+                elif _pnl_mode == "R":
+                    pnl_avail["_pnl_disp"] = (pnl_avail["_pnl"].astype(float)
+                                              / pnl_avail["_risk"].astype(float))
+                    _n_by_stop  = int(pnl_avail["_risk_stop"].notna().sum())
+                    _n_by_fixed = len(pnl_avail) - _n_by_stop
+                    if _n_by_fixed and _n_by_stop:
+                        _mode_msg.info(
+                            f"**Mixed R basis:** {_n_by_stop} trade(s) measured against "
+                            f"their own opening stop, {_n_by_fixed} against the fixed "
+                            f"1R = {fmt_price(_r_unit)} (no stop recorded).", icon="ℹ️")
+                    elif _n_by_fixed:
+                        _mode_msg.info(
+                            f"All {_n_by_fixed} trade(s) use the fixed 1R = "
+                            f"{fmt_price(_r_unit)} — none have an opening stop recorded, "
+                            f"so these R values are only as accurate as that assumption. "
+                            f"Record an opening stop on new trades for a true per-trade R.",
+                            icon="ℹ️")
 
-                if _pnl_mode in ("%", "Acct. %"):
+                if _pnl_mode in ("%", "Acct. %", "R"):
                     _pct_series = pnl_avail["_pnl_disp"].dropna().astype(float)
                     _eff_series = _pct_series
-                    def _mv(v, prefix="", decimals=2):
-                        return "N/A" if v is None else f"{v:,.{decimals}f}%"
+                    if _pnl_mode == "R":
+                        def _mv(v, prefix="", decimals=2):
+                            return "N/A" if v is None else f"{v:,.{decimals}f}R"
+                    else:
+                        def _mv(v, prefix="", decimals=2):
+                            return "N/A" if v is None else f"{v:,.{decimals}f}%"
                     _eff_winners = _eff_series[_eff_series > 0]
                     _eff_losers  = _eff_series[_eff_series < 0]
                     _avg_winner_v = float(_eff_winners.mean())   if not _eff_winners.empty else None
@@ -8933,7 +9025,8 @@ elif page == "📊  Statistics":
                 _avg_days  = float(_days_held.mean()) if not _days_held.empty else None
                 _ann_ev    = _ev * (365 / _avg_days) if _ev is not None and _avg_days and _avg_days > 0 else None
 
-                _mode_label = {"$": "", "%": "· % returns", "Acct. %": "· Acct. % returns"}.get(_pnl_mode, "")
+                _mode_label = {"$": "", "%": "· % returns", "Acct. %": "· Acct. % returns",
+                               "R": "· R multiples (P&L ÷ risk at entry)"}.get(_pnl_mode, "")
                 st.markdown(f"**{len(pnl_avail)} trade(s) in analysis**  "
                             f"{_mode_label}  "
                             f"{'· 10% trimmed mean (per group)' if _use_trimmed else ''}")
@@ -9017,7 +9110,7 @@ elif page == "📊  Statistics":
                     _aw = _avg_winner_v or 0
                     _al = _avg_loser_v  or 0
                     _y_prefix = "" if _pnl_mode != "$" else "$"
-                    _y_suffix = "%" if _pnl_mode != "$" else ""
+                    _y_suffix = {"$": "", "R": "R"}.get(_pnl_mode, "%")
                     _y_fmt    = ".2f" if _pnl_mode != "$" else ",.0f"
                     _chart_layout = dict(
                         height=280, showlegend=False,
@@ -9059,10 +9152,11 @@ elif page == "📊  Statistics":
                 if not pnl_avail.empty:
                     _sc_dates = pd.to_datetime(pnl_avail["_date"], errors="coerce")
                     if _pnl_mode != "$" and "_pnl_disp" in pnl_avail.columns:
+                        _sc_unit    = "R" if _pnl_mode == "R" else "%"
                         _sc_pnl = pnl_avail["_pnl_disp"].values
                         _sc_y_label = f"P&L ({_pnl_mode})"
-                        _sc_hover   = [f"{t}<br>{p:,.2f}%" for t, p in zip(pnl_avail["ticker"].values, _sc_pnl)]
-                        _sc_tick_sfx = "%"
+                        _sc_hover   = [f"{t}<br>{p:,.2f}{_sc_unit}" for t, p in zip(pnl_avail["ticker"].values, _sc_pnl)]
+                        _sc_tick_sfx = _sc_unit
                         _sc_tick_pfx = ""
                         _sc_tick_fmt = ".2f"
                     else:
@@ -9317,7 +9411,7 @@ elif page == "📊  Statistics":
                         if _t_df.empty:
                             continue
                         _t_raw = _t_df["_pnl"].astype(float)
-                        if _pnl_mode in ("%", "Acct. %") and "_pnl_disp" in _t_df.columns:
+                        if _pnl_mode in ("%", "Acct. %", "R") and "_pnl_disp" in _t_df.columns:
                             _t_eff = _t_df["_pnl_disp"].astype(float)
                         else:
                             _t_eff = _t_raw
@@ -10609,18 +10703,63 @@ elif page == "🔗  Broker Sync":
             elif not _hashes:
                 _ah1.warning("No accounts found for this Schwab login.")
             else:
+                import json as _json
+
+                try:
+                    _alias_map = _json.loads(settings.get("schwab_account_aliases", "{}")) or {}
+                    if not isinstance(_alias_map, dict):
+                        _alias_map = {}
+                except ValueError:
+                    _alias_map = {}
+
+                def _acct_label(num: str) -> str:
+                    # Ignore an alias whose account has since been renamed or deleted,
+                    # so the label always matches what the naming expander shows.
+                    _alias = _alias_map.get(num)
+                    return _alias if _alias in all_accounts else num
+
                 _nums = [h.get("accountNumber", "") for h in _hashes]
                 if len(_nums) > 1:
                     _default_idx = _nums.index(sc_acct_num) if sc_acct_num in _nums else 0
                     _chosen = _ah1.selectbox("Schwab account", _nums, index=_default_idx,
+                                             format_func=_acct_label,
                                              key="schwab_acct_select")
                 else:
                     _chosen = _nums[0]
-                    _ah1.caption(f"Account: {_chosen}")
+                    _ah1.caption(f"Account: {_acct_label(_chosen)}")
                 if _chosen != sc_acct_num:
                     set_setting("schwab_account_number", _chosen)
                 _sel_hash = next((h.get("hashValue", "") for h in _hashes
                                   if h.get("accountNumber") == _chosen), "")
+
+                with st.expander("✏️  Name these accounts", expanded=False):
+                    st.caption(
+                        "Schwab's API doesn't share the nicknames you set on schwab.com, so "
+                        "pick the Trade Log account each one maps to and that name is shown "
+                        "instead of the number. Add accounts under **Accounts** above."
+                    )
+                    _NO_ALIAS = "— show account number —"
+                    _alias_opts = [_NO_ALIAS] + all_accounts
+                    _new_map = dict(_alias_map)
+                    for _num in _nums:
+                        _cur = _alias_map.get(_num, _NO_ALIAS)
+                        if _cur not in _alias_opts:   # account was renamed or deleted
+                            _cur = _NO_ALIAS
+                        _wkey = f"schwab_alias_{_num}"
+                        if st.session_state.get(_wkey) not in _alias_opts:
+                            st.session_state.pop(_wkey, None)   # account deleted mid-session
+                        _pick = st.selectbox(
+                            f"••••{_num[-4:]}" if len(_num) > 4 else _num,
+                            _alias_opts, index=_alias_opts.index(_cur),
+                            key=_wkey,
+                        )
+                        if _pick == _NO_ALIAS:
+                            _new_map.pop(_num, None)
+                        else:
+                            _new_map[_num] = _pick
+                    if _new_map != _alias_map:
+                        set_setting("schwab_account_aliases", _json.dumps(_new_map))
+                        st.rerun()
 
             st.divider()
             st.markdown("#### Fetch Account Data & Trades")
