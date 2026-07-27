@@ -5091,981 +5091,1002 @@ if page == "📋  Trading Log":
             is_open_mask    = _make_is_open_mask(filtered)
             live_ticker_ser = _live_ticker_series(filtered)
 
-        display = filtered.copy()
-        display["Status"] = np.where(is_open_mask, "Open", "Closed")
-        display["Stop Loss"] = display.apply(_fmt_stop, axis=1)
-        display["Instrument"] = display["instrument_type"].apply(
-            lambda v: {"stock": "Stock", "option": "Option", "future": "Future"}.get(str(v or "stock").lower(), "Stock")
-        )
-        # Vectorised P&L: map live tickers → prices, then compute in one pass
-        _live_prices_ser = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("price") if t else None)
-        _qty   = pd.to_numeric(filtered["quantity"],    errors="coerce")
-        _ep    = pd.to_numeric(filtered["entry_price"], errors="coerce")
-        _xp    = pd.to_numeric(filtered["exit_price"],  errors="coerce")
-        _mult  = pd.to_numeric(filtered["multiplier"],  errors="coerce").fillna(1.0)
-        _sign  = np.where(filtered["side"].fillna("long").str.lower() == "short", -1.0, 1.0)
-        _price = np.where(is_open_mask, _live_prices_ser.to_numpy(dtype=object), _xp.to_numpy(dtype=object))
-        _price_num = pd.to_numeric(pd.Series(_price, index=filtered.index), errors="coerce")
-        _raw   = (_price_num - _ep) * _qty * _mult * pd.Series(_sign, index=filtered.index)
-        _valid = _qty.notna() & _ep.notna() & _price_num.notna()
-        # Include dividends in P&L. For open trades with a live price, add to price-based
-        # P&L. For open trades with no price yet, show dividends alone so the cost-basis
-        # reduction is always visible (rather than hidden behind "—").
-        _div_ids = filtered["id"].tolist()
-        if _div_ids:
-            _div_map_pnl = load_dividends_for_trades(_div_ids)
-            _div_by_id   = {tid: sum(d.get("total_amount") or 0 for d in divs)
-                            for tid, divs in _div_map_pnl.items()}
-            _div_series  = filtered["id"].map(_div_by_id).fillna(0.0)
+        # Empty filtered set — e.g. Status=Open when every trade in the log is
+        # closed. The display-table build below assumes at least one row:
+        # DataFrame.apply(axis=1) returns a frame (not a Series) on empty input,
+        # which breaks the column assignments. Show a clear message and skip the
+        # table instead of crashing on what is a perfectly normal, empty view.
+        if filtered.empty:
+            _pre_agg_filtered = filtered.copy()  # Bulk Actions below references this
+            _n_open   = int(trades["exit_date"].isna().sum())
+            _n_closed = int(trades["exit_date"].notna().sum())
+            if status_filter == "Open" and _n_open == 0 and _n_closed:
+                st.info(
+                    f"No open trades to show — all {_n_closed} trade"
+                    f"{'s' if _n_closed != 1 else ''} in your log are closed. "
+                    "Switch the **Status** filter above to “All” or “Closed” to see them."
+                )
+            else:
+                st.info(
+                    "No trades match the current filters. "
+                    "Adjust them above, or click ↺ Reset to clear all filters."
+                )
         else:
-            _div_series = pd.Series(0.0, index=filtered.index)
-        display["_pnl_num"] = np.where(
-            _valid.values,
-            _raw.values + _div_series.values,
-            np.where(_div_series.values > 0, _div_series.values, np.nan),
-        )
-
-        display = display.rename(columns={
-            "id":           "Trade ID",
-            "entry_date":   "Entry Date",
-            "ticker":       "Ticker",
-            "quantity":     "Quantity",
-            "entry_price":  "Entry Price",
-            "exit_date":    "Exit Date",
-            "exit_price":   "Exit Price",
-            "tags":         "Tags",
-            "notes":        "Notes",
-            "opening_stop": "Opening Stop",
-            "current_stop": "Current Stop",
-        })
-
-        display["Trade ID"]       = display["Trade ID"].astype(str)
-        display["Entry Date"]     = filtered["entry_date"].apply(lambda v: fmt_date(v, euro_dates))
-        display["Exit Date"]      = filtered["exit_date"].apply(lambda v: fmt_date(v, euro_dates))
-        # Adjust displayed entry price (cost basis) by total dividends received per share
-        _adj_ep_vals = np.where(
-            (_qty.values > 0) & (_div_series.values > 0),
-            _ep.values - _div_series.values / _qty.values,
-            _ep.values,
-        )
-        display["Entry Price"] = [fmt_price(v) if pd.notna(v) else "—" for v in _adj_ep_vals]
-        display["Quantity"]       = filtered["quantity"].apply(fmt_qty)
-        display["Exit Price"]     = np.where(is_open_mask, "", filtered["exit_price"].apply(fmt_price))
-        display["Live Price"]     = np.where(
-            is_open_mask,
-            live_ticker_ser.map(lambda t: fmt_price(live_data.get(t, {}).get("price")) if t else "—"),
-            "—",
-        )
-        display["P&L"]            = display["_pnl_num"].apply(fmt_pnl)
-
-        # ── Native currency columns (only when currency mode is on) ────────────
-        _fx_mode     = settings.get("currency_mode", "0") == "1"
-        _fx_native   = settings.get("native_currency", "USD")
-        if _fx_mode and _fx_native != "USD":
-            _live_fx = get_fx_rate(_fx_native)
-            _cur_sym = {"AUD": "A$", "CAD": "C$", "EUR": "€"}.get(_fx_native, _fx_native)
-
-            def _native_pnl(row):
-                pnl_usd = row.get("_pnl_num")
-                if pnl_usd is None or pd.isna(pnl_usd):
-                    return "—"
-                fx = _live_fx if _is_open(row) else float(row.get("fx_rate_exit") or _live_fx or 1.0)
-                if not fx or fx == 0:
-                    return "—"
-                val = pnl_usd / fx
-                return f"{_cur_sym}{val:+,.2f}"
-
-            def _native_entry(row):
-                ep, qty = row.get("entry_price"), row.get("quantity")
-                fx = float(row.get("fx_rate_entry") or 1.0)
-                if not ep or not qty or not fx:
-                    return "—"
-                return f"{_cur_sym}{float(ep)*float(qty)/fx:,.2f}"
-
-            def _native_exit(row):
-                if _is_open(row):
-                    return "—"
-                xp, qty = row.get("exit_price"), row.get("quantity")
-                fx = float(row.get("fx_rate_exit") or 1.0)
-                if not xp or not qty or not fx:
-                    return "—"
-                return f"{_cur_sym}{float(xp)*float(qty)/fx:,.2f}"
-
-            display["P&L (Native)"]    = filtered.apply(_native_pnl,   axis=1)
-            display["Entry (Native)"]  = filtered.apply(_native_entry,  axis=1)
-            display["Exit (Native)"]   = filtered.apply(_native_exit,   axis=1)
-            display["FX Rate Entry"]   = filtered["fx_rate_entry"].apply(
-                lambda v: f"{float(v):.4f}" if v and not pd.isna(v) else "—"
+            display = filtered.copy()
+            display["Status"] = np.where(is_open_mask, "Open", "Closed")
+            display["Stop Loss"] = display.apply(_fmt_stop, axis=1)
+            display["Instrument"] = display["instrument_type"].apply(
+                lambda v: {"stock": "Stock", "option": "Option", "future": "Future"}.get(str(v or "stock").lower(), "Stock")
+            )
+            # Vectorised P&L: map live tickers → prices, then compute in one pass
+            _live_prices_ser = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("price") if t else None)
+            _qty   = pd.to_numeric(filtered["quantity"],    errors="coerce")
+            _ep    = pd.to_numeric(filtered["entry_price"], errors="coerce")
+            _xp    = pd.to_numeric(filtered["exit_price"],  errors="coerce")
+            _mult  = pd.to_numeric(filtered["multiplier"],  errors="coerce").fillna(1.0)
+            _sign  = np.where(filtered["side"].fillna("long").str.lower() == "short", -1.0, 1.0)
+            _price = np.where(is_open_mask, _live_prices_ser.to_numpy(dtype=object), _xp.to_numpy(dtype=object))
+            _price_num = pd.to_numeric(pd.Series(_price, index=filtered.index), errors="coerce")
+            _raw   = (_price_num - _ep) * _qty * _mult * pd.Series(_sign, index=filtered.index)
+            _valid = _qty.notna() & _ep.notna() & _price_num.notna()
+            # Include dividends in P&L. For open trades with a live price, add to price-based
+            # P&L. For open trades with no price yet, show dividends alone so the cost-basis
+            # reduction is always visible (rather than hidden behind "—").
+            _div_ids = filtered["id"].tolist()
+            if _div_ids:
+                _div_map_pnl = load_dividends_for_trades(_div_ids)
+                _div_by_id   = {tid: sum(d.get("total_amount") or 0 for d in divs)
+                                for tid, divs in _div_map_pnl.items()}
+                _div_series  = filtered["id"].map(_div_by_id).fillna(0.0)
+            else:
+                _div_series = pd.Series(0.0, index=filtered.index)
+            display["_pnl_num"] = np.where(
+                _valid.values,
+                _raw.values + _div_series.values,
+                np.where(_div_series.values > 0, _div_series.values, np.nan),
             )
 
-        display["Position Value"] = filtered.apply(
-            lambda r: fmt_price(r["quantity"] * r["entry_price"] * (r.get("multiplier") or 1.0))
-                      if r["quantity"] and r["entry_price"] else "—", axis=1
-        )
-        display["Opening Stop"] = filtered["opening_stop"].apply(fmt_price)
-        def _fmt_current_stop(row):
-            cs  = row.get("current_stop")
-            tt  = str(row.get("trail_type") or "fixed")
-            ta  = row.get("trail_amount")
-            lbl = fmt_price(cs) if cs is not None else "—"
-            if tt != "fixed" and ta and not pd.isna(ta):
-                lbl += f" ▲{ta}{tt}"
-            return lbl
-        if "trail_type" in filtered.columns:
-            display["Current Stop"] = filtered.apply(_fmt_current_stop, axis=1)
-        else:
-            display["Current Stop"] = filtered["current_stop"].apply(fmt_price)
+            display = display.rename(columns={
+                "id":           "Trade ID",
+                "entry_date":   "Entry Date",
+                "ticker":       "Ticker",
+                "quantity":     "Quantity",
+                "entry_price":  "Entry Price",
+                "exit_date":    "Exit Date",
+                "exit_price":   "Exit Price",
+                "tags":         "Tags",
+                "notes":        "Notes",
+                "opening_stop": "Opening Stop",
+                "current_stop": "Current Stop",
+            })
 
-        # ── Optional columns ───────────────────────────────────────────────────
-
-        if "Days in Trade" in vis:
-            _entry_dt  = pd.to_datetime(filtered["entry_date"], errors="coerce")
-            _exit_dt   = pd.to_datetime(filtered["exit_date"],  errors="coerce")
-            _days_open = (today_ts - _entry_dt).dt.days.astype("Int64")
-            _days_held = (_exit_dt - _entry_dt).dt.days.astype("Int64")
-            display["Days in Trade"] = np.where(
+            display["Trade ID"]       = display["Trade ID"].astype(str)
+            display["Entry Date"]     = filtered["entry_date"].apply(lambda v: fmt_date(v, euro_dates))
+            display["Exit Date"]      = filtered["exit_date"].apply(lambda v: fmt_date(v, euro_dates))
+            # Adjust displayed entry price (cost basis) by total dividends received per share
+            _adj_ep_vals = np.where(
+                (_qty.values > 0) & (_div_series.values > 0),
+                _ep.values - _div_series.values / _qty.values,
+                _ep.values,
+            )
+            display["Entry Price"] = [fmt_price(v) if pd.notna(v) else "—" for v in _adj_ep_vals]
+            display["Quantity"]       = filtered["quantity"].apply(fmt_qty)
+            display["Exit Price"]     = np.where(is_open_mask, "", filtered["exit_price"].apply(fmt_price))
+            display["Live Price"]     = np.where(
                 is_open_mask,
-                _days_open.where(_days_open.notna(), other=pd.NA).astype(str).replace("<NA>", "—"),
-                _days_held.where(_days_held.notna(), other=pd.NA).astype(str).replace("<NA>", "—"),
+                live_ticker_ser.map(lambda t: fmt_price(live_data.get(t, {}).get("price")) if t else "—"),
+                "—",
             )
+            display["P&L"]            = display["_pnl_num"].apply(fmt_pnl)
 
-        if "Entry Value" in vis:
-            display["Entry Value"] = filtered.apply(
+            # ── Native currency columns (only when currency mode is on) ────────────
+            _fx_mode     = settings.get("currency_mode", "0") == "1"
+            _fx_native   = settings.get("native_currency", "USD")
+            if _fx_mode and _fx_native != "USD":
+                _live_fx = get_fx_rate(_fx_native)
+                _cur_sym = {"AUD": "A$", "CAD": "C$", "EUR": "€"}.get(_fx_native, _fx_native)
+
+                def _native_pnl(row):
+                    pnl_usd = row.get("_pnl_num")
+                    if pnl_usd is None or pd.isna(pnl_usd):
+                        return "—"
+                    fx = _live_fx if _is_open(row) else float(row.get("fx_rate_exit") or _live_fx or 1.0)
+                    if not fx or fx == 0:
+                        return "—"
+                    val = pnl_usd / fx
+                    return f"{_cur_sym}{val:+,.2f}"
+
+                def _native_entry(row):
+                    ep, qty = row.get("entry_price"), row.get("quantity")
+                    fx = float(row.get("fx_rate_entry") or 1.0)
+                    if not ep or not qty or not fx:
+                        return "—"
+                    return f"{_cur_sym}{float(ep)*float(qty)/fx:,.2f}"
+
+                def _native_exit(row):
+                    if _is_open(row):
+                        return "—"
+                    xp, qty = row.get("exit_price"), row.get("quantity")
+                    fx = float(row.get("fx_rate_exit") or 1.0)
+                    if not xp or not qty or not fx:
+                        return "—"
+                    return f"{_cur_sym}{float(xp)*float(qty)/fx:,.2f}"
+
+                display["P&L (Native)"]    = filtered.apply(_native_pnl,   axis=1)
+                display["Entry (Native)"]  = filtered.apply(_native_entry,  axis=1)
+                display["Exit (Native)"]   = filtered.apply(_native_exit,   axis=1)
+                display["FX Rate Entry"]   = filtered["fx_rate_entry"].apply(
+                    lambda v: f"{float(v):.4f}" if v and not pd.isna(v) else "—"
+                )
+
+            display["Position Value"] = filtered.apply(
                 lambda r: fmt_price(r["quantity"] * r["entry_price"] * (r.get("multiplier") or 1.0))
                           if r["quantity"] and r["entry_price"] else "—", axis=1
             )
-
-        need_cur_val = any(c in vis for c in ["Current Value", "% of Account"])
-        if need_cur_val:
-            _cv_qty  = pd.to_numeric(filtered["quantity"], errors="coerce")
-            _cv_live = _live_prices_ser  # already computed above
-            _cv_xp   = pd.to_numeric(filtered["exit_price"], errors="coerce")
-            _cv_px   = np.where(is_open_mask, _cv_live, _cv_xp)
-            _cv_px_s = pd.to_numeric(pd.Series(_cv_px, index=filtered.index), errors="coerce")
-            filtered["_cur_val"] = np.where(_cv_qty.notna() & _cv_px_s.notna(),
-                                            _cv_qty * _cv_px_s * _mult, np.nan)
-
-        if "Current Value" in vis:
-            display["Current Value"] = filtered["_cur_val"].apply(fmt_price)
-
-        if "% of Account" in vis:
-            # Options: size by *max risk* (worst-case loss at expiration) as % of
-            # account. Stocks/other: size by current market value.
-            def _pct_of_account(r):
-                if not (acct_bal > 0):
-                    return "—"
-                if row_is_option(r):
-                    mr = option_legs_max_risk([{
-                        "type": r.get("option_type"), "strike": r.get("strike"),
-                        "side": r.get("side"),        "qty":    r.get("quantity"),
-                        "mult": r.get("multiplier"),  "entry_price": r.get("entry_price"),
-                    }])
-                    if mr is None:
-                        return "∞"          # unbounded (naked short call)
-                    return fmt_pct(mr / acct_bal * 100)
-                if pd.notna(r.get("_cur_val")):
-                    return fmt_pct(r["_cur_val"] / acct_bal * 100)
-                return "—"
-            display["% of Account"] = filtered.apply(_pct_of_account, axis=1)
-
-        if "Ann. P&L" in vis:
-            _ap_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
-            _ap_entry  = pd.to_datetime(filtered["entry_date"], errors="coerce")
-            _ap_exit   = pd.to_datetime(filtered["exit_date"],  errors="coerce")
-            _ap_days   = np.where(is_open_mask,
-                                  (today_ts - _ap_entry).dt.days,
-                                  (_ap_exit - _ap_entry).dt.days)
-            _ap_days_s = pd.to_numeric(pd.Series(_ap_days, index=filtered.index), errors="coerce")
-            _ap_ann    = np.where(
-                _ap_pnl.notna() & (_ap_days_s > 0),
-                _ap_pnl / _ap_days_s * 365,
-                np.nan,
-            )
-            display["Ann. P&L"] = pd.Series(_ap_ann, index=filtered.index).apply(
-                lambda v: fmt_pnl(v) if pd.notna(v) else "—"
-            )
-
-        if "Realized P&L $" in vis:
-            _rp_raw = (_xp - _ep) * _qty * _mult * pd.Series(_sign, index=filtered.index)
-            _rp_valid = ~is_open_mask & _qty.notna() & _ep.notna() & _xp.notna()
-            display["Realized P&L $"] = np.where(
-                _rp_valid,
-                _rp_raw.apply(fmt_pnl),
-                "—",
-            )
-
-        if "Realized P&L %" in vis:
-            _rpct_raw = (_xp - _ep) / _ep * 100 * pd.Series(_sign, index=filtered.index)
-            _rpct_valid = ~is_open_mask & _ep.notna() & _xp.notna() & (_ep != 0)
-            display["Realized P&L %"] = np.where(
-                _rpct_valid,
-                _rpct_raw.apply(fmt_signed_pct),
-                "—",
-            )
-
-        need_urp = any(c in vis for c in ["Unrealized P&L %", "Unrealized Ann. Return %"])
-        if need_urp:
-            # Dividend-adjusted entry price (per share)
-            _urp_adj_ep = pd.Series(
-                np.where(
-                    (_qty.values > 0) & (_div_series.values > 0),
-                    _ep.values - _div_series.values / _qty.values,
-                    _ep.values,
-                ),
-                index=filtered.index,
-            )
-            _urp_live  = pd.to_numeric(_live_prices_ser, errors="coerce")
-            _urp_sign  = pd.Series(_sign, index=filtered.index)
-            _urp_valid = is_open_mask & _urp_live.notna() & _urp_adj_ep.notna() & (_urp_adj_ep != 0)
-            _urp_raw_pct = np.where(
-                _urp_valid,
-                (_urp_live - _urp_adj_ep) / _urp_adj_ep.abs() * 100 * _urp_sign,
-                np.nan,
-            )
-            _urp_pct_ser = pd.Series(_urp_raw_pct, index=filtered.index)
-
-        if "Unrealized P&L %" in vis:
-            display["Unrealized P&L %"] = _urp_pct_ser.apply(
-                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
-            )
-
-        if "Unrealized Ann. Return %" in vis:
-            _uarp_entry_dt = pd.to_datetime(filtered["entry_date"], errors="coerce")
-            _uarp_days     = (today_ts - _uarp_entry_dt).dt.days
-            _uarp_ann      = np.where(
-                _urp_valid & (_uarp_days > 0),
-                _urp_raw_pct / _uarp_days * 365,
-                np.nan,
-            )
-            display["Unrealized Ann. Return %"] = pd.Series(_uarp_ann, index=filtered.index).apply(
-                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
-            )
-
-        if "Acct P&L %" in vis:
-            display["Acct P&L %"] = filtered.apply(
-                lambda r: fmt_signed_pct(display.loc[r.name, "_pnl_num"] / acct_bal * 100)
-                          if pd.notna(display.loc[r.name, "_pnl_num"]) and acct_bal > 0 else "—", axis=1
-            )
-
-        need_day = any(c in vis for c in ["Day's Change", "Day Change %", "Day P&L", "Day P&L %"])
-        if need_day:
-            _dc_live  = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("price"))
-            _dc_prev  = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("prev_close"))
-            _dc_delta = pd.to_numeric(_dc_live, errors="coerce") - pd.to_numeric(_dc_prev, errors="coerce")
-            filtered["_day_chg"] = np.where(is_open_mask & _dc_delta.notna(), _dc_delta, np.nan)
-
-        if "Day's Change" in vis:
-            display["Day's Change"] = filtered["_day_chg"].apply(lambda v: fmt_pnl(v) if pd.notna(v) else "—")
-
-        if "Day Change %" in vis:
-            _dcp_dc   = pd.to_numeric(filtered["_day_chg"], errors="coerce")
-            _dcp_prev = pd.to_numeric(_dc_prev, errors="coerce")
-            _dcp_pct  = np.where(
-                _dcp_dc.notna() & _dcp_prev.notna() & (_dcp_prev != 0),
-                _dcp_dc / _dcp_prev * 100,
-                np.nan,
-            )
-            display["Day Change %"] = pd.Series(_dcp_pct, index=filtered.index).apply(
-                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
-            )
-
-        if "Day P&L" in vis:
-            display["Day P&L"] = filtered.apply(
-                lambda r: fmt_pnl(r.get("_day_chg") * r["quantity"] * float(r.get("multiplier") or 1.0))
-                          if pd.notna(r.get("_day_chg")) and r["quantity"] else "—", axis=1
-            )
-
-        if "Day P&L %" in vis:
-            def _day_pnl_pct(row):
-                dc = row.get("_day_chg")
-                qty, ep = row["quantity"], row["entry_price"]
-                if not pd.notna(dc) or not qty or not ep: return "—"
-                entry_val = qty * ep
-                return fmt_signed_pct(dc * qty / entry_val * 100) if entry_val else "—"
-            display["Day P&L %"] = filtered.apply(_day_pnl_pct, axis=1)
-
-        need_stop_dist = any(c in vis for c in ["Stop Dist $", "Stop Dist %", "Stop Dist ATR",
-                                                 "Locked-in Profit", "Open Risk"])
-        if need_stop_dist or "Opening Risk" in vis:
-            filtered["_live_p"] = np.where(is_open_mask, _live_prices_ser, np.nan)
-
-        # Compute effective stop: trailing stop level (if trail_type != 'fixed') or current_stop
-        def _eff_stop(row):
-            tt = str(row.get("trail_type") or "fixed")
-            ta = row.get("trail_amount")
-            cs = row.get("current_stop")
-            if tt == "fixed" or not ta or pd.isna(ta):
-                return cs
-            # Trailing — need highest high since entry
-            hh = get_highest_high_since(row["ticker"],
-                                        str(row["entry_date"])[:10] if row.get("entry_date") else None)
-            if hh is None:
-                return cs
-            atr = metadata.get(row["ticker"], {}).get("atr14") if metadata else None
-            side_val = str(row.get("side") or "long").lower()
-            if side_val == "short":
-                # For shorts: trail above the lowest low
-                ll_val = get_highest_high_since(row["ticker"],
-                                                str(row["entry_date"])[:10] if row.get("entry_date") else None)
-                if tt == "$":
-                    return ll_val + float(ta) if ll_val is not None else cs
-                elif tt == "%":
-                    return ll_val * (1 + float(ta) / 100) if ll_val is not None else cs
-                elif tt == "ATR":
-                    return (ll_val + float(ta) * atr) if ll_val is not None and atr else cs
+            display["Opening Stop"] = filtered["opening_stop"].apply(fmt_price)
+            def _fmt_current_stop(row):
+                cs  = row.get("current_stop")
+                tt  = str(row.get("trail_type") or "fixed")
+                ta  = row.get("trail_amount")
+                lbl = fmt_price(cs) if cs is not None else "—"
+                if tt != "fixed" and ta and not pd.isna(ta):
+                    lbl += f" ▲{ta}{tt}"
+                return lbl
+            if "trail_type" in filtered.columns:
+                display["Current Stop"] = filtered.apply(_fmt_current_stop, axis=1)
             else:
-                if tt == "$":
-                    return hh - float(ta)
-                elif tt == "%":
-                    return hh * (1 - float(ta) / 100)
-                elif tt == "ATR":
-                    return (hh - float(ta) * atr) if atr else cs
-            return cs
+                display["Current Stop"] = filtered["current_stop"].apply(fmt_price)
 
-        if need_stop_dist and "trail_type" in filtered.columns:
-            filtered["_eff_stop"] = filtered.apply(
-                lambda r: _eff_stop(r) if is_open_mask[filtered.index.get_loc(r.name)] else r.get("current_stop"),
-                axis=1,
-            )
-        else:
-            filtered["_eff_stop"] = filtered["current_stop"]
+            # ── Optional columns ───────────────────────────────────────────────────
 
-        if "Locked-in Profit" in vis:
-            _lk_cs  = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
-            _lk_ep  = pd.to_numeric(filtered["entry_price"],   errors="coerce")
-            _lk_qty = pd.to_numeric(filtered["quantity"],      errors="coerce")
-            _lk_mul = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
-            _lk_val = (_lk_cs - _lk_ep) * _lk_qty * _lk_mul
-            _lk_ok  = is_open_mask & _lk_cs.notna() & _lk_ep.notna() & _lk_qty.notna()
-            display["Locked-in Profit"] = np.where(_lk_ok, _lk_val.apply(fmt_pnl), "—")
+            if "Days in Trade" in vis:
+                _entry_dt  = pd.to_datetime(filtered["entry_date"], errors="coerce")
+                _exit_dt   = pd.to_datetime(filtered["exit_date"],  errors="coerce")
+                _days_open = (today_ts - _entry_dt).dt.days.astype("Int64")
+                _days_held = (_exit_dt - _entry_dt).dt.days.astype("Int64")
+                display["Days in Trade"] = np.where(
+                    is_open_mask,
+                    _days_open.where(_days_open.notna(), other=pd.NA).astype(str).replace("<NA>", "—"),
+                    _days_held.where(_days_held.notna(), other=pd.NA).astype(str).replace("<NA>", "—"),
+                )
 
-        if "Open Risk" in vis:
-            _or_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
-            _or_cs     = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
-            _or_ep     = pd.to_numeric(filtered["entry_price"],   errors="coerce")
-            _or_qty    = pd.to_numeric(filtered["quantity"],      errors="coerce")
-            _or_mul    = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
-            _or_locked = np.where(
-                _or_cs.notna() & _or_ep.notna() & _or_qty.notna(),
-                (_or_cs - _or_ep) * _or_qty * _or_mul,
-                0.0,
-            )
-            _or_risk = _or_pnl - pd.Series(_or_locked, index=filtered.index)
-            _or_ok   = is_open_mask & _or_pnl.notna()
-            display["Open Risk"] = np.where(_or_ok, _or_risk.apply(fmt_pnl), "—")
+            if "Entry Value" in vis:
+                display["Entry Value"] = filtered.apply(
+                    lambda r: fmt_price(r["quantity"] * r["entry_price"] * (r.get("multiplier") or 1.0))
+                              if r["quantity"] and r["entry_price"] else "—", axis=1
+                )
 
-        if "Opening Risk" in vis:
-            def _opening_risk(row):
-                qty, ep, os_ = row["quantity"], row["entry_price"], row["opening_stop"]
-                mult = float(row.get("multiplier") or 1.0)
-                return fmt_price(qty * abs(ep - os_) * mult) if qty and ep and os_ else "—"
-            display["Opening Risk"] = filtered.apply(_opening_risk, axis=1)
+            need_cur_val = any(c in vis for c in ["Current Value", "% of Account"])
+            if need_cur_val:
+                _cv_qty  = pd.to_numeric(filtered["quantity"], errors="coerce")
+                _cv_live = _live_prices_ser  # already computed above
+                _cv_xp   = pd.to_numeric(filtered["exit_price"], errors="coerce")
+                _cv_px   = np.where(is_open_mask, _cv_live, _cv_xp)
+                _cv_px_s = pd.to_numeric(pd.Series(_cv_px, index=filtered.index), errors="coerce")
+                filtered["_cur_val"] = np.where(_cv_qty.notna() & _cv_px_s.notna(),
+                                                _cv_qty * _cv_px_s * _mult, np.nan)
 
-        if "Stop Dist $" in vis:
-            display["Stop Dist $"] = filtered.apply(
-                lambda r: fmt_price(r.get("_live_p") - r["_eff_stop"])
-                          if pd.notna(r.get("_live_p")) and r["_eff_stop"] is not None else "—", axis=1
-            )
+            if "Current Value" in vis:
+                display["Current Value"] = filtered["_cur_val"].apply(fmt_price)
 
-        if "Stop Dist %" in vis:
-            def _sd_pct(row):
-                lp, cs = row.get("_live_p"), row["_eff_stop"]
-                if not pd.notna(lp) or cs is None or lp == 0: return "—"
-                return fmt_pct((lp - cs) / lp * 100)
-            display["Stop Dist %"] = filtered.apply(_sd_pct, axis=1)
+            if "% of Account" in vis:
+                # Options: size by *max risk* (worst-case loss at expiration) as % of
+                # account. Stocks/other: size by current market value.
+                def _pct_of_account(r):
+                    if not (acct_bal > 0):
+                        return "—"
+                    if row_is_option(r):
+                        mr = option_legs_max_risk([{
+                            "type": r.get("option_type"), "strike": r.get("strike"),
+                            "side": r.get("side"),        "qty":    r.get("quantity"),
+                            "mult": r.get("multiplier"),  "entry_price": r.get("entry_price"),
+                        }])
+                        if mr is None:
+                            return "∞"          # unbounded (naked short call)
+                        return fmt_pct(mr / acct_bal * 100)
+                    if pd.notna(r.get("_cur_val")):
+                        return fmt_pct(r["_cur_val"] / acct_bal * 100)
+                    return "—"
+                display["% of Account"] = filtered.apply(_pct_of_account, axis=1)
 
-        if "Stop Dist ATR" in vis:
-            def _sd_atr(row):
-                lp, cs = row.get("_live_p"), row["_eff_stop"]
-                if not pd.notna(lp) or cs is None: return "—"
-                atr = metadata.get(row["ticker"], {}).get("atr14")
-                return fmt_num((lp - cs) / atr) if atr else "—"
-            display["Stop Dist ATR"] = filtered.apply(_sd_atr, axis=1)
+            if "Ann. P&L" in vis:
+                _ap_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
+                _ap_entry  = pd.to_datetime(filtered["entry_date"], errors="coerce")
+                _ap_exit   = pd.to_datetime(filtered["exit_date"],  errors="coerce")
+                _ap_days   = np.where(is_open_mask,
+                                      (today_ts - _ap_entry).dt.days,
+                                      (_ap_exit - _ap_entry).dt.days)
+                _ap_days_s = pd.to_numeric(pd.Series(_ap_days, index=filtered.index), errors="coerce")
+                _ap_ann    = np.where(
+                    _ap_pnl.notna() & (_ap_days_s > 0),
+                    _ap_pnl / _ap_days_s * 365,
+                    np.nan,
+                )
+                display["Ann. P&L"] = pd.Series(_ap_ann, index=filtered.index).apply(
+                    lambda v: fmt_pnl(v) if pd.notna(v) else "—"
+                )
 
-        if metadata:
-            if "Sector" in vis:
-                display["Sector"]      = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("sector") or "—")
-            if "Industry" in vis:
-                display["Industry"]    = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("industry") or "—")
-            if "Beta" in vis:
-                display["Beta"]        = filtered["ticker"].apply(lambda t: fmt_num(metadata.get(t, {}).get("beta")))
-            if "Correlation" in vis:
-                display["Correlation"] = filtered["ticker"].apply(
-                    lambda t: fmt_num(metadata.get(t, {}).get("correlation_spy"), decimals=3))
+            if "Realized P&L $" in vis:
+                _rp_raw = (_xp - _ep) * _qty * _mult * pd.Series(_sign, index=filtered.index)
+                _rp_valid = ~is_open_mask & _qty.notna() & _ep.notna() & _xp.notna()
+                display["Realized P&L $"] = np.where(
+                    _rp_valid,
+                    _rp_raw.apply(fmt_pnl),
+                    "—",
+                )
 
-        # Options / Futures columns
-        if "Contract" in vis:
-            display["Contract"] = filtered.apply(_contract_sym, axis=1)
-        if "Leg" in vis:
-            display["Leg"] = filtered["leg_label"].apply(lambda v: str(v) if v and not pd.isna(v) else "—")
-        if "Expiration" in vis:
-            display["Expiration"] = filtered["expiration"].apply(lambda v: fmt_date(v, euro_dates) if v and not pd.isna(v) else "—")
-        if "Strike" in vis:
-            display["Strike"] = filtered["strike"].apply(fmt_price)
-        if "Option Type" in vis:
-            display["Option Type"] = filtered["option_type"].apply(
-                lambda v: "Call" if str(v or "").upper().startswith("C")
-                          else "Put" if str(v or "").upper().startswith("P") else "—"
-            )
-        if "Multiplier" in vis:
-            display["Multiplier"] = filtered["multiplier"].apply(
-                lambda v: fmt_num(float(v)) if v and not pd.isna(v) else "1"
-            )
-        if "Spread Group" in vis:
-            display["Spread Group"] = filtered["leg_group"].apply(
-                lambda v: str(v)[:8] if v and not pd.isna(v) else "—"
-            )
-        if "Spread Type" in vis:
-            display["Spread Type"] = filtered["spread_type"].apply(
-                lambda v: str(v) if v and not pd.isna(v) else "—"
-            ) if "spread_type" in filtered.columns else "—"
+            if "Realized P&L %" in vis:
+                _rpct_raw = (_xp - _ep) / _ep * 100 * pd.Series(_sign, index=filtered.index)
+                _rpct_valid = ~is_open_mask & _ep.notna() & _xp.notna() & (_ep != 0)
+                display["Realized P&L %"] = np.where(
+                    _rpct_valid,
+                    _rpct_raw.apply(fmt_signed_pct),
+                    "—",
+                )
 
-        if "Underlying" in vis:
-            import re as _re
-            def _underlying(row):
-                t = str(row.get("ticker") or "")
-                if str(row.get("instrument_type") or "stock").lower() == "option":
-                    m = _re.match(r'^([A-Z]{1,6})', t.upper())
-                    return m.group(1) if m else t
-                return t
-            display["Underlying"] = filtered.apply(_underlying, axis=1)
+            need_urp = any(c in vis for c in ["Unrealized P&L %", "Unrealized Ann. Return %"])
+            if need_urp:
+                # Dividend-adjusted entry price (per share)
+                _urp_adj_ep = pd.Series(
+                    np.where(
+                        (_qty.values > 0) & (_div_series.values > 0),
+                        _ep.values - _div_series.values / _qty.values,
+                        _ep.values,
+                    ),
+                    index=filtered.index,
+                )
+                _urp_live  = pd.to_numeric(_live_prices_ser, errors="coerce")
+                _urp_sign  = pd.Series(_sign, index=filtered.index)
+                _urp_valid = is_open_mask & _urp_live.notna() & _urp_adj_ep.notna() & (_urp_adj_ep != 0)
+                _urp_raw_pct = np.where(
+                    _urp_valid,
+                    (_urp_live - _urp_adj_ep) / _urp_adj_ep.abs() * 100 * _urp_sign,
+                    np.nan,
+                )
+                _urp_pct_ser = pd.Series(_urp_raw_pct, index=filtered.index)
 
-        if "Delta" in vis:
-            display["Delta"] = (
-                filtered["_delta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
-                if "_delta_pos" in filtered.columns else "—"
-            )
+            if "Unrealized P&L %" in vis:
+                display["Unrealized P&L %"] = _urp_pct_ser.apply(
+                    lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
+                )
 
-        if "Theta" in vis:
-            display["Theta"] = (
-                filtered["_theta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
-                if "_theta_pos" in filtered.columns else "—"
-            )
+            if "Unrealized Ann. Return %" in vis:
+                _uarp_entry_dt = pd.to_datetime(filtered["entry_date"], errors="coerce")
+                _uarp_days     = (today_ts - _uarp_entry_dt).dt.days
+                _uarp_ann      = np.where(
+                    _urp_valid & (_uarp_days > 0),
+                    _urp_raw_pct / _uarp_days * 365,
+                    np.nan,
+                )
+                display["Unrealized Ann. Return %"] = pd.Series(_uarp_ann, index=filtered.index).apply(
+                    lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
+                )
 
-        if "Commission" in vis:
-            display["Commission"] = filtered["commission"].apply(
-                lambda v: fmt_price(float(v)) if v is not None and not pd.isna(v) else "$0.00"
-            ) if "commission" in filtered.columns else "$0.00"
+            if "Acct P&L %" in vis:
+                display["Acct P&L %"] = filtered.apply(
+                    lambda r: fmt_signed_pct(display.loc[r.name, "_pnl_num"] / acct_bal * 100)
+                              if pd.notna(display.loc[r.name, "_pnl_num"]) and acct_bal > 0 else "—", axis=1
+                )
 
-        if "Ann. Return %" in vis:
-            _arp_pnl   = pd.to_numeric(display["_pnl_num"], errors="coerce")
-            _arp_entry = pd.to_datetime(filtered["entry_date"], errors="coerce")
-            _arp_exit  = pd.to_datetime(filtered["exit_date"],  errors="coerce")
-            _arp_ep    = pd.to_numeric(filtered["entry_price"], errors="coerce")
-            _arp_qty   = pd.to_numeric(filtered["quantity"],    errors="coerce")
-            _arp_mul   = pd.to_numeric(filtered.get("multiplier", pd.Series(1.0, index=filtered.index)), errors="coerce").fillna(1.0)
-            _arp_days  = np.where(is_open_mask,
-                                  (today_ts - _arp_entry).dt.days,
-                                  (_arp_exit - _arp_entry).dt.days)
-            _arp_days_s = pd.to_numeric(pd.Series(_arp_days, index=filtered.index), errors="coerce")
-            _arp_cost  = (_arp_ep * _arp_qty * _arp_mul).abs()
-            _arp_pct   = np.where(
-                _arp_pnl.notna() & _arp_cost.notna() & (_arp_cost > 0) & (_arp_days_s > 0),
-                _arp_pnl / _arp_cost * 100 / _arp_days_s * 365,
-                np.nan,
-            )
-            display["Ann. Return %"] = pd.Series(_arp_pct, index=filtered.index).apply(
-                lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
-            )
+            need_day = any(c in vis for c in ["Day's Change", "Day Change %", "Day P&L", "Day P&L %"])
+            if need_day:
+                _dc_live  = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("price"))
+                _dc_prev  = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("prev_close"))
+                _dc_delta = pd.to_numeric(_dc_live, errors="coerce") - pd.to_numeric(_dc_prev, errors="coerce")
+                filtered["_day_chg"] = np.where(is_open_mask & _dc_delta.notna(), _dc_delta, np.nan)
 
-        # Earnings column — auto-fetch with manual override for open trades
-        if "Earnings" in vis:
-            _earn_iom = is_open_mask  # close over the precomputed mask
-            def _earnings_val(row):
-                manual = row.get("earnings_date")
-                if manual and not pd.isna(manual) and str(manual).strip():
-                    return str(manual).strip()
-                if _earn_iom[row.name]:
-                    fetched = fetch_next_earnings(row["ticker"])
-                    return fetched if fetched else "—"
-                return "—"
-            display["Earnings"] = filtered.apply(_earnings_val, axis=1)
+            if "Day's Change" in vis:
+                display["Day's Change"] = filtered["_day_chg"].apply(lambda v: fmt_pnl(v) if pd.notna(v) else "—")
 
-        # ── Collapse spread/roll groups (when expand toggle is off) ─────────────
+            if "Day Change %" in vis:
+                _dcp_dc   = pd.to_numeric(filtered["_day_chg"], errors="coerce")
+                _dcp_prev = pd.to_numeric(_dc_prev, errors="coerce")
+                _dcp_pct  = np.where(
+                    _dcp_dc.notna() & _dcp_prev.notna() & (_dcp_prev != 0),
+                    _dcp_dc / _dcp_prev * 100,
+                    np.nan,
+                )
+                display["Day Change %"] = pd.Series(_dcp_pct, index=filtered.index).apply(
+                    lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
+                )
 
-        # Snapshot before aggregation — spread summaries need the full leg data
-        _pre_agg_filtered = filtered.copy()
+            if "Day P&L" in vis:
+                display["Day P&L"] = filtered.apply(
+                    lambda r: fmt_pnl(r.get("_day_chg") * r["quantity"] * float(r.get("multiplier") or 1.0))
+                              if pd.notna(r.get("_day_chg")) and r["quantity"] else "—", axis=1
+                )
 
-        _group_row_ids: dict[int, list] = {}
-        if not _expand_legs:
-            # Build aggregated rows for each leg_group / roll_group
-            _group_col = "leg_group" if "leg_group" in filtered.columns else None
-            _roll_col  = "roll_group" if "roll_group" in filtered.columns else None
-            _grouped_ids: set      = set()
-            _agg_rows: list        = []
-            _agg_member_ids: list  = []  # parallel: member trade IDs for each agg row
+            if "Day P&L %" in vis:
+                def _day_pnl_pct(row):
+                    dc = row.get("_day_chg")
+                    qty, ep = row["quantity"], row["entry_price"]
+                    if not pd.notna(dc) or not qty or not ep: return "—"
+                    entry_val = qty * ep
+                    return fmt_signed_pct(dc * qty / entry_val * 100) if entry_val else "—"
+                display["Day P&L %"] = filtered.apply(_day_pnl_pct, axis=1)
 
-            for _gc in [_group_col, _roll_col]:
-                if _gc is None:
-                    continue
-                for _grp_key in filtered[_gc].dropna().unique():
-                    _grp_mask = filtered[_gc] == _grp_key
-                    _grp_rows = display[_grp_mask.values]
-                    _grp_filt = filtered[_grp_mask.values]
-                    if len(_grp_rows) < 2:
+            need_stop_dist = any(c in vis for c in ["Stop Dist $", "Stop Dist %", "Stop Dist ATR",
+                                                     "Locked-in Profit", "Open Risk"])
+            if need_stop_dist or "Opening Risk" in vis:
+                filtered["_live_p"] = np.where(is_open_mask, _live_prices_ser, np.nan)
+
+            # Compute effective stop: trailing stop level (if trail_type != 'fixed') or current_stop
+            def _eff_stop(row):
+                tt = str(row.get("trail_type") or "fixed")
+                ta = row.get("trail_amount")
+                cs = row.get("current_stop")
+                if tt == "fixed" or not ta or pd.isna(ta):
+                    return cs
+                # Trailing — need highest high since entry
+                hh = get_highest_high_since(row["ticker"],
+                                            str(row["entry_date"])[:10] if row.get("entry_date") else None)
+                if hh is None:
+                    return cs
+                atr = metadata.get(row["ticker"], {}).get("atr14") if metadata else None
+                side_val = str(row.get("side") or "long").lower()
+                if side_val == "short":
+                    # For shorts: trail above the lowest low
+                    ll_val = get_highest_high_since(row["ticker"],
+                                                    str(row["entry_date"])[:10] if row.get("entry_date") else None)
+                    if tt == "$":
+                        return ll_val + float(ta) if ll_val is not None else cs
+                    elif tt == "%":
+                        return ll_val * (1 + float(ta) / 100) if ll_val is not None else cs
+                    elif tt == "ATR":
+                        return (ll_val + float(ta) * atr) if ll_val is not None and atr else cs
+                else:
+                    if tt == "$":
+                        return hh - float(ta)
+                    elif tt == "%":
+                        return hh * (1 - float(ta) / 100)
+                    elif tt == "ATR":
+                        return (hh - float(ta) * atr) if atr else cs
+                return cs
+
+            if need_stop_dist and "trail_type" in filtered.columns:
+                filtered["_eff_stop"] = filtered.apply(
+                    lambda r: _eff_stop(r) if is_open_mask[filtered.index.get_loc(r.name)] else r.get("current_stop"),
+                    axis=1,
+                )
+            else:
+                filtered["_eff_stop"] = filtered["current_stop"]
+
+            if "Locked-in Profit" in vis:
+                _lk_cs  = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
+                _lk_ep  = pd.to_numeric(filtered["entry_price"],   errors="coerce")
+                _lk_qty = pd.to_numeric(filtered["quantity"],      errors="coerce")
+                _lk_mul = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
+                _lk_val = (_lk_cs - _lk_ep) * _lk_qty * _lk_mul
+                _lk_ok  = is_open_mask & _lk_cs.notna() & _lk_ep.notna() & _lk_qty.notna()
+                display["Locked-in Profit"] = np.where(_lk_ok, _lk_val.apply(fmt_pnl), "—")
+
+            if "Open Risk" in vis:
+                _or_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
+                _or_cs     = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
+                _or_ep     = pd.to_numeric(filtered["entry_price"],   errors="coerce")
+                _or_qty    = pd.to_numeric(filtered["quantity"],      errors="coerce")
+                _or_mul    = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
+                _or_locked = np.where(
+                    _or_cs.notna() & _or_ep.notna() & _or_qty.notna(),
+                    (_or_cs - _or_ep) * _or_qty * _or_mul,
+                    0.0,
+                )
+                _or_risk = _or_pnl - pd.Series(_or_locked, index=filtered.index)
+                _or_ok   = is_open_mask & _or_pnl.notna()
+                display["Open Risk"] = np.where(_or_ok, _or_risk.apply(fmt_pnl), "—")
+
+            if "Opening Risk" in vis:
+                def _opening_risk(row):
+                    qty, ep, os_ = row["quantity"], row["entry_price"], row["opening_stop"]
+                    mult = float(row.get("multiplier") or 1.0)
+                    return fmt_price(qty * abs(ep - os_) * mult) if qty and ep and os_ else "—"
+                display["Opening Risk"] = filtered.apply(_opening_risk, axis=1)
+
+            if "Stop Dist $" in vis:
+                display["Stop Dist $"] = filtered.apply(
+                    lambda r: fmt_price(r.get("_live_p") - r["_eff_stop"])
+                              if pd.notna(r.get("_live_p")) and r["_eff_stop"] is not None else "—", axis=1
+                )
+
+            if "Stop Dist %" in vis:
+                def _sd_pct(row):
+                    lp, cs = row.get("_live_p"), row["_eff_stop"]
+                    if not pd.notna(lp) or cs is None or lp == 0: return "—"
+                    return fmt_pct((lp - cs) / lp * 100)
+                display["Stop Dist %"] = filtered.apply(_sd_pct, axis=1)
+
+            if "Stop Dist ATR" in vis:
+                def _sd_atr(row):
+                    lp, cs = row.get("_live_p"), row["_eff_stop"]
+                    if not pd.notna(lp) or cs is None: return "—"
+                    atr = metadata.get(row["ticker"], {}).get("atr14")
+                    return fmt_num((lp - cs) / atr) if atr else "—"
+                display["Stop Dist ATR"] = filtered.apply(_sd_atr, axis=1)
+
+            if metadata:
+                if "Sector" in vis:
+                    display["Sector"]      = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("sector") or "—")
+                if "Industry" in vis:
+                    display["Industry"]    = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("industry") or "—")
+                if "Beta" in vis:
+                    display["Beta"]        = filtered["ticker"].apply(lambda t: fmt_num(metadata.get(t, {}).get("beta")))
+                if "Correlation" in vis:
+                    display["Correlation"] = filtered["ticker"].apply(
+                        lambda t: fmt_num(metadata.get(t, {}).get("correlation_spy"), decimals=3))
+
+            # Options / Futures columns
+            if "Contract" in vis:
+                display["Contract"] = filtered.apply(_contract_sym, axis=1)
+            if "Leg" in vis:
+                display["Leg"] = filtered["leg_label"].apply(lambda v: str(v) if v and not pd.isna(v) else "—")
+            if "Expiration" in vis:
+                display["Expiration"] = filtered["expiration"].apply(lambda v: fmt_date(v, euro_dates) if v and not pd.isna(v) else "—")
+            if "Strike" in vis:
+                display["Strike"] = filtered["strike"].apply(fmt_price)
+            if "Option Type" in vis:
+                display["Option Type"] = filtered["option_type"].apply(
+                    lambda v: "Call" if str(v or "").upper().startswith("C")
+                              else "Put" if str(v or "").upper().startswith("P") else "—"
+                )
+            if "Multiplier" in vis:
+                display["Multiplier"] = filtered["multiplier"].apply(
+                    lambda v: fmt_num(float(v)) if v and not pd.isna(v) else "1"
+                )
+            if "Spread Group" in vis:
+                display["Spread Group"] = filtered["leg_group"].apply(
+                    lambda v: str(v)[:8] if v and not pd.isna(v) else "—"
+                )
+            if "Spread Type" in vis:
+                display["Spread Type"] = filtered["spread_type"].apply(
+                    lambda v: str(v) if v and not pd.isna(v) else "—"
+                ) if "spread_type" in filtered.columns else "—"
+
+            if "Underlying" in vis:
+                import re as _re
+                def _underlying(row):
+                    t = str(row.get("ticker") or "")
+                    if str(row.get("instrument_type") or "stock").lower() == "option":
+                        m = _re.match(r'^([A-Z]{1,6})', t.upper())
+                        return m.group(1) if m else t
+                    return t
+                display["Underlying"] = filtered.apply(_underlying, axis=1)
+
+            if "Delta" in vis:
+                display["Delta"] = (
+                    filtered["_delta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
+                    if "_delta_pos" in filtered.columns else "—"
+                )
+
+            if "Theta" in vis:
+                display["Theta"] = (
+                    filtered["_theta_pos"].apply(lambda v: fmt_num(v, 2) if pd.notna(v) else "—")
+                    if "_theta_pos" in filtered.columns else "—"
+                )
+
+            if "Commission" in vis:
+                display["Commission"] = filtered["commission"].apply(
+                    lambda v: fmt_price(float(v)) if v is not None and not pd.isna(v) else "$0.00"
+                ) if "commission" in filtered.columns else "$0.00"
+
+            if "Ann. Return %" in vis:
+                _arp_pnl   = pd.to_numeric(display["_pnl_num"], errors="coerce")
+                _arp_entry = pd.to_datetime(filtered["entry_date"], errors="coerce")
+                _arp_exit  = pd.to_datetime(filtered["exit_date"],  errors="coerce")
+                _arp_ep    = pd.to_numeric(filtered["entry_price"], errors="coerce")
+                _arp_qty   = pd.to_numeric(filtered["quantity"],    errors="coerce")
+                _arp_mul   = pd.to_numeric(filtered.get("multiplier", pd.Series(1.0, index=filtered.index)), errors="coerce").fillna(1.0)
+                _arp_days  = np.where(is_open_mask,
+                                      (today_ts - _arp_entry).dt.days,
+                                      (_arp_exit - _arp_entry).dt.days)
+                _arp_days_s = pd.to_numeric(pd.Series(_arp_days, index=filtered.index), errors="coerce")
+                _arp_cost  = (_arp_ep * _arp_qty * _arp_mul).abs()
+                _arp_pct   = np.where(
+                    _arp_pnl.notna() & _arp_cost.notna() & (_arp_cost > 0) & (_arp_days_s > 0),
+                    _arp_pnl / _arp_cost * 100 / _arp_days_s * 365,
+                    np.nan,
+                )
+                display["Ann. Return %"] = pd.Series(_arp_pct, index=filtered.index).apply(
+                    lambda v: fmt_signed_pct(v) if pd.notna(v) else "—"
+                )
+
+            # Earnings column — auto-fetch with manual override for open trades
+            if "Earnings" in vis:
+                _earn_iom = is_open_mask  # close over the precomputed mask
+                def _earnings_val(row):
+                    manual = row.get("earnings_date")
+                    if manual and not pd.isna(manual) and str(manual).strip():
+                        return str(manual).strip()
+                    if _earn_iom[row.name]:
+                        fetched = fetch_next_earnings(row["ticker"])
+                        return fetched if fetched else "—"
+                    return "—"
+                display["Earnings"] = filtered.apply(_earnings_val, axis=1)
+
+            # ── Collapse spread/roll groups (when expand toggle is off) ─────────────
+
+            # Snapshot before aggregation — spread summaries need the full leg data
+            _pre_agg_filtered = filtered.copy()
+
+            _group_row_ids: dict[int, list] = {}
+            if not _expand_legs:
+                # Build aggregated rows for each leg_group / roll_group
+                _group_col = "leg_group" if "leg_group" in filtered.columns else None
+                _roll_col  = "roll_group" if "roll_group" in filtered.columns else None
+                _grouped_ids: set      = set()
+                _agg_rows: list        = []
+                _agg_member_ids: list  = []  # parallel: member trade IDs for each agg row
+
+                for _gc in [_group_col, _roll_col]:
+                    if _gc is None:
                         continue
-                    _grouped_ids.update(_grp_filt.index.tolist())
-                    # Aggregate: sum PnL, use first ticker, first entry date
-                    _agg_pnl  = _grp_rows["_pnl_num"].dropna().sum()
-                    _agg_row  = {c: "—" for c in display.columns}
-                    _agg_row["Trade ID"]    = f"[{_gc.replace('_group','')}] {_grp_key}"
-                    # Status: open if any leg is still open
-                    _any_open = _grp_filt.apply(_is_open, axis=1).any()
-                    _agg_row["Status"]      = "Open" if _any_open else "Closed"
-                    _agg_row["Ticker"]      = _grp_filt["ticker"].iloc[0]
-                    # Instrument: reflect the kind of group
-                    _grp_itype = str(_grp_filt["instrument_type"].iloc[0] if "instrument_type" in _grp_filt.columns else "stock").lower()
-                    if _gc == "roll_group":
-                        _agg_row["Instrument"] = "Option Roll"
-                    elif _grp_itype == "option":
-                        _agg_row["Instrument"] = "Option Spread"
-                    else:
-                        _agg_row["Instrument"] = "Spread"
-                    _agg_row["Entry Date"]  = _grp_rows["Entry Date"].iloc[0]
-                    _agg_row["Exit Date"]   = _grp_rows["Exit Date"].iloc[-1]
-                    _agg_row["P&L"]         = fmt_pnl(_agg_pnl)
-                    _agg_row["_pnl_num"]    = _agg_pnl
-                    # Quantity: for spreads show the number of *spreads* (the per-leg
-                    # contract count), which is what traders track — not the leg count,
-                    # which is just the structure. Rolls keep the leg count.
-                    if _gc == "leg_group":
-                        _sp_units = spread_unit_count(_grp_filt["quantity"].tolist())
-                        _agg_row["Quantity"] = (
-                            fmt_qty(_sp_units) if _sp_units else f"{len(_grp_rows)} legs"
-                        )
-                    else:
-                        _agg_row["Quantity"] = f"{len(_grp_rows)} legs"
-                    # Spread Type: stored type wins; otherwise infer from leg structure
-                    # so collapsed option spreads still show e.g. "Vertical" / "Iron Condor".
-                    if "Spread Type" in _agg_row:
-                        _stype_val = None
-                        if "spread_type" in _grp_filt.columns and _grp_filt["spread_type"].notna().any():
-                            _stype_val = _grp_filt["spread_type"].dropna().iloc[0]
-                        if not _stype_val and _grp_itype == "option" and _gc == "leg_group":
-                            _stype_val = _detect_spread_type(_grp_filt)
-                        _agg_row["Spread Type"] = str(_stype_val) if _stype_val else "—"
-                    # Net live price: sum each leg's market price with side polarity
-                    if _any_open and live_data:
-                        _grp_live_tkrs = live_ticker_ser[_grp_mask]
-                        _grp_signs     = np.where(
+                    for _grp_key in filtered[_gc].dropna().unique():
+                        _grp_mask = filtered[_gc] == _grp_key
+                        _grp_rows = display[_grp_mask.values]
+                        _grp_filt = filtered[_grp_mask.values]
+                        if len(_grp_rows) < 2:
+                            continue
+                        _grouped_ids.update(_grp_filt.index.tolist())
+                        # Aggregate: sum PnL, use first ticker, first entry date
+                        _agg_pnl  = _grp_rows["_pnl_num"].dropna().sum()
+                        _agg_row  = {c: "—" for c in display.columns}
+                        _agg_row["Trade ID"]    = f"[{_gc.replace('_group','')}] {_grp_key}"
+                        # Status: open if any leg is still open
+                        _any_open = _grp_filt.apply(_is_open, axis=1).any()
+                        _agg_row["Status"]      = "Open" if _any_open else "Closed"
+                        _agg_row["Ticker"]      = _grp_filt["ticker"].iloc[0]
+                        # Instrument: reflect the kind of group
+                        _grp_itype = str(_grp_filt["instrument_type"].iloc[0] if "instrument_type" in _grp_filt.columns else "stock").lower()
+                        if _gc == "roll_group":
+                            _agg_row["Instrument"] = "Option Roll"
+                        elif _grp_itype == "option":
+                            _agg_row["Instrument"] = "Option Spread"
+                        else:
+                            _agg_row["Instrument"] = "Spread"
+                        _agg_row["Entry Date"]  = _grp_rows["Entry Date"].iloc[0]
+                        _agg_row["Exit Date"]   = _grp_rows["Exit Date"].iloc[-1]
+                        _agg_row["P&L"]         = fmt_pnl(_agg_pnl)
+                        _agg_row["_pnl_num"]    = _agg_pnl
+                        # Quantity: for spreads show the number of *spreads* (the per-leg
+                        # contract count), which is what traders track — not the leg count,
+                        # which is just the structure. Rolls keep the leg count.
+                        if _gc == "leg_group":
+                            _sp_units = spread_unit_count(_grp_filt["quantity"].tolist())
+                            _agg_row["Quantity"] = (
+                                fmt_qty(_sp_units) if _sp_units else f"{len(_grp_rows)} legs"
+                            )
+                        else:
+                            _agg_row["Quantity"] = f"{len(_grp_rows)} legs"
+                        # Spread Type: stored type wins; otherwise infer from leg structure
+                        # so collapsed option spreads still show e.g. "Vertical" / "Iron Condor".
+                        if "Spread Type" in _agg_row:
+                            _stype_val = None
+                            if "spread_type" in _grp_filt.columns and _grp_filt["spread_type"].notna().any():
+                                _stype_val = _grp_filt["spread_type"].dropna().iloc[0]
+                            if not _stype_val and _grp_itype == "option" and _gc == "leg_group":
+                                _stype_val = _detect_spread_type(_grp_filt)
+                            _agg_row["Spread Type"] = str(_stype_val) if _stype_val else "—"
+                        # Net live price: sum each leg's market price with side polarity
+                        if _any_open and live_data:
+                            _grp_live_tkrs = live_ticker_ser[_grp_mask]
+                            _grp_signs     = np.where(
+                                _grp_filt["side"].fillna("long").str.lower() == "short", -1.0, 1.0
+                            )
+                            _leg_pxs = [
+                                float(live_data[sym]["price"]) * sign
+                                for sym, sign in zip(_grp_live_tkrs.values, _grp_signs)
+                                if sym and live_data.get(sym, {}).get("price") is not None
+                            ]
+                            if len(_leg_pxs) == len(_grp_filt):
+                                _agg_row["Live Price"] = fmt_price(sum(_leg_pxs))
+
+                        # Aggregate position-value columns across legs (net, with side
+                        # polarity — consistent with the net Live Price above).
+                        _val_signs = np.where(
                             _grp_filt["side"].fillna("long").str.lower() == "short", -1.0, 1.0
                         )
-                        _leg_pxs = [
-                            float(live_data[sym]["price"]) * sign
-                            for sym, sign in zip(_grp_live_tkrs.values, _grp_signs)
-                            if sym and live_data.get(sym, {}).get("price") is not None
-                        ]
-                        if len(_leg_pxs) == len(_grp_filt):
-                            _agg_row["Live Price"] = fmt_price(sum(_leg_pxs))
+                        # Current Value: net market value of the legs (with side polarity)
+                        if "_cur_val" in _grp_filt.columns:
+                            _leg_cv = pd.to_numeric(_grp_filt["_cur_val"], errors="coerce").to_numpy()
+                            if not np.all(np.isnan(_leg_cv)):
+                                _net_cv = float(np.nansum(_leg_cv * _val_signs))
+                                _agg_row["Current Value"] = fmt_price(_net_cv)
+                        # % of Account: option spreads sized by combined max risk
+                        # (worst-case loss across all legs); other groups by net value.
+                        if acct_bal > 0:
+                            if _grp_itype == "option":
+                                _mr = option_legs_max_risk([
+                                    {"type": _r.get("option_type"), "strike": _r.get("strike"),
+                                     "side": _r.get("side"),        "qty":    _r.get("quantity"),
+                                     "mult": _r.get("multiplier"),  "entry_price": _r.get("entry_price")}
+                                    for _, _r in _grp_filt.iterrows()
+                                ])
+                                if _mr is None:
+                                    _agg_row["% of Account"] = "∞"
+                                elif _mr is not None:
+                                    _agg_row["% of Account"] = fmt_pct(_mr / acct_bal * 100)
+                            elif "_cur_val" in _grp_filt.columns and not np.all(np.isnan(_leg_cv)):
+                                _agg_row["% of Account"] = fmt_pct(_net_cv / acct_bal * 100)
+                        # Entry Value: net debit/credit basis across legs
+                        _leg_qty  = pd.to_numeric(_grp_filt["quantity"],    errors="coerce").to_numpy()
+                        _leg_ep   = pd.to_numeric(_grp_filt["entry_price"], errors="coerce").to_numpy()
+                        _leg_mult = pd.to_numeric(_grp_filt["multiplier"],  errors="coerce").fillna(1.0).to_numpy()
+                        _leg_ev   = _leg_qty * _leg_ep * _leg_mult
+                        if not np.all(np.isnan(_leg_ev)):
+                            _agg_row["Entry Value"] = fmt_price(float(np.nansum(_leg_ev * _val_signs)))
+                        # Acct P&L % from the summed P&L
+                        if acct_bal > 0 and pd.notna(_agg_pnl):
+                            _agg_row["Acct P&L %"] = fmt_signed_pct(_agg_pnl / acct_bal * 100)
+                        # Days in Trade: legs share an entry date — use the first leg's value
+                        if "Days in Trade" in _grp_rows.columns:
+                            _agg_row["Days in Trade"] = _grp_rows["Days in Trade"].iloc[0]
+                        # Net greeks: sum signed position greeks across legs
+                        if "_delta_pos" in _grp_filt.columns:
+                            _ds = pd.to_numeric(_grp_filt["_delta_pos"], errors="coerce")
+                            if _ds.notna().any():
+                                _agg_row["Delta"] = fmt_num(float(_ds.sum()), 2)
+                        if "_theta_pos" in _grp_filt.columns:
+                            _ts = pd.to_numeric(_grp_filt["_theta_pos"], errors="coerce")
+                            if _ts.notna().any():
+                                _agg_row["Theta"] = fmt_num(float(_ts.sum()), 2)
 
-                    # Aggregate position-value columns across legs (net, with side
-                    # polarity — consistent with the net Live Price above).
-                    _val_signs = np.where(
-                        _grp_filt["side"].fillna("long").str.lower() == "short", -1.0, 1.0
-                    )
-                    # Current Value: net market value of the legs (with side polarity)
-                    if "_cur_val" in _grp_filt.columns:
-                        _leg_cv = pd.to_numeric(_grp_filt["_cur_val"], errors="coerce").to_numpy()
-                        if not np.all(np.isnan(_leg_cv)):
-                            _net_cv = float(np.nansum(_leg_cv * _val_signs))
-                            _agg_row["Current Value"] = fmt_price(_net_cv)
-                    # % of Account: option spreads sized by combined max risk
-                    # (worst-case loss across all legs); other groups by net value.
-                    if acct_bal > 0:
-                        if _grp_itype == "option":
-                            _mr = option_legs_max_risk([
-                                {"type": _r.get("option_type"), "strike": _r.get("strike"),
-                                 "side": _r.get("side"),        "qty":    _r.get("quantity"),
-                                 "mult": _r.get("multiplier"),  "entry_price": _r.get("entry_price")}
-                                for _, _r in _grp_filt.iterrows()
-                            ])
-                            if _mr is None:
-                                _agg_row["% of Account"] = "∞"
-                            elif _mr is not None:
-                                _agg_row["% of Account"] = fmt_pct(_mr / acct_bal * 100)
-                        elif "_cur_val" in _grp_filt.columns and not np.all(np.isnan(_leg_cv)):
-                            _agg_row["% of Account"] = fmt_pct(_net_cv / acct_bal * 100)
-                    # Entry Value: net debit/credit basis across legs
-                    _leg_qty  = pd.to_numeric(_grp_filt["quantity"],    errors="coerce").to_numpy()
-                    _leg_ep   = pd.to_numeric(_grp_filt["entry_price"], errors="coerce").to_numpy()
-                    _leg_mult = pd.to_numeric(_grp_filt["multiplier"],  errors="coerce").fillna(1.0).to_numpy()
-                    _leg_ev   = _leg_qty * _leg_ep * _leg_mult
-                    if not np.all(np.isnan(_leg_ev)):
-                        _agg_row["Entry Value"] = fmt_price(float(np.nansum(_leg_ev * _val_signs)))
-                    # Acct P&L % from the summed P&L
-                    if acct_bal > 0 and pd.notna(_agg_pnl):
-                        _agg_row["Acct P&L %"] = fmt_signed_pct(_agg_pnl / acct_bal * 100)
-                    # Days in Trade: legs share an entry date — use the first leg's value
-                    if "Days in Trade" in _grp_rows.columns:
-                        _agg_row["Days in Trade"] = _grp_rows["Days in Trade"].iloc[0]
-                    # Net greeks: sum signed position greeks across legs
-                    if "_delta_pos" in _grp_filt.columns:
-                        _ds = pd.to_numeric(_grp_filt["_delta_pos"], errors="coerce")
-                        if _ds.notna().any():
-                            _agg_row["Delta"] = fmt_num(float(_ds.sum()), 2)
-                    if "_theta_pos" in _grp_filt.columns:
-                        _ts = pd.to_numeric(_grp_filt["_theta_pos"], errors="coerce")
-                        if _ts.notna().any():
-                            _agg_row["Theta"] = fmt_num(float(_ts.sum()), 2)
+                        _agg_rows.append(_agg_row)
+                        _agg_member_ids.append(_grp_filt["id"].tolist())
 
-                    _agg_rows.append(_agg_row)
-                    _agg_member_ids.append(_grp_filt["id"].tolist())
-
-            if _agg_rows or _grouped_ids:
-                # Keep non-grouped rows
-                _non_grp_mask = ~display.index.isin(_grouped_ids)
-                _non_grp_disp = display[_non_grp_mask]
-                _non_grp_count = len(_non_grp_disp)
-                _agg_df       = pd.DataFrame(_agg_rows, columns=display.columns) if _agg_rows else pd.DataFrame(columns=display.columns)
-                display       = pd.concat([_non_grp_disp, _agg_df], ignore_index=True)
-                display["Trade ID"] = display["Trade ID"].astype(str)
-                filtered      = filtered[_non_grp_mask].reset_index(drop=True)
-                # map display index → member trade IDs for each aggregate row
-                _group_row_ids = {
-                    _non_grp_count + j: ids for j, ids in enumerate(_agg_member_ids)
-                }
-                is_open_mask  = _make_is_open_mask(filtered)
-
-        # ── Positions view ─────────────────────────────────────────────────────
-
-        if _positions_view:
-            # Build one aggregated row per ticker (open positions only)
-            # Use pre-aggregation data so spread legs aren't invisible here
-            _pos_rows = []
-            _pos_ticker_ids: dict[str, list[int]] = {}  # ticker → list of trade ids
-            _all_open = _pre_agg_filtered[_make_is_open_mask(_pre_agg_filtered)]
-
-            for _tkr, _grp in _all_open.groupby("ticker"):
-                _ids = _grp["id"].tolist()
-                _pos_ticker_ids[_tkr] = _ids
-                # Weighted-average cost from lots if available, else from trades
-                _lots_map = load_lots_for_trades(_ids)
-                _all_lots = [lot for llist in _lots_map.values() for lot in llist]
-                if _all_lots:
-                    _trade_side = {
-                        int(row["id"]): (-1 if str(row.get("side", "")).lower() == "short" else 1)
-                        for _, row in _grp.iterrows()
+                if _agg_rows or _grouped_ids:
+                    # Keep non-grouped rows
+                    _non_grp_mask = ~display.index.isin(_grouped_ids)
+                    _non_grp_disp = display[_non_grp_mask]
+                    _non_grp_count = len(_non_grp_disp)
+                    _agg_df       = pd.DataFrame(_agg_rows, columns=display.columns) if _agg_rows else pd.DataFrame(columns=display.columns)
+                    display       = pd.concat([_non_grp_disp, _agg_df], ignore_index=True)
+                    display["Trade ID"] = display["Trade ID"].astype(str)
+                    filtered      = filtered[_non_grp_mask].reset_index(drop=True)
+                    # map display index → member trade IDs for each aggregate row
+                    _group_row_ids = {
+                        _non_grp_count + j: ids for j, ids in enumerate(_agg_member_ids)
                     }
-                    _open_lots_all = [l for l in _all_lots if l["lot_type"] != "exit"]
-                    _exit_lots     = [l for l in _all_lots if l["lot_type"] == "exit"]
-                    _signed_lot_qty  = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _open_lots_all)
-                    _signed_lot_cost = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) * l["price"] for l in _open_lots_all)
-                    # Partial exits reduce the open size but leave the per-share cost basis alone.
-                    _signed_exit_qty = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _exit_lots)
-                    if _signed_lot_qty != 0:
-                        _total_qty = abs(_signed_lot_qty - _signed_exit_qty)
-                        _avg_cost  = _signed_lot_cost / _signed_lot_qty
+                    is_open_mask  = _make_is_open_mask(filtered)
+
+            # ── Positions view ─────────────────────────────────────────────────────
+
+            if _positions_view:
+                # Build one aggregated row per ticker (open positions only)
+                # Use pre-aggregation data so spread legs aren't invisible here
+                _pos_rows = []
+                _pos_ticker_ids: dict[str, list[int]] = {}  # ticker → list of trade ids
+                _all_open = _pre_agg_filtered[_make_is_open_mask(_pre_agg_filtered)]
+
+                for _tkr, _grp in _all_open.groupby("ticker"):
+                    _ids = _grp["id"].tolist()
+                    _pos_ticker_ids[_tkr] = _ids
+                    # Weighted-average cost from lots if available, else from trades
+                    _lots_map = load_lots_for_trades(_ids)
+                    _all_lots = [lot for llist in _lots_map.values() for lot in llist]
+                    if _all_lots:
+                        _trade_side = {
+                            int(row["id"]): (-1 if str(row.get("side", "")).lower() == "short" else 1)
+                            for _, row in _grp.iterrows()
+                        }
+                        _open_lots_all = [l for l in _all_lots if l["lot_type"] != "exit"]
+                        _exit_lots     = [l for l in _all_lots if l["lot_type"] == "exit"]
+                        _signed_lot_qty  = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _open_lots_all)
+                        _signed_lot_cost = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) * l["price"] for l in _open_lots_all)
+                        # Partial exits reduce the open size but leave the per-share cost basis alone.
+                        _signed_exit_qty = sum(l["quantity"] * _trade_side.get(int(l["trade_id"]), 1) for l in _exit_lots)
+                        if _signed_lot_qty != 0:
+                            _total_qty = abs(_signed_lot_qty - _signed_exit_qty)
+                            _avg_cost  = _signed_lot_cost / _signed_lot_qty
+                        else:
+                            _total_qty = sum(l["quantity"] for l in _open_lots_all if _trade_side.get(int(l["trade_id"]), 1) == 1)
+                            _avg_cost  = (_signed_lot_cost / _total_qty) if _total_qty else 0.0
+                        _n_adds     = sum(1 for l in _all_lots if l["lot_type"] == "add")
                     else:
-                        _total_qty = sum(l["quantity"] for l in _open_lots_all if _trade_side.get(int(l["trade_id"]), 1) == 1)
-                        _avg_cost  = (_signed_lot_cost / _total_qty) if _total_qty else 0.0
-                    _n_adds     = sum(1 for l in _all_lots if l["lot_type"] == "add")
+                        _signs      = _grp["side"].map(lambda s: -1 if str(s).lower() == "short" else 1).fillna(1)
+                        _signed_qty = (_grp["quantity"].fillna(0) * _signs)
+                        _net_qty    = float(_signed_qty.sum())
+                        _net_cost   = float((_signed_qty * _grp["entry_price"].fillna(0)).sum())
+                        if _net_qty != 0:
+                            _total_qty = abs(_net_qty)
+                            _avg_cost  = _net_cost / _net_qty
+                        else:
+                            # Balanced spread: use long-leg qty, net cost as basis
+                            _total_qty = float(_grp.loc[_signs == 1, "quantity"].fillna(0).sum())
+                            _avg_cost  = (_net_cost / _total_qty) if _total_qty else 0.0
+                        _n_adds = 0
+
+                    # Dividends
+                    _divs_map = load_dividends_for_trades(_ids)
+                    _total_divs = sum(
+                        d.get("total_amount") or 0
+                        for dlist in _divs_map.values() for d in dlist
+                    )
+
+                    # Live price / P&L
+                    _live_key  = _tkr
+                    _live_px   = live_data.get(_live_key, {}).get("price")
+                    _cur_val   = (_live_px * _total_qty) if _live_px else None
+                    _entry_val = _avg_cost * _total_qty
+                    _pnl_val   = (_cur_val - _entry_val) if _cur_val is not None else None
+
+                    _pos_rows.append({
+                        "Ticker":        _tkr,
+                        "Qty":           fmt_qty(_total_qty),
+                        "Avg Cost":      fmt_price(_avg_cost),
+                        "Adds":          _n_adds,
+                        "Live Price":    fmt_price(_live_px) if _live_px else "—",
+                        "Current Value": fmt_price(_cur_val) if _cur_val else "—",
+                        "Unrealized P&L": fmt_pnl(_pnl_val) if _pnl_val is not None else "—",
+                        "Dividends Rcvd": fmt_price(_total_divs) if _total_divs else "—",
+                        "_pnl_num":      _pnl_val,
+                        "_ids_json":     str(_ids),   # store ids as string for drill-down
+                    })
+
+                if not _pos_rows:
+                    st.info("No open positions.")
                 else:
-                    _signs      = _grp["side"].map(lambda s: -1 if str(s).lower() == "short" else 1).fillna(1)
-                    _signed_qty = (_grp["quantity"].fillna(0) * _signs)
-                    _net_qty    = float(_signed_qty.sum())
-                    _net_cost   = float((_signed_qty * _grp["entry_price"].fillna(0)).sum())
-                    if _net_qty != 0:
-                        _total_qty = abs(_net_qty)
-                        _avg_cost  = _net_cost / _net_qty
-                    else:
-                        # Balanced spread: use long-leg qty, net cost as basis
-                        _total_qty = float(_grp.loc[_signs == 1, "quantity"].fillna(0).sum())
-                        _avg_cost  = (_net_cost / _total_qty) if _total_qty else 0.0
-                    _n_adds = 0
+                    _pos_df = pd.DataFrame(_pos_rows)
+                    _pos_display_cols = ["Ticker", "Qty", "Avg Cost", "Adds",
+                                         "Live Price", "Current Value", "Unrealized P&L", "Dividends Rcvd"]
+                    _pos_event = st.dataframe(
+                        _pos_df[_pos_display_cols],
+                        width='stretch', hide_index=True,
+                        on_select="rerun", selection_mode="single-row",
+                        key="pos_table",
+                    )
+                    _pos_sel = _pos_event.selection.rows
+                    st.caption(f"{len(_pos_rows)} open position{'s' if len(_pos_rows) != 1 else ''}"
+                               + (" · click a row to drill down" if not _pos_sel else ""))
 
-                # Dividends
-                _divs_map = load_dividends_for_trades(_ids)
-                _total_divs = sum(
-                    d.get("total_amount") or 0
-                    for dlist in _divs_map.values() for d in dlist
-                )
+                    # ── Drill-down panel ──────────────────────────────────────────
+                    if _pos_sel:
+                        _sel_pos_row  = _pos_df.iloc[_pos_sel[0]]
+                        _sel_ticker   = _sel_pos_row["Ticker"]
+                        _sel_ids      = _pos_ticker_ids.get(_sel_ticker, [])
 
-                # Live price / P&L
-                _live_key  = _tkr
-                _live_px   = live_data.get(_live_key, {}).get("price")
-                _cur_val   = (_live_px * _total_qty) if _live_px else None
-                _entry_val = _avg_cost * _total_qty
-                _pnl_val   = (_cur_val - _entry_val) if _cur_val is not None else None
+                        st.markdown(f"#### 🔍  {_sel_ticker} — Position Detail")
 
-                _pos_rows.append({
-                    "Ticker":        _tkr,
-                    "Qty":           fmt_qty(_total_qty),
-                    "Avg Cost":      fmt_price(_avg_cost),
-                    "Adds":          _n_adds,
-                    "Live Price":    fmt_price(_live_px) if _live_px else "—",
-                    "Current Value": fmt_price(_cur_val) if _cur_val else "—",
-                    "Unrealized P&L": fmt_pnl(_pnl_val) if _pnl_val is not None else "—",
-                    "Dividends Rcvd": fmt_price(_total_divs) if _total_divs else "—",
-                    "_pnl_num":      _pnl_val,
-                    "_ids_json":     str(_ids),   # store ids as string for drill-down
-                })
+                        _dd_lots_map = load_lots_for_trades(_sel_ids)
+                        _dd_divs_map = load_dividends_for_trades(_sel_ids)
 
-            if not _pos_rows:
-                st.info("No open positions.")
-            else:
-                _pos_df = pd.DataFrame(_pos_rows)
-                _pos_display_cols = ["Ticker", "Qty", "Avg Cost", "Adds",
-                                     "Live Price", "Current Value", "Unrealized P&L", "Dividends Rcvd"]
-                _pos_event = st.dataframe(
-                    _pos_df[_pos_display_cols],
-                    width='stretch', hide_index=True,
-                    on_select="rerun", selection_mode="single-row",
-                    key="pos_table",
-                )
-                _pos_sel = _pos_event.selection.rows
-                st.caption(f"{len(_pos_rows)} open position{'s' if len(_pos_rows) != 1 else ''}"
-                           + (" · click a row to drill down" if not _pos_sel else ""))
+                        _dd_col1, _dd_col2 = st.columns([3, 2])
 
-                # ── Drill-down panel ──────────────────────────────────────────
-                if _pos_sel:
-                    _sel_pos_row  = _pos_df.iloc[_pos_sel[0]]
-                    _sel_ticker   = _sel_pos_row["Ticker"]
-                    _sel_ids      = _pos_ticker_ids.get(_sel_ticker, [])
+                        # Build side sign map once — used by lots table, summary, and trade IDs table
+                        _dd_trades  = filtered[filtered["id"].isin(_sel_ids)]
+                        _dd_signs   = _dd_trades["side"].map(lambda s: -1 if str(s).lower() == "short" else 1).fillna(1)
+                        _trade_sign = dict(zip(_dd_trades["id"].astype(int), _dd_signs.values))
 
-                    st.markdown(f"#### 🔍  {_sel_ticker} — Position Detail")
-
-                    _dd_lots_map = load_lots_for_trades(_sel_ids)
-                    _dd_divs_map = load_dividends_for_trades(_sel_ids)
-
-                    _dd_col1, _dd_col2 = st.columns([3, 2])
-
-                    # Build side sign map once — used by lots table, summary, and trade IDs table
-                    _dd_trades  = filtered[filtered["id"].isin(_sel_ids)]
-                    _dd_signs   = _dd_trades["side"].map(lambda s: -1 if str(s).lower() == "short" else 1).fillna(1)
-                    _trade_sign = dict(zip(_dd_trades["id"].astype(int), _dd_signs.values))
-
-                    with _dd_col1:
-                        st.markdown("**Tax Lots**")
-                        _flat_lots = [
-                            {**lot, "Trade ID": tid}
-                            for tid, llist in _dd_lots_map.items()
-                            for lot in llist
-                        ]
-                        if _flat_lots:
-                            _lot_raw  = pd.DataFrame(_flat_lots)
-                            _lot_disp = _lot_raw[["Trade ID", "date", "quantity", "price", "lot_type", "notes"]].copy()
-                            _lot_disp.columns = ["Trade ID", "Date", "Qty", "Price", "Type", "Notes"]
-                            # Apply sign: short legs show negative qty and cost basis
-                            _lot_sign = _lot_raw["Trade ID"].astype(int).map(lambda tid: _trade_sign.get(tid, 1))
-                            _lot_disp["Qty"]        = (_lot_raw["quantity"] * _lot_sign).apply(lambda v: int(v) if v == int(v) else v)
-                            _lot_disp["Price"]      = _lot_raw["price"].apply(fmt_price)
-                            _lot_disp["Cost Basis"] = (_lot_raw["quantity"] * _lot_sign * _lot_raw["price"]).apply(fmt_price)
-                            st.dataframe(_lot_disp, width='stretch', hide_index=True)
-
-                            # Summary under lots — use signed qty from trade side
-                            _dd_sq       = (_dd_trades["quantity"].fillna(0) * _dd_signs)
-                            _net_qty_dd  = float(_dd_sq.sum())
-                            _net_cost_dd = float((_dd_sq * _dd_trades["entry_price"].fillna(0)).sum())
-                            if _net_qty_dd != 0:
-                                _total_qty_dd = abs(_net_qty_dd)
-                                _avg_c        = _net_cost_dd / _net_qty_dd
-                            else:
-                                _total_qty_dd = float(_dd_trades.loc[_dd_signs == 1, "quantity"].fillna(0).sum())
-                                _avg_c        = (_net_cost_dd / _total_qty_dd) if _total_qty_dd else 0.0
-                            _total_basis  = _avg_c * _total_qty_dd
-                            _ms1, _ms2, _ms3 = st.columns(3)
-                            _ms1.metric("Total Qty",   fmt_qty(_total_qty_dd))
-                            _ms2.metric("Avg Cost",    fmt_price(_avg_c))
-                            _ms3.metric("Total Basis", fmt_price(_total_basis))
-                        else:
-                            st.info("No lot records — add lots via 'Add to Position' in the Multiple Buy/Sell section.")
-
-                    with _dd_col2:
-                        st.markdown("**Dividends**")
-                        _flat_divs = [
-                            {**d, "Trade ID": tid}
-                            for tid, dlist in _dd_divs_map.items()
-                            for d in dlist
-                        ]
-                        if _flat_divs:
-                            _div_disp = pd.DataFrame(_flat_divs)[
-                                ["ex_date", "amount_per_share", "quantity", "total_amount", "notes"]
+                        with _dd_col1:
+                            st.markdown("**Tax Lots**")
+                            _flat_lots = [
+                                {**lot, "Trade ID": tid}
+                                for tid, llist in _dd_lots_map.items()
+                                for lot in llist
                             ]
-                            _div_disp.columns = ["Ex-Date", "$/Share", "Qty", "Total", "Notes"]
-                            _div_disp["$/Share"] = _div_disp["$/Share"].apply(fmt_price)
-                            _div_disp["Total"]   = _div_disp["Total"].apply(
-                                lambda v: fmt_price(v) if v and not pd.isna(v) else "—"
-                            )
-                            st.dataframe(_div_disp, width='stretch', hide_index=True)
-                            _div_total = sum(
-                                (d.get("total_amount") or 0) for d in _flat_divs
-                            )
-                            st.metric("Total Dividends", fmt_price(_div_total))
-                        else:
-                            st.info("No dividends recorded for this position.")
+                            if _flat_lots:
+                                _lot_raw  = pd.DataFrame(_flat_lots)
+                                _lot_disp = _lot_raw[["Trade ID", "date", "quantity", "price", "lot_type", "notes"]].copy()
+                                _lot_disp.columns = ["Trade ID", "Date", "Qty", "Price", "Type", "Notes"]
+                                # Apply sign: short legs show negative qty and cost basis
+                                _lot_sign = _lot_raw["Trade ID"].astype(int).map(lambda tid: _trade_sign.get(tid, 1))
+                                _lot_disp["Qty"]        = (_lot_raw["quantity"] * _lot_sign).apply(lambda v: int(v) if v == int(v) else v)
+                                _lot_disp["Price"]      = _lot_raw["price"].apply(fmt_price)
+                                _lot_disp["Cost Basis"] = (_lot_raw["quantity"] * _lot_sign * _lot_raw["price"]).apply(fmt_price)
+                                st.dataframe(_lot_disp, width='stretch', hide_index=True)
 
-                        st.markdown("**Individual Trade IDs**")
-                        _id_df = filtered[filtered["id"].isin(_sel_ids)][
-                            ["id", "entry_date", "quantity", "entry_price", "account_name", "side"]
-                        ].copy()
-                        _id_df.columns = ["ID", "Entry Date", "Qty", "Entry Price", "Account", "side"]
-                        _id_df["Qty"]         = (_id_df["Qty"] * _id_df["side"].map(lambda s: -1 if str(s).lower() == "short" else 1)).apply(lambda v: int(v) if v == int(v) else v)
-                        _id_df["Entry Date"]  = _id_df["Entry Date"].apply(lambda v: fmt_date(v, euro_dates))
-                        _id_df["Entry Price"] = _id_df["Entry Price"].apply(fmt_price)
-                        st.dataframe(_id_df.drop(columns=["side"]), width='stretch', hide_index=True)
+                                # Summary under lots — use signed qty from trade side
+                                _dd_sq       = (_dd_trades["quantity"].fillna(0) * _dd_signs)
+                                _net_qty_dd  = float(_dd_sq.sum())
+                                _net_cost_dd = float((_dd_sq * _dd_trades["entry_price"].fillna(0)).sum())
+                                if _net_qty_dd != 0:
+                                    _total_qty_dd = abs(_net_qty_dd)
+                                    _avg_c        = _net_cost_dd / _net_qty_dd
+                                else:
+                                    _total_qty_dd = float(_dd_trades.loc[_dd_signs == 1, "quantity"].fillna(0).sum())
+                                    _avg_c        = (_net_cost_dd / _total_qty_dd) if _total_qty_dd else 0.0
+                                _total_basis  = _avg_c * _total_qty_dd
+                                _ms1, _ms2, _ms3 = st.columns(3)
+                                _ms1.metric("Total Qty",   fmt_qty(_total_qty_dd))
+                                _ms2.metric("Avg Cost",    fmt_price(_avg_c))
+                                _ms3.metric("Total Basis", fmt_price(_total_basis))
+                            else:
+                                st.info("No lot records — add lots via 'Add to Position' in the Multiple Buy/Sell section.")
 
-            # Skip the normal trades table when positions view is active
-            _skip_trades_table = True
-        else:
-            _skip_trades_table = False
+                        with _dd_col2:
+                            st.markdown("**Dividends**")
+                            _flat_divs = [
+                                {**d, "Trade ID": tid}
+                                for tid, dlist in _dd_divs_map.items()
+                                for d in dlist
+                            ]
+                            if _flat_divs:
+                                _div_disp = pd.DataFrame(_flat_divs)[
+                                    ["ex_date", "amount_per_share", "quantity", "total_amount", "notes"]
+                                ]
+                                _div_disp.columns = ["Ex-Date", "$/Share", "Qty", "Total", "Notes"]
+                                _div_disp["$/Share"] = _div_disp["$/Share"].apply(fmt_price)
+                                _div_disp["Total"]   = _div_disp["Total"].apply(
+                                    lambda v: fmt_price(v) if v and not pd.isna(v) else "—"
+                                )
+                                st.dataframe(_div_disp, width='stretch', hide_index=True)
+                                _div_total = sum(
+                                    (d.get("total_amount") or 0) for d in _flat_divs
+                                )
+                                st.metric("Total Dividends", fmt_price(_div_total))
+                            else:
+                                st.info("No dividends recorded for this position.")
 
-        # ── Render table ───────────────────────────────────────────────────────
+                            st.markdown("**Individual Trade IDs**")
+                            _id_df = filtered[filtered["id"].isin(_sel_ids)][
+                                ["id", "entry_date", "quantity", "entry_price", "account_name", "side"]
+                            ].copy()
+                            _id_df.columns = ["ID", "Entry Date", "Qty", "Entry Price", "Account", "side"]
+                            _id_df["Qty"]         = (_id_df["Qty"] * _id_df["side"].map(lambda s: -1 if str(s).lower() == "short" else 1)).apply(lambda v: int(v) if v == int(v) else v)
+                            _id_df["Entry Date"]  = _id_df["Entry Date"].apply(lambda v: fmt_date(v, euro_dates))
+                            _id_df["Entry Price"] = _id_df["Entry Price"].apply(fmt_price)
+                            st.dataframe(_id_df.drop(columns=["side"]), width='stretch', hide_index=True)
 
-        safe_vis   = [c for c in vis if c in display.columns]
-        _grp_keys  = (
-            filtered["leg_group"].reset_index(drop=True)
-            if "leg_group" in filtered.columns else None
-        )
-        styled     = _style_table(display[safe_vis], settings, group_keys=_grp_keys)
-        selected_rows = []  # initialised here; overwritten below when trades table is rendered
-        valid_rows = []
-        valid_non_group_rows = []
-
-        if not _positions_view:
-            # Resolve pending selection changes BEFORE the widget is instantiated.
-            if st.session_state.pop("_reset_table_sel", False):
-                st.session_state["trade_table"] = {"selection": {"rows": [], "columns": []}}
-            if st.session_state.pop("_select_all_pending", False):
-                st.session_state["trade_table"] = {"selection": {"rows": list(range(len(display))), "columns": []}}
-
-            event = st.dataframe(styled, width='stretch', hide_index=True,
-                                 on_select="rerun", selection_mode="multi-row",
-                                 key="trade_table")
-
-            selected_rows = event.selection.rows
-
-            valid_rows = [i for i in selected_rows if i < len(display)]
-            valid_non_group_rows = [i for i in valid_rows if i not in _group_row_ids and i < len(filtered)]
-
-            def _resolve_ids(indices):
-                ids = []
-                for i in indices:
-                    if i in _group_row_ids:
-                        ids.extend(int(x) for x in _group_row_ids[i])
-                    elif i < len(filtered):
-                        ids.append(int(filtered.iloc[i]["id"]))
-                return ids
-
-            if valid_rows:
-                st.session_state["_bulk_sel_ids"] = _resolve_ids(valid_rows)
+                # Skip the normal trades table when positions view is active
+                _skip_trades_table = True
             else:
-                st.session_state.pop("_bulk_sel_ids", None)
+                _skip_trades_table = False
 
-            _cap_c1, _cap_c2, _cap_c3 = st.columns([4, 1, 1])
-            _cap_c1.caption(
-                f"{len(filtered)} trade{'s' if len(filtered) != 1 else ''}"
-                + (f"  ·  {len(selected_rows)} selected" if selected_rows else "")
+            # ── Render table ───────────────────────────────────────────────────────
+
+            safe_vis   = [c for c in vis if c in display.columns]
+            _grp_keys  = (
+                filtered["leg_group"].reset_index(drop=True)
+                if "leg_group" in filtered.columns else None
             )
-            if _cap_c2.button("☑  Select All", key="select_all_btn", help="Select all visible rows"):
-                st.session_state["_select_all_pending"] = True
-                st.rerun()
-            if selected_rows and _cap_c3.button("✕  Clear", key="clear_sel_btn", help="Clear selection"):
-                st.session_state["_reset_table_sel"] = True
-                st.rerun()
+            styled     = _style_table(display[safe_vis], settings, group_keys=_grp_keys)
+            selected_rows = []  # initialised here; overwritten below when trades table is rendered
+            valid_rows = []
+            valid_non_group_rows = []
 
-            # Inline drill-down: quick-edit + lots + dividends when a single non-group row is selected
-            if len(valid_non_group_rows) == 1:
-                _dd_id  = int(filtered.iloc[valid_non_group_rows[0]]["id"])
-                _dd_row = filtered.iloc[valid_non_group_rows[0]]
-                _dd_current_tag_names = [
-                    tag_id_to_name[tid]
-                    for tid in get_trade_tag_ids(_dd_id)
-                    if tid in tag_id_to_name
-                ]
-                with st.form(f"quick_edit_{_dd_id}", clear_on_submit=False):
-                    qe1, qe2, qe3 = st.columns(3)
-                    _qe_entry_date = qe1.date_input(
-                        "Entry Date",
-                        value=pd.to_datetime(_dd_row["entry_date"]).date()
-                              if _dd_row.get("entry_date") and not pd.isna(_dd_row["entry_date"]) else None,
-                        key=f"qe_ed_{_dd_id}",
-                    )
-                    _qe_ticker = qe2.text_input("Ticker", value=str(_dd_row.get("ticker") or ""),
-                                                key=f"qe_tk_{_dd_id}")
-                    _qe_qty = qe3.number_input("Quantity", min_value=0.0, step=1.0, format="%.4f",
-                                               value=float(_dd_row["quantity"]) if _dd_row.get("quantity") else None,
-                                               key=f"qe_qty_{_dd_id}")
-                    qe4, qe5, qe6 = st.columns(3)
-                    _qe_entry_price = qe4.number_input("Entry Price", min_value=0.0, step=0.01, format="%.4f",
-                                                        value=float(_dd_row["entry_price"]) if _dd_row.get("entry_price") else None,
-                                                        key=f"qe_ep_{_dd_id}")
-                    _qe_exit_date = qe5.date_input(
-                        "Exit Date",
-                        value=pd.to_datetime(_dd_row["exit_date"]).date()
-                              if _dd_row.get("exit_date") and not pd.isna(_dd_row["exit_date"]) else None,
-                        key=f"qe_xd_{_dd_id}",
-                    )
-                    _qe_exit_price = qe6.number_input("Exit Price", min_value=0.0, step=0.01, format="%.4f",
-                                                       value=float(_dd_row["exit_price"])
-                                                             if _dd_row.get("exit_price") and not pd.isna(_dd_row["exit_price"]) else None,
-                                                       key=f"qe_xp_{_dd_id}")
-                    _qe_sel_tag_names = st.multiselect(
-                        "Tags",
-                        options=list(tag_name_to_id.keys()),
-                        default=_dd_current_tag_names,
-                        key=f"qe_tags_{_dd_id}",
-                        placeholder="Add tags…",
-                    )
-                    if st.form_submit_button("💾  Save Quick Edit", width='stretch'):
-                        _qe_tag_ids = [tag_name_to_id[n] for n in _qe_sel_tag_names if n in tag_name_to_id]
-                        _qe_cs = float(_dd_row["current_stop"]) if _dd_row.get("current_stop") and not pd.isna(_dd_row.get("current_stop", float("nan"))) else None
-                        update_trade(
-                            _dd_id,
-                            _qe_exit_date,
-                            float(_qe_exit_price) if _qe_exit_price else None,
-                            _dd_row.get("notes") or None,
-                            _qe_cs,
-                            bool(_dd_row.get("stop_enabled", 1)),
-                            _qe_tag_ids,
-                            entry_date=_qe_entry_date,
-                            ticker=_qe_ticker.strip() if _qe_ticker.strip() else None,
-                            quantity=float(_qe_qty) if _qe_qty else None,
-                            entry_price=float(_qe_entry_price) if _qe_entry_price else None,
-                        )
-                        st.toast("Trade updated.", icon="✅")
-                        st.rerun()
-                # Linked trading plan (read-only summary)
-                _dd_plan = _plan_by_id(
-                    _cached_load_trading_plans(st.session_state["_v_plans"]),
-                    _dd_row.get("plan_id"),
+            if not _positions_view:
+                # Resolve pending selection changes BEFORE the widget is instantiated.
+                if st.session_state.pop("_reset_table_sel", False):
+                    st.session_state["trade_table"] = {"selection": {"rows": [], "columns": []}}
+                if st.session_state.pop("_select_all_pending", False):
+                    st.session_state["trade_table"] = {"selection": {"rows": list(range(len(display))), "columns": []}}
+
+                event = st.dataframe(styled, width='stretch', hide_index=True,
+                                     on_select="rerun", selection_mode="multi-row",
+                                     key="trade_table")
+
+                selected_rows = event.selection.rows
+
+                valid_rows = [i for i in selected_rows if i < len(display)]
+                valid_non_group_rows = [i for i in valid_rows if i not in _group_row_ids and i < len(filtered)]
+
+                def _resolve_ids(indices):
+                    ids = []
+                    for i in indices:
+                        if i in _group_row_ids:
+                            ids.extend(int(x) for x in _group_row_ids[i])
+                        elif i < len(filtered):
+                            ids.append(int(filtered.iloc[i]["id"]))
+                    return ids
+
+                if valid_rows:
+                    st.session_state["_bulk_sel_ids"] = _resolve_ids(valid_rows)
+                else:
+                    st.session_state.pop("_bulk_sel_ids", None)
+
+                _cap_c1, _cap_c2, _cap_c3 = st.columns([4, 1, 1])
+                _cap_c1.caption(
+                    f"{len(filtered)} trade{'s' if len(filtered) != 1 else ''}"
+                    + (f"  ·  {len(selected_rows)} selected" if selected_rows else "")
                 )
-                if _dd_plan:
-                    st.info(_plan_summary_md(_dd_plan))
-                _dd_lots = load_trade_lots(_dd_id)
-                _dd_divs = load_trade_dividends(_dd_id)
-                _lot_col, _div_col = st.columns(2)
-                with _lot_col:
-                    st.markdown("**Tax Lots**")
-                    if _dd_lots:
-                        _lots_df = pd.DataFrame(
-                            _dd_lots,
-                            columns=["id", "trade_id", "date", "quantity", "price", "lot_type", "notes"]
+                if _cap_c2.button("☑  Select All", key="select_all_btn", help="Select all visible rows"):
+                    st.session_state["_select_all_pending"] = True
+                    st.rerun()
+                if selected_rows and _cap_c3.button("✕  Clear", key="clear_sel_btn", help="Clear selection"):
+                    st.session_state["_reset_table_sel"] = True
+                    st.rerun()
+
+                # Inline drill-down: quick-edit + lots + dividends when a single non-group row is selected
+                if len(valid_non_group_rows) == 1:
+                    _dd_id  = int(filtered.iloc[valid_non_group_rows[0]]["id"])
+                    _dd_row = filtered.iloc[valid_non_group_rows[0]]
+                    _dd_current_tag_names = [
+                        tag_id_to_name[tid]
+                        for tid in get_trade_tag_ids(_dd_id)
+                        if tid in tag_id_to_name
+                    ]
+                    with st.form(f"quick_edit_{_dd_id}", clear_on_submit=False):
+                        qe1, qe2, qe3 = st.columns(3)
+                        _qe_entry_date = qe1.date_input(
+                            "Entry Date",
+                            value=pd.to_datetime(_dd_row["entry_date"]).date()
+                                  if _dd_row.get("entry_date") and not pd.isna(_dd_row["entry_date"]) else None,
+                            key=f"qe_ed_{_dd_id}",
                         )
-                        st.dataframe(
-                            _lots_df[["date", "lot_type", "quantity", "price"]].rename(
-                                columns={"lot_type": "Type", "quantity": "Qty", "price": "Price"}
-                            ),
-                            width='stretch', hide_index=True
+                        _qe_ticker = qe2.text_input("Ticker", value=str(_dd_row.get("ticker") or ""),
+                                                    key=f"qe_tk_{_dd_id}")
+                        _qe_qty = qe3.number_input("Quantity", min_value=0.0, step=1.0, format="%.4f",
+                                                   value=float(_dd_row["quantity"]) if _dd_row.get("quantity") else None,
+                                                   key=f"qe_qty_{_dd_id}")
+                        qe4, qe5, qe6 = st.columns(3)
+                        _qe_entry_price = qe4.number_input("Entry Price", min_value=0.0, step=0.01, format="%.4f",
+                                                            value=float(_dd_row["entry_price"]) if _dd_row.get("entry_price") else None,
+                                                            key=f"qe_ep_{_dd_id}")
+                        _qe_exit_date = qe5.date_input(
+                            "Exit Date",
+                            value=pd.to_datetime(_dd_row["exit_date"]).date()
+                                  if _dd_row.get("exit_date") and not pd.isna(_dd_row["exit_date"]) else None,
+                            key=f"qe_xd_{_dd_id}",
                         )
-                    else:
-                        st.caption("No lots recorded.")
-                with _div_col:
-                    st.markdown("**Dividends**")
-                    if _dd_divs:
-                        _divs_df = pd.DataFrame(
-                            _dd_divs,
-                            columns=["id", "trade_id", "ex_date", "amount_per_share",
-                                     "quantity", "total_amount", "notes"]
+                        _qe_exit_price = qe6.number_input("Exit Price", min_value=0.0, step=0.01, format="%.4f",
+                                                           value=float(_dd_row["exit_price"])
+                                                                 if _dd_row.get("exit_price") and not pd.isna(_dd_row["exit_price"]) else None,
+                                                           key=f"qe_xp_{_dd_id}")
+                        _qe_sel_tag_names = st.multiselect(
+                            "Tags",
+                            options=list(tag_name_to_id.keys()),
+                            default=_dd_current_tag_names,
+                            key=f"qe_tags_{_dd_id}",
+                            placeholder="Add tags…",
                         )
-                        st.dataframe(
-                            _divs_df[["ex_date", "amount_per_share", "quantity", "total_amount"]].rename(
-                                columns={"ex_date": "Ex-Date", "amount_per_share": "$/Share",
-                                         "quantity": "Qty", "total_amount": "Total"}
-                            ),
-                            width='stretch', hide_index=True
-                        )
-                    else:
-                        st.caption("No dividends recorded.")
+                        if st.form_submit_button("💾  Save Quick Edit", width='stretch'):
+                            _qe_tag_ids = [tag_name_to_id[n] for n in _qe_sel_tag_names if n in tag_name_to_id]
+                            _qe_cs = float(_dd_row["current_stop"]) if _dd_row.get("current_stop") and not pd.isna(_dd_row.get("current_stop", float("nan"))) else None
+                            update_trade(
+                                _dd_id,
+                                _qe_exit_date,
+                                float(_qe_exit_price) if _qe_exit_price else None,
+                                _dd_row.get("notes") or None,
+                                _qe_cs,
+                                bool(_dd_row.get("stop_enabled", 1)),
+                                _qe_tag_ids,
+                                entry_date=_qe_entry_date,
+                                ticker=_qe_ticker.strip() if _qe_ticker.strip() else None,
+                                quantity=float(_qe_qty) if _qe_qty else None,
+                                entry_price=float(_qe_entry_price) if _qe_entry_price else None,
+                            )
+                            st.toast("Trade updated.", icon="✅")
+                            st.rerun()
+                    # Linked trading plan (read-only summary)
+                    _dd_plan = _plan_by_id(
+                        _cached_load_trading_plans(st.session_state["_v_plans"]),
+                        _dd_row.get("plan_id"),
+                    )
+                    if _dd_plan:
+                        st.info(_plan_summary_md(_dd_plan))
+                    _dd_lots = load_trade_lots(_dd_id)
+                    _dd_divs = load_trade_dividends(_dd_id)
+                    _lot_col, _div_col = st.columns(2)
+                    with _lot_col:
+                        st.markdown("**Tax Lots**")
+                        if _dd_lots:
+                            _lots_df = pd.DataFrame(
+                                _dd_lots,
+                                columns=["id", "trade_id", "date", "quantity", "price", "lot_type", "notes"]
+                            )
+                            st.dataframe(
+                                _lots_df[["date", "lot_type", "quantity", "price"]].rename(
+                                    columns={"lot_type": "Type", "quantity": "Qty", "price": "Price"}
+                                ),
+                                width='stretch', hide_index=True
+                            )
+                        else:
+                            st.caption("No lots recorded.")
+                    with _div_col:
+                        st.markdown("**Dividends**")
+                        if _dd_divs:
+                            _divs_df = pd.DataFrame(
+                                _dd_divs,
+                                columns=["id", "trade_id", "ex_date", "amount_per_share",
+                                         "quantity", "total_amount", "notes"]
+                            )
+                            st.dataframe(
+                                _divs_df[["ex_date", "amount_per_share", "quantity", "total_amount"]].rename(
+                                    columns={"ex_date": "Ex-Date", "amount_per_share": "$/Share",
+                                             "quantity": "Qty", "total_amount": "Total"}
+                                ),
+                                width='stretch', hide_index=True
+                            )
+                        else:
+                            st.caption("No dividends recorded.")
 
         # ── Bulk Actions ───────────────────────────────────────────────────────
 
