@@ -129,8 +129,14 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
     "$UV_BIN" venv --python 3.12 "$VENV_DIR" >>"$LOG" 2>&1 \
         || fail "Could not create a Python environment."
 
-    # Install Trade Log dependencies
+    # Install Trade Log dependencies.
+    # --only-binary=cryptography forces uv to use cryptography's prebuilt wheel
+    # instead of compiling it from source. Building cryptography needs a Rust
+    # toolchain + OpenSSL, which end-user Macs don't have — without this, the
+    # install fails with a confusing build error (surfaced as "check your
+    # internet connection"). Every Mac we support has a matching wheel.
     "$UV_BIN" pip install -r "$RESOURCES_DIR/requirements.txt" \
+        --only-binary=cryptography \
         --python "$VENV_DIR/bin/python" >>"$LOG" 2>&1 \
         || { rm -rf "$VENV_DIR"; fail "Could not install dependencies.\n\nPlease check your internet connection and try again."; }
 

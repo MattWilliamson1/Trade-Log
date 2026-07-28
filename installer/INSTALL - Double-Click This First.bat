@@ -208,7 +208,10 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     pause & exit /b 1
 )
 
-"%UV%" pip install -r "%~dp0requirements.txt" --python "%~dp0.venv\Scripts\python.exe"
+:: --only-binary=cryptography forces uv to use cryptography's prebuilt wheel
+:: instead of compiling from source (which needs Rust + OpenSSL that end-user
+:: machines don't have). Prevents a confusing build failure on install.
+"%UV%" pip install -r "%~dp0requirements.txt" --only-binary=cryptography --python "%~dp0.venv\Scripts\python.exe"
 if errorlevel 1 (
     echo.
     echo  [!] Package installation failed.
