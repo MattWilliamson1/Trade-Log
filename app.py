@@ -59,7 +59,7 @@ DEFAULT_SETTINGS = {
     "options_commission":   "0.65",  # per contract
     "futures_commission":   "2.25",  # per contract
     # Currency
-    "native_currency":      "USD",   # USD | AUD | CAD | EUR
+    "native_currency":      "USD",   # see NATIVE_CURRENCIES
     "currency_mode":        "0",     # 0 = USD only, 1 = show native currency
     # Row color coding
     "row_color_enabled":    "0",
@@ -876,12 +876,57 @@ def get_live_data(symbols: tuple) -> dict:
     return _yf_get_live_data(yf_symbols)
 
 
-_FX_PAIRS = {
-    "AUD": "AUDUSD=X",
-    "CAD": "CADUSD=X",
-    "EUR": "EURUSD=X",
-    "USD": None,
+# Every native currency the app supports, in one place. "symbol" prefixes the
+# "(Native)" columns; "pair" is the Yahoo ticker quoting USD per 1 unit (None for
+# USD itself). Adding a currency = adding one row here — the Settings dropdown,
+# the column symbols, and both FX lookups all read from this.
+NATIVE_CURRENCIES: dict[str, dict] = {
+    "USD": {"symbol": "$",  "pair": None},
+    "AUD": {"symbol": "A$", "pair": "AUDUSD=X"},
+    "CAD": {"symbol": "C$", "pair": "CADUSD=X"},
+    "EUR": {"symbol": "€",  "pair": "EURUSD=X"},
+    "GBP": {"symbol": "£",  "pair": "GBPUSD=X"},
 }
+_FX_PAIRS = {k: v["pair"] for k, v in NATIVE_CURRENCIES.items()}
+
+
+def currency_symbol(code: str) -> str:
+    """Display symbol for a currency code, falling back to the code itself."""
+    return NATIVE_CURRENCIES.get((code or "").upper(), {}).get("symbol") or code
+
+
+def trade_currency(row) -> str:
+    """The currency a trade's prices were typed in. 'USD' when unset or unknown.
+
+    Prices are always *stored* in USD; this is the denomination the user
+    actually entered, kept so the trade can be shown (and edited) in its own
+    money and so the exit side converts with the same currency as the entry.
+    """
+    try:
+        v = row.get("native_currency")
+    except AttributeError:
+        v = None
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "USD"
+    code = str(v).strip().upper()
+    return code if code in NATIVE_CURRENCIES else "USD"
+
+
+# FX rates are quoted USD-per-1-native (see NATIVE_CURRENCIES), so native → USD
+# multiplies and USD → native divides. Everything that crosses the storage
+# boundary goes through these two so the direction can never drift apart.
+def native_to_usd(amount, fx):
+    """Price typed in the trade's currency → the USD value we store."""
+    if amount is None or not fx:
+        return None
+    return float(amount) * float(fx)
+
+
+def usd_to_native(amount, fx):
+    """Stored USD → the trade's own currency, for display and editing."""
+    if amount is None or not fx:
+        return None
+    return float(amount) / float(fx)
 
 @st.cache_data(ttl=3600)
 def get_fx_rate(native_currency: str) -> float:
@@ -1676,6 +1721,7 @@ def load_trades() -> pd.DataFrame:
                 t.chart_notes, t.earnings_date,
                 t.commission, t.underlying_price_at_entry,
                 t.account_name, t.roll_group, t.exchange, t.plan_id,
+                t.native_currency, t.fx_rate_entry, t.fx_rate_exit,
                 GROUP_CONCAT(tg.name, ', ') AS tags
             FROM trades t
             LEFT JOIN trade_tags tt ON tt.trade_id = t.id
@@ -1881,7 +1927,7 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
             roll_group or None,
             native_currency or "USD",
             float(fx_rate_entry) if fx_rate_entry else 1.0,
-            float(fx_rate_exit)  if fx_rate_exit  else 1.0,
+            float(fx_rate_exit)  if fx_rate_exit is not None else None,
             trail_type or "fixed",
             float(trail_amount) if trail_amount else None,
             exchange or "",
@@ -1908,7 +1954,8 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
                  opening_stop=None, instrument_type=None, expiration=None,
                  strike=None, option_type=None, multiplier=None, side=None,
                  commission=None, account_name=None,
-                 trail_type=None, trail_amount=None, plan_id=_UNCHANGED):
+                 trail_type=None, trail_amount=None, plan_id=_UNCHANGED,
+                 native_currency=None, fx_rate_entry=None, fx_rate_exit=_UNCHANGED):
     with get_connection() as conn:
         # Build the update dynamically — only overwrite fields that were passed
         sets = [
@@ -1969,6 +2016,17 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
         if plan_id is not _UNCHANGED:
             sets.append("plan_id=?")
             vals.append(int(plan_id) if plan_id else None)
+        if native_currency is not None:
+            sets.append("native_currency=?")
+            vals.append(str(native_currency).upper())
+        if fx_rate_entry is not None:
+            sets.append("fx_rate_entry=?")
+            vals.append(float(fx_rate_entry))
+        # Sentinel-guarded: clearing the exit date must be able to write NULL
+        # back, which a plain `is not None` check could never express.
+        if fx_rate_exit is not _UNCHANGED:
+            sets.append("fx_rate_exit=?")
+            vals.append(float(fx_rate_exit) if fx_rate_exit else None)
         vals.append(trade_id)
         conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", vals)
         conn.execute("DELETE FROM trade_tags WHERE trade_id=?", (trade_id,))
@@ -2138,7 +2196,8 @@ def update_position(trade_id: int, add_qty: float, add_price: float, add_date: s
     return new_qty, new_avg
 
 
-def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_date):
+def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_date,
+                       fx_rate_exit=None):
     """Record selling part of an open position.
 
     Each call logs an "exit" lot and reduces the position's remaining open
@@ -2147,6 +2206,10 @@ def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_d
     average of all exit prices, and its quantity is restored to the full amount
     held so realised P&L (exit − entry) × quantity is computed over the whole
     position. Returns the remaining open quantity (0.0 when fully closed).
+
+    ``exit_price`` is USD, like every stored price — the caller converts from
+    the trade's own currency first and passes the rate it used as
+    ``fx_rate_exit``, which is stamped onto the trade when it fully closes.
     """
     exit_date_str = (
         exit_date.isoformat() if hasattr(exit_date, "isoformat") else (str(exit_date) if exit_date else None)
@@ -2167,10 +2230,17 @@ def partial_exit_trade(trade_id: int, exit_qty: float, exit_price: float, exit_d
             wavg_exit = (
                 sum(l["quantity"] * l["price"] for l in exits) / sold if sold else float(exit_price)
             )
-            conn.execute(
-                "UPDATE trades SET exit_date=?, exit_price=?, quantity=? WHERE id=?",
-                (exit_date_str, wavg_exit, sold, trade_id),
-            )
+            if fx_rate_exit:
+                conn.execute(
+                    "UPDATE trades SET exit_date=?, exit_price=?, quantity=?, fx_rate_exit=? "
+                    "WHERE id=?",
+                    (exit_date_str, wavg_exit, sold, float(fx_rate_exit), trade_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE trades SET exit_date=?, exit_price=?, quantity=? WHERE id=?",
+                    (exit_date_str, wavg_exit, sold, trade_id),
+                )
             return 0.0
         # Still open — just shrink the live position; no exit price yet.
         conn.execute(
@@ -2394,6 +2464,72 @@ def import_parsed_trades(trade_list: list[dict]) -> dict:
         except Exception as e:
             errors.append(f"{td.get('ticker','?')}: {e}")
     return {"imported": imported, "closed": closed, "dupes": dupes, "errors": errors}
+
+
+# Columns that are internal plumbing rather than something worth eyeballing in
+# an import preview. Kept in one place so every broker preview hides the same set.
+_IMPORT_PREVIEW_HIDE_COLS = [
+    "notes", "stop_enabled", "opening_stop", "current_stop",
+    "tag_ids", "leg_group", "leg_label",
+]
+
+
+def select_trades_to_import(trades: list[dict], key: str,
+                            hide_cols: list[str] | None = None) -> list[dict]:
+    """Render an import preview with a tick box per row; return the ticked trades.
+
+    Everything except the "Import" column is read-only, so the table still reads
+    like the old preview — you just untick anything you don't want. All rows
+    start ticked, so the default behaviour is unchanged.
+
+    The editor key folds in a fingerprint of the rows, so a fresh fetch starts
+    with a clean slate instead of inheriting tick marks from the previous one.
+    """
+    if not trades:
+        return []
+
+    hide = list(_IMPORT_PREVIEW_HIDE_COLS if hide_cols is None else hide_cols)
+    sig = abs(hash(tuple(
+        (str(t.get("ticker", "")), str(t.get("entry_date", "")),
+         str(t.get("quantity", "")), str(t.get("entry_price", "")),
+         str(t.get("exit_date", "")), str(t.get("exit_price", "")))
+        for t in trades
+    ))) % (10 ** 10)
+    ed_key   = f"{key}__{len(trades)}_{sig}"
+    dflt_key = f"{ed_key}__default"
+    default  = st.session_state.get(dflt_key, True)
+
+    _bc1, _bc2, _bc3 = st.columns([1, 1, 4])
+    if _bc1.button("Select all", key=f"{ed_key}__all", width='stretch'):
+        st.session_state[dflt_key] = True
+        st.session_state.pop(ed_key, None)      # drop stale edits so the default applies
+        st.rerun()
+    if _bc2.button("Select none", key=f"{ed_key}__none", width='stretch'):
+        st.session_state[dflt_key] = False
+        st.session_state.pop(ed_key, None)
+        st.rerun()
+
+    df = pd.DataFrame(trades).drop(columns=hide, errors="ignore")
+    df.insert(0, "Import", default)
+
+    edited = st.data_editor(
+        df,
+        width='stretch',
+        hide_index=True,
+        disabled=[c for c in df.columns if c != "Import"],
+        column_config={
+            "Import": st.column_config.CheckboxColumn(
+                "Import", help="Untick any trade you don't want to bring in.",
+                default=default, pinned=True, width="small",
+            ),
+        },
+        key=ed_key,
+    )
+
+    picked = [t for t, keep in zip(trades, edited["Import"].fillna(False).astype(bool))
+              if keep]
+    _bc3.caption(f"**{len(picked)}** of {len(trades)} selected.")
+    return picked
 
 _raw_add_account = add_account
 def add_account(name: str):
@@ -3766,7 +3902,7 @@ TOUR_STEPS = [
         "title": "Add any extra currencies",
         "body": (
             "Trading in a non-USD account? Open **Multi-Currency**, switch it on, and "
-            "pick your **native currency** (AUD, CAD, EUR).\n\n"
+            "pick your **native currency** (AUD, CAD, EUR, GBP).\n\n"
             "Trade Log will then show P&L converted to your currency alongside the USD "
             "figures. USD-only? Skip ahead."
         ),
@@ -4108,11 +4244,26 @@ if page == "📋  Trading Log":
                 s_ticker = _at_ticker
                 with st.container(border=True, key="add_need_fields"):
                     st.caption("● Required to log a trade")
-                    c1, c2, c3 = st.columns(3)
+                    c1, c2, c3, c4 = st.columns([1, 1, 1, 0.75])
                     entry_date  = c1.date_input("Entry Date *")
                     quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.4f", value=None,
                                                   help="Fractional shares are supported (e.g. 2.5).")
                     entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
+                    add_ccy = c4.selectbox(
+                        "Currency",
+                        options=list(NATIVE_CURRENCIES),
+                        format_func=lambda c: f"{currency_symbol(c)}  {c}",
+                        key="add_stock_ccy",
+                        help=(
+                            "The currency you are typing prices in — entry, stop, and exit. "
+                            "Anything other than USD is converted at that date's FX rate and "
+                            "stored in USD, so every stat stays comparable across currencies."
+                        ),
+                    )
+                    st.caption(
+                        "Prices below use the selected currency; they are stored in USD "
+                        "at the entry- and exit-date FX rate."
+                    )
                     st.markdown("**Stop Loss**")
                     _trailing_en = st.session_state.get("add_trailing_en", False)
                     sc1, sc2 = st.columns([1, 2])
@@ -4246,18 +4397,33 @@ if page == "📋  Trading Log":
                         try:
                             t       = s_ticker.upper().strip()
                             sel_ids = [tag_name_to_id[n] for n in sel_tag_names]
-                            _cur_nat    = settings.get("native_currency", "USD")
-                            _cur_mode   = settings.get("currency_mode", "0") == "1"
-                            _fx_entry   = get_fx_rate_at_date(_cur_nat, str(entry_date)) if _cur_mode and _cur_nat != "USD" else 1.0
-                            _fx_exit    = get_fx_rate_at_date(_cur_nat, str(exit_date))  if _cur_mode and _cur_nat != "USD" and exit_date else 1.0
+                            # The picker owns the conversion: prices were typed in
+                            # _cur_nat, so multiply by that date's USD-per-native rate
+                            # to get the USD we store. USD trades keep fx = 1.0 and
+                            # are byte-for-byte what they were before this existed.
+                            _cur_nat  = add_ccy or "USD"
+                            _fx_entry = (get_fx_rate_at_date(_cur_nat, str(entry_date))
+                                         if _cur_nat != "USD" else 1.0)
+                            # No exit date yet → leave the exit rate NULL rather than
+                            # 1.0, so a still-open trade can't be mistaken for one
+                            # that converted at parity. The close paths fill it in.
+                            if _cur_nat == "USD":
+                                _fx_exit = 1.0
+                            elif exit_date:
+                                _fx_exit = get_fx_rate_at_date(_cur_nat, str(exit_date))
+                            else:
+                                _fx_exit = None
+                            # An exit price with no exit date has no date to price the
+                            # conversion off; fall back to the entry rate.
+                            _fx_exit_eff = _fx_exit or _fx_entry
                             new_id  = add_trade(
                                 entry_date, t,
-                                float(quantity), float(entry_price),
+                                float(quantity), native_to_usd(entry_price, _fx_entry),
                                 exit_date,
-                                float(exit_price) if exit_price else None,
+                                native_to_usd(exit_price, _fx_exit_eff) if exit_price else None,
                                 notes or None,
                                 stop_enabled,
-                                float(opening_stop) if opening_stop else None,
+                                native_to_usd(opening_stop, _fx_entry) if opening_stop else None,
                                 sel_ids,
                                 instrument_type="stock",
                                 commission=float(stock_commission) if stock_commission else 0.0,
@@ -4272,11 +4438,22 @@ if page == "📋  Trading Log":
                             )
                             for f in (uploaded_files or []):
                                 save_attachment(new_id, f)
+                            if _cur_nat == "USD":
+                                _conf_entry = fmt_price(entry_price)
+                            else:
+                                # No "$" anywhere in this line: st.markdown treats
+                                # a second bare $ as the start of a LaTeX span and
+                                # eats everything between the two.
+                                _conf_entry = (
+                                    f"{currency_symbol(_cur_nat)}{float(entry_price):,.2f}"
+                                    f"  →  {native_to_usd(entry_price, _fx_entry):,.2f} USD"
+                                    f"  (rate {_fx_entry:.4f})"
+                                )
                             st.session_state["_trade_added"] = {
                                 "title": f"{t} added to your log.",
                                 "lines": [
                                     f"- **Quantity:** {fmt_qty(quantity)}",
-                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, euro_dates)}",
+                                    f"- **Entry:** {_conf_entry} on {fmt_date(entry_date, euro_dates)}",
                                 ],
                             }
                             st.rerun()
@@ -4488,8 +4665,15 @@ if page == "📋  Trading Log":
                             f"<span style='color:#2ecc71;font-weight:700'>${_ep_live:,.2f}</span></div>",
                             unsafe_allow_html=True,
                         )
+                ep_ccy   = trade_currency(ep_row)
                 ep_qty   = st.number_input(f"Shares to Exit (max {fmt_qty(ep_max)})", min_value=0.0, max_value=ep_max, step=1.0, format="%.4f", value=None, key="ep_qty")
-                ep_price = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None, key="ep_price")
+                ep_price = st.number_input(
+                    f"Exit Price ({currency_symbol(ep_ccy)} {ep_ccy})",
+                    min_value=0.0, step=0.01, format="%.2f", value=None, key="ep_price",
+                    help=("This trade was entered in " + ep_ccy + ". Type the exit in the "
+                          "same currency — it is converted at the exit date's rate.")
+                          if ep_ccy != "USD" else None,
+                )
                 ep_date  = st.date_input("Exit Date", key="ep_date")
                 if st.button("Record Exit", key="ep_submit"):
                     if not ep_qty or not ep_price:
@@ -4497,13 +4681,23 @@ if page == "📋  Trading Log":
                     elif ep_qty > ep_max:
                         st.error(f"Cannot exit more than {fmt_qty(ep_max)} shares.")
                     else:
-                        _remaining = partial_exit_trade(ep_id, ep_qty, ep_price, ep_date)
+                        # Exit side of the conversion: price the sale at the exit
+                        # date's rate and hand that rate down so it lands on the
+                        # trade when the last share goes out.
+                        _ep_fx = (get_fx_rate_at_date(ep_ccy, str(ep_date))
+                                  if ep_ccy != "USD" else 1.0)
+                        _remaining = partial_exit_trade(
+                            ep_id, ep_qty, native_to_usd(ep_price, _ep_fx), ep_date,
+                            fx_rate_exit=_ep_fx,
+                        )
                         _bust("_v_trades")
+                        _ep_shown = (fmt_price(ep_price) if ep_ccy == "USD"
+                                     else f"{currency_symbol(ep_ccy)}{float(ep_price):,.2f}")
                         if _remaining > 0:
-                            st.success(f"Exited {fmt_qty(ep_qty)} @ {fmt_price(ep_price)} · "
+                            st.success(f"Exited {fmt_qty(ep_qty)} @ {_ep_shown} · "
                                        f"{fmt_qty(_remaining)} still open")
                         else:
-                            st.success(f"Exited {fmt_qty(ep_qty)} @ {fmt_price(ep_price)} · position fully closed")
+                            st.success(f"Exited {fmt_qty(ep_qty)} @ {_ep_shown} · position fully closed")
                         st.rerun()
 
     # ── Dividend Adjustment ───────────────────────────────────────────────────
@@ -5180,37 +5374,60 @@ if page == "📋  Trading Log":
             display["P&L"]            = display["_pnl_num"].apply(fmt_pnl)
 
             # ── Native currency columns (only when currency mode is on) ────────────
-            _fx_mode     = settings.get("currency_mode", "0") == "1"
-            _fx_native   = settings.get("native_currency", "USD")
-            if _fx_mode and _fx_native != "USD":
-                _live_fx = get_fx_rate(_fx_native)
-                _cur_sym = {"AUD": "A$", "CAD": "C$", "EUR": "€"}.get(_fx_native, _fx_native)
+            # Each trade stores the currency its prices were typed in, so a mixed
+            # book renders every row in its own money rather than forcing one
+            # global currency onto all of them. USD rows show "—" — there is
+            # nothing to convert.
+            _fx_mode = settings.get("currency_mode", "0") == "1"
+            if _fx_mode:
+                _ccys_held = sorted({
+                    c for c in (filtered["native_currency"].dropna().astype(str).str.upper().unique()
+                                if "native_currency" in filtered.columns else [])
+                    if c in NATIVE_CURRENCIES and c != "USD"
+                })
+                _live_fx_by_ccy = {c: get_fx_rate(c) for c in _ccys_held}
+
+                def _exit_fx(row, ccy):
+                    """Rate to value a closed row at: the one stamped when it closed,
+                    else today's — a trade closed before the exit side converted has
+                    no stamped rate, and today's beats silently reporting parity."""
+                    v = row.get("fx_rate_exit")
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return _live_fx_by_ccy.get(ccy)
+                    return float(v)
 
                 def _native_pnl(row):
+                    ccy = trade_currency(row)
+                    if ccy == "USD":
+                        return "—"
                     pnl_usd = row.get("_pnl_num")
                     if pnl_usd is None or pd.isna(pnl_usd):
                         return "—"
-                    fx = _live_fx if _is_open(row) else float(row.get("fx_rate_exit") or _live_fx or 1.0)
-                    if not fx or fx == 0:
-                        return "—"
-                    val = pnl_usd / fx
-                    return f"{_cur_sym}{val:+,.2f}"
+                    fx  = _live_fx_by_ccy.get(ccy) if _is_open(row) else _exit_fx(row, ccy)
+                    val = usd_to_native(pnl_usd, fx)
+                    return f"{currency_symbol(ccy)}{val:+,.2f}" if val is not None else "—"
 
                 def _native_entry(row):
-                    ep, qty = row.get("entry_price"), row.get("quantity")
-                    fx = float(row.get("fx_rate_entry") or 1.0)
-                    if not ep or not qty or not fx:
+                    ccy = trade_currency(row)
+                    if ccy == "USD":
                         return "—"
-                    return f"{_cur_sym}{float(ep)*float(qty)/fx:,.2f}"
+                    ep, qty = row.get("entry_price"), row.get("quantity")
+                    if not ep or not qty:
+                        return "—"
+                    mult = float(row.get("multiplier") or 1.0)
+                    val  = usd_to_native(float(ep) * float(qty) * mult, row.get("fx_rate_entry"))
+                    return f"{currency_symbol(ccy)}{val:,.2f}" if val is not None else "—"
 
                 def _native_exit(row):
-                    if _is_open(row):
+                    ccy = trade_currency(row)
+                    if ccy == "USD" or _is_open(row):
                         return "—"
                     xp, qty = row.get("exit_price"), row.get("quantity")
-                    fx = float(row.get("fx_rate_exit") or 1.0)
-                    if not xp or not qty or not fx:
+                    if not xp or not qty:
                         return "—"
-                    return f"{_cur_sym}{float(xp)*float(qty)/fx:,.2f}"
+                    mult = float(row.get("multiplier") or 1.0)
+                    val  = usd_to_native(float(xp) * float(qty) * mult, _exit_fx(row, ccy))
+                    return f"{currency_symbol(ccy)}{val:,.2f}" if val is not None else "—"
 
                 display["P&L (Native)"]    = filtered.apply(_native_pnl,   axis=1)
                 display["Entry (Native)"]  = filtered.apply(_native_entry,  axis=1)
@@ -6731,20 +6948,47 @@ if page == "📋  Trading Log":
             current_tag_ids   = get_trade_tag_ids(trade_id)
             current_tag_names = [tag_id_to_name[i] for i in current_tag_ids if i in tag_id_to_name]
 
+            # Prices are stored in USD but were typed in the trade's own currency —
+            # show them back in that currency so an edit round-trips to the same
+            # number the user originally entered.
+            _ed_ccy0 = trade_currency(row)
+            _ed_fx_e = float(row.get("fx_rate_entry") or 1.0)
+            _ed_fx_x_raw = row.get("fx_rate_exit")
+            _ed_fx_x = (float(_ed_fx_x_raw)
+                        if _ed_fx_x_raw and not pd.isna(_ed_fx_x_raw) else _ed_fx_e)
+            _ed_entry_date0 = (pd.to_datetime(row["entry_date"]).date()
+                               if row["entry_date"] and not pd.isna(row["entry_date"]) else None)
+
+            def _ed_show(v, fx):
+                """Stored USD -> the number to put in the input box."""
+                if v is None or pd.isna(v):
+                    return None
+                return float(usd_to_native(v, fx) if _ed_ccy0 != "USD" else v)
+
             with st.form("edit_trade"):
                 st.markdown("**Core Fields**")
-                ee1, ee2, ee3, ee4 = st.columns(4)
-                edit_entry_date = ee1.date_input(
-                    "Entry Date",
-                    value=pd.to_datetime(row["entry_date"]).date()
-                          if row["entry_date"] and not pd.isna(row["entry_date"]) else None,
-                )
+                ee1, ee2, ee3, ee4, ee5 = st.columns([1, 1, 1, 1, 0.75])
+                edit_entry_date = ee1.date_input("Entry Date", value=_ed_entry_date0)
                 edit_ticker = ee2.text_input("Ticker", value=str(row["ticker"] or ""))
                 edit_qty    = ee3.number_input("Quantity", min_value=0.0, step=1.0, format="%.4f",
                                                value=float(row["quantity"]) if row["quantity"] else None)
                 edit_entry_price = ee4.number_input(
                     "Entry Price", min_value=0.0, step=0.01, format="%.4f",
-                    value=float(row["entry_price"]) if row["entry_price"] else None,
+                    value=_ed_show(row["entry_price"], _ed_fx_e),
+                )
+                _ed_ccy_opts = list(NATIVE_CURRENCIES)
+                edit_ccy = ee5.selectbox(
+                    "Currency",
+                    options=_ed_ccy_opts,
+                    index=_ed_ccy_opts.index(_ed_ccy0) if _ed_ccy0 in _ed_ccy_opts else 0,
+                    format_func=lambda c: f"{currency_symbol(c)}  {c}",
+                    # Deliberately unkeyed. A keyed widget's session_state wins over
+                    # `index` on every rerun, so switching to another trade would
+                    # keep showing the previous trade's currency — and then save the
+                    # new trade's prices under it. The other Core Fields inputs are
+                    # unkeyed for the same reason.
+                    help=("The currency the prices on this form are in. Changing it "
+                          "re-prices the trade at that currency's rate for these dates."),
                 )
                 ec1, ec2 = st.columns(2)
                 edit_exit_date = ec1.date_input(
@@ -6754,8 +6998,13 @@ if page == "📋  Trading Log":
                 )
                 edit_exit_price = ec2.number_input(
                     "Exit Price", min_value=0.0, step=0.01, format="%.4f",
-                    value=float(row["exit_price"]) if row["exit_price"] else None,
+                    value=_ed_show(row["exit_price"], _ed_fx_x),
                 )
+                if _ed_ccy0 != "USD":
+                    st.caption(
+                        f"Prices shown in {_ed_ccy0}; stored in USD at "
+                        f"{_ed_fx_e:.4f} (entry)."
+                    )
 
                 # Account and commission
                 ea1, ea2, ea3 = st.columns(3)
@@ -6795,8 +7044,9 @@ if page == "📋  Trading Log":
                     st.markdown("**Stop Loss**")
                     es1, es2, es3, es4 = st.columns([1, 2, 2, 1])
                     edit_stop_en  = es1.checkbox("Enabled", value=bool(row["stop_enabled"]))
-                    opening_val   = float(row["opening_stop"]) if row["opening_stop"] else None
-                    current_val   = float(row["current_stop"]) if row["current_stop"] is not None else opening_val
+                    opening_val   = _ed_show(row["opening_stop"], _ed_fx_e) if row["opening_stop"] else None
+                    current_val   = (_ed_show(row["current_stop"], _ed_fx_e)
+                                     if row["current_stop"] is not None else opening_val)
                     edit_opening_stop = es2.number_input("Opening Stop", min_value=0.0, step=0.01,
                                                           format="%.4f", value=opening_val,
                                                           help="Initial stop set at entry.")
@@ -6880,16 +7130,43 @@ if page == "📋  Trading Log":
                         _edit_plan_id = None
                     else:
                         _edit_plan_id = int(_et_plans[_et_plan_opts.index(edit_plan_choice) - 1]["id"])
+                    # The entry rate is only re-looked-up when it could actually
+                    # have changed — currency or entry date. Re-fetching on every
+                    # save would let a slightly different quote drift the stored
+                    # USD entry price a little each time the form is submitted.
+                    _ed_ccy_new = edit_ccy or "USD"
+                    if _ed_ccy_new == "USD":
+                        _fx_e_new = 1.0
+                    elif _ed_ccy_new != _ed_ccy0 or edit_entry_date != _ed_entry_date0:
+                        _fx_e_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_entry_date))
+                    else:
+                        _fx_e_new = _ed_fx_e
+                    # The exit rate is always resolved from the exit date: this is
+                    # the side that used to be left unset, and the date is the only
+                    # thing that determines it. No exit date -> no rate.
+                    if not edit_exit_date:
+                        _fx_x_new = None
+                    elif _ed_ccy_new == "USD":
+                        _fx_x_new = 1.0
+                    else:
+                        _fx_x_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_exit_date))
+                    _fx_x_eff = _fx_x_new or _fx_e_new
+
                     update_trade(
                         trade_id,
-                        edit_exit_date, edit_exit_price,
-                        edit_notes, edit_current_stop, edit_stop_en, edit_tag_ids,
+                        edit_exit_date, native_to_usd(edit_exit_price, _fx_x_eff),
+                        edit_notes, native_to_usd(edit_current_stop, _fx_e_new),
+                        edit_stop_en, edit_tag_ids,
                         plan_id=_edit_plan_id,
                         entry_date=edit_entry_date,
                         ticker=edit_ticker if edit_ticker.strip() else None,
                         quantity=edit_qty,
-                        entry_price=edit_entry_price,
-                        opening_stop=edit_opening_stop if inst_type == "stock" else None,
+                        entry_price=native_to_usd(edit_entry_price, _fx_e_new),
+                        opening_stop=(native_to_usd(edit_opening_stop, _fx_e_new)
+                                      if inst_type == "stock" else None),
+                        native_currency=_ed_ccy_new,
+                        fx_rate_entry=_fx_e_new,
+                        fx_rate_exit=_fx_x_new,
                         expiration=edit_expiration,
                         strike=edit_strike,
                         option_type=edit_option_type,
@@ -9285,33 +9562,93 @@ elif page == "📊  Statistics":
                 # ── Sector breakdown pie chart ─────────────────────────────────
                 _unique_tix = list(pnl_avail["ticker"].dropna().unique())
                 if _unique_tix:
-                    _sector_data: dict[str, dict] = {"count": {}, "pnl": {}}
+                    # Capital = cost basis at entry (|price x qty x multiplier|), the
+                    # same base _pct_of_trade uses, so "% of account" here means the
+                    # share of the account that sector tied up.
+                    _sector_data: dict[str, dict] = {"count": {}, "pnl": {}, "capital": {}}
                     for _t in _unique_tix:
                         _sec = get_ticker_sector(_t) or "Unknown"
                         _t_rows = pnl_avail[pnl_avail["ticker"] == _t]
-                        _sector_data["count"][_sec]  = _sector_data["count"].get(_sec, 0) + len(_t_rows)
-                        _sector_data["pnl"][_sec]    = _sector_data["pnl"].get(_sec, 0.0) + float(_t_rows["_pnl"].sum())
-                    _pie_mode = st.radio("Sector chart by", ["Trade Count", "Total P&L"],
-                                         horizontal=True, key="st_pie_mode", label_visibility="collapsed")
-                    _pie_vals_raw = _sector_data["count"] if _pie_mode == "Trade Count" else _sector_data["pnl"]
-                    _pie_vals = {k: v for k, v in _pie_vals_raw.items() if v > 0}
-                    if _pie_vals:
-                        _fig_pie = go.Figure(go.Pie(
-                            labels=list(_pie_vals.keys()),
-                            values=list(_pie_vals.values()),
-                            hole=0.35,
-                            textinfo="label+percent",
-                            hovertemplate="%{label}<br>%{value}<extra></extra>",
-                        ))
-                        _fig_pie.update_layout(
-                            title=f"Sector Breakdown — {_pie_mode}",
-                            height=340, showlegend=True,
-                            margin=dict(t=40, b=10, l=10, r=10),
-                            paper_bgcolor=_CHT_BG,
-                            font=dict(color=_CHT_FONT),
-                            legend=dict(bgcolor=_CHT_LEG),
-                        )
-                        st.plotly_chart(_fig_pie, width='stretch', theme=None)
+                        _cap = float((
+                            pd.to_numeric(_t_rows["entry_price"], errors="coerce").abs()
+                            * pd.to_numeric(_t_rows["quantity"], errors="coerce").abs()
+                            * pd.to_numeric(_t_rows["multiplier"], errors="coerce").fillna(1.0).abs()
+                        ).fillna(0).sum())
+                        _sector_data["count"][_sec]   = _sector_data["count"].get(_sec, 0) + len(_t_rows)
+                        _sector_data["pnl"][_sec]     = _sector_data["pnl"].get(_sec, 0.0) + float(_t_rows["_pnl"].sum())
+                        _sector_data["capital"][_sec] = _sector_data["capital"].get(_sec, 0.0) + _cap
+
+                    _PIE_MODES = ["# of Positions", "Capital $", "% of Account", "Total P&L"]
+                    _pie_mode = st.radio("Sector chart by", _PIE_MODES,
+                                         horizontal=True, key="st_pie_metric",
+                                         label_visibility="collapsed")
+
+                    _pie_vals_raw: dict[str, float] = {}
+                    _pie_fmt = lambda v: f"{v:,.2f}"
+                    _pie_skip = None
+                    if _pie_mode == "# of Positions":
+                        _pie_vals_raw = _sector_data["count"]
+                        _pie_fmt = lambda v: f"{v:,.0f}"
+                    elif _pie_mode == "Capital $":
+                        _pie_vals_raw = _sector_data["capital"]
+                        _pie_fmt = lambda v: f"${v:,.2f}"
+                    elif _pie_mode == "% of Account":
+                        if acct_bal:
+                            _pie_vals_raw = {k: v / acct_bal * 100
+                                             for k, v in _sector_data["capital"].items()}
+                            _pie_fmt = lambda v: f"{v:,.2f}%"
+                        else:
+                            _pie_skip = ("Set your account balance in ⚙️ Settings to chart "
+                                         "sector capital as a % of the account.")
+                    else:
+                        _pie_vals_raw = _sector_data["pnl"]
+                        _pie_fmt = lambda v: f"${v:,.2f}"
+
+                    if _pie_skip:
+                        st.info(_pie_skip, icon="ℹ️")
+                    else:
+                        # A pie can only render positive magnitudes — losing sectors
+                        # (and zero-capital rows) drop out, so say so rather than
+                        # silently showing a partial breakdown.
+                        _pie_vals = {k: v for k, v in _pie_vals_raw.items() if v > 0}
+                        _pie_dropped = [k for k in _pie_vals_raw if k not in _pie_vals]
+                        if _pie_vals:
+                            _pie_total = sum(_pie_vals.values())
+                            _fig_pie = go.Figure(go.Pie(
+                                labels=list(_pie_vals.keys()),
+                                values=list(_pie_vals.values()),
+                                customdata=[[_pie_fmt(v)] for v in _pie_vals.values()],
+                                hole=0.42,
+                                textinfo="label+percent",
+                                hovertemplate=("%{label}<br>" + _pie_mode
+                                               + ": %{customdata[0]}<br>"
+                                               "Share of shown: %{percent}<extra></extra>"),
+                            ))
+                            _fig_pie.update_layout(
+                                title=f"Sector Breakdown — {_pie_mode}",
+                                height=340, showlegend=True,
+                                margin=dict(t=40, b=10, l=10, r=10),
+                                paper_bgcolor=_CHT_BG,
+                                font=dict(color=_CHT_FONT),
+                                legend=dict(bgcolor=_CHT_LEG),
+                                annotations=[dict(
+                                    text=f"<b>{_pie_fmt(_pie_total)}</b><br>total",
+                                    x=0.5, y=0.5, showarrow=False,
+                                    font=dict(size=13, color=_CHT_FONT),
+                                )],
+                            )
+                            st.plotly_chart(_fig_pie, width='stretch', theme=None)
+                            if _pie_dropped:
+                                st.caption(
+                                    "Not shown (zero or negative in this mode): "
+                                    + ", ".join(sorted(_pie_dropped))
+                                )
+                        else:
+                            # Escape the "$" in "Capital $" — st.info renders markdown
+                            # and a bare $ can start a LaTeX span.
+                            st.info(f"No sector has a positive "
+                                    f"{_pie_mode.replace('$', chr(92) + '$')} value to chart.",
+                                    icon="ℹ️")
 
                 # ── Rolling Sharpe / Sortino chart ────────────────────────────
                 if len(pnl_series) >= 25:
@@ -10150,17 +10487,26 @@ elif page == "🔗  Broker Sync":
 
             _preview = st.session_state.get("_ib_preview")
             if _preview:
-                st.caption(f"{len(_preview)} trade(s) ready to import:")
-                _prev_df = pd.DataFrame(_preview).drop(
-                    columns=["notes", "stop_enabled", "opening_stop", "tag_ids",
-                             "current_stop", "side", "leg_label"], errors="ignore"
+                st.caption(
+                    f"{len(_preview)} trade(s) found — untick any you don't want, "
+                    "then import:"
                 )
-                st.dataframe(_prev_df, width='stretch', hide_index=True)
+                _ib_picked = select_trades_to_import(
+                    _preview, "ib_today_pick",
+                    hide_cols=["notes", "stop_enabled", "opening_stop", "tag_ids",
+                               "current_stop", "side", "leg_label"],
+                )
                 _imp_c1, _imp_c2 = st.columns(2)
-                if _imp_c1.button("✅  Import All Trades", width='stretch', key="ib_import_all"):
+                _ib_imp_label = (
+                    f"✅  Import {len(_ib_picked)} Selected Trade(s)"
+                    if len(_ib_picked) < len(_preview)
+                    else f"✅  Import All {len(_preview)} Trade(s)"
+                )
+                if _imp_c1.button(_ib_imp_label, width='stretch', key="ib_import_all",
+                                  disabled=not _ib_picked):
                     _imported = 0
                     _ib_dupes = 0
-                    for _td in _preview:
+                    for _td in _ib_picked:
                         try:
                             if is_duplicate_trade(
                                 _td.get("ticker", ""),
@@ -10332,19 +10678,17 @@ elif page == "🔗  Broker Sync":
                         except Exception:
                             return True
 
-                    _flex_trades = [t for t in _flex_trades_all if _flex_in_range(t)]
+                    _flex_in_rng = [t for t in _flex_trades_all if _flex_in_range(t)]
                     st.caption(
-                        f"{len(_flex_trades)} of {len(_flex_trades_all)} trade(s) in range "
+                        f"{len(_flex_in_rng)} of {len(_flex_trades_all)} trade(s) in range "
                         f"({_imp2_date_from} → {_imp2_date_to}). "
-                        "Open positions have no exit date/price."
+                        "Open positions have no exit date/price. "
+                        "Untick any trade you don't want to bring in."
                     )
-                    _flex_trades_df = pd.DataFrame(_flex_trades).drop(
-                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
-                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
-                    ) if _flex_trades else pd.DataFrame()
-                    if not _flex_trades_df.empty:
-                        st.dataframe(_flex_trades_df, width='stretch', hide_index=True)
+                    if _flex_in_rng:
+                        _flex_trades = select_trades_to_import(_flex_in_rng, "flex_pick")
                     else:
+                        _flex_trades = []
                         st.info("No trades in the selected date range.")
 
                     _import_label2 = (
@@ -10827,16 +11171,13 @@ elif page == "🔗  Broker Sync":
                 _strades = _sres.get("trades", [])
                 st.markdown("##### Trades")
                 if _strades:
-                    _sdf = pd.DataFrame(_strades).drop(
-                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
-                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
-                    )
-                    st.dataframe(_sdf, width='stretch', hide_index=True)
+                    st.caption("Untick any trade you don't want to bring in.")
+                    _s_picked = select_trades_to_import(_strades, "schwab_pick")
                     _ic1, _ic2 = st.columns(2)
-                    if _ic1.button(f"✅  Import {len(_strades)} Trade(s)", width='stretch',
-                                   key="schwab_import"):
+                    if _ic1.button(f"✅  Import {len(_s_picked)} Trade(s)", width='stretch',
+                                   key="schwab_import", disabled=not _s_picked):
                         with st.spinner("Importing…"):
-                            _counts = import_parsed_trades(_strades)
+                            _counts = import_parsed_trades(_s_picked)
                         if _counts["errors"]:
                             st.warning(
                                 f"{len(_counts['errors'])} trade(s) failed:\n" +
@@ -10921,15 +11262,12 @@ elif page == "🔗  Broker Sync":
                 st.markdown(f"##### Trades  ·  {len(_ftrades)} position(s) from "
                             f"{_fres.get('fill_count', 0)} fill(s)")
                 if _ftrades:
-                    _fdf = pd.DataFrame(_ftrades).drop(
-                        columns=["notes", "stop_enabled", "opening_stop", "current_stop",
-                                 "tag_ids", "leg_group", "leg_label"], errors="ignore"
-                    )
-                    st.dataframe(_fdf, width='stretch', hide_index=True)
-                    if st.button(f"✅  Import {len(_ftrades)} Trade(s)", width='stretch',
-                                 key="fidelity_import_trades"):
+                    st.caption("Untick any trade you don't want to bring in.")
+                    _f_picked = select_trades_to_import(_ftrades, "fidelity_pick")
+                    if st.button(f"✅  Import {len(_f_picked)} Trade(s)", width='stretch',
+                                 key="fidelity_import_trades", disabled=not _f_picked):
                         with st.spinner("Importing…"):
-                            _counts = import_parsed_trades(_ftrades)
+                            _counts = import_parsed_trades(_f_picked)
                         if _counts["errors"]:
                             st.warning(
                                 f"{len(_counts['errors'])} trade(s) failed:\n" +
@@ -11209,10 +11547,14 @@ elif page == "⚙️  Settings":
     with st.form("settings_currency_form"):
         st.markdown("#### Multi-Currency")
         st.caption(
-            "Enable if your clients trade USD-denominated securities in a non-USD account. "
-            "Entry and exit prices are always recorded in USD. The app will also show "
-            "P&L converted to the native currency using live and historical FX rates.\n\n"
-            "Supported: **AUD**, **CAD**, **EUR**. FX rates sourced from Yahoo Finance."
+            "Adds the FX columns - P&L, Entry, and Exit in each trade's own currency - "
+            "to the trade table.\n\n"
+            "Currency is chosen per trade on the Add Trade form (it defaults to USD). "
+            "Prices are converted at that date's rate and always stored in USD, so "
+            "stats and totals stay comparable across currencies.\n\n"
+            "Supported: "
+            + ", ".join(f"**{c}**" for c in NATIVE_CURRENCIES if c != "USD")
+            + ". FX rates sourced from Yahoo Finance."
         )
         _cur_mode_val  = settings.get("currency_mode", "0") == "1"
         _cur_native    = settings.get("native_currency", "USD")
@@ -11220,13 +11562,15 @@ elif page == "⚙️  Settings":
         new_currency_mode   = cx1.toggle("Show native currency P&L",
                                           value=_cur_mode_val,
                                           help="Adds FX-adjusted P&L columns to the trade table.")
+        _ccy_opts = list(NATIVE_CURRENCIES)
         new_native_currency = cx2.selectbox(
             "Client native currency",
-            options=["USD", "AUD", "CAD", "EUR"],
-            index=["USD", "AUD", "CAD", "EUR"].index(_cur_native) if _cur_native in ["USD","AUD","CAD","EUR"] else 0,
+            options=_ccy_opts,
+            index=_ccy_opts.index(_cur_native) if _cur_native in _ccy_opts else 0,
             help=(
-                "The currency the client holds their account in. "
-                "When a trade is entered the app will record the FX rate at that time."
+                "The currency the client holds their account in. Individual trades "
+                "carry their own currency, set on the Add Trade form - this setting "
+                "does not override it."
             ),
         )
         if st.form_submit_button("💾  Save Currency Settings", width='stretch'):
