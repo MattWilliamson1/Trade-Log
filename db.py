@@ -229,7 +229,13 @@ def init_db():
         for table, col, typedef in MIGRATIONS:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             if col not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                except sqlite3.OperationalError as e:
+                    # Idempotency backstop: if a stale/partial build already added the
+                    # column, PRAGMA can miss it in some states — ignore only that case.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
         for idx_sql in INDEXES:
             conn.execute(idx_sql)
     # Startup backup: once per calendar day if DB is under size limit
