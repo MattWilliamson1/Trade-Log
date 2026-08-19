@@ -55,6 +55,46 @@ def rand_bday(start: date, end: date) -> date:
             return d
     return start
 
+# ── Account / risk model ───────────────────────────────────────────────────────
+# Every trade is sized so its OPEN RISK — (entry − stop) × shares for stocks, or
+# the defined max-loss for options — is a consistent fraction of the account. This
+# is what makes the demo's numbers hang together: normalized risk in, a believable
+# equity curve out.
+
+STARTING_EQUITY = 25_000.0
+CONTRIB_AMT     = 500.0          # monthly contribution
+RISK_PCT        = 0.005          # 0.5% of account risked per trade
+
+def first_bdays_of_months(start: date, end: date) -> list:
+    """First business day of each month strictly after `start`'s month, up to `end`."""
+    out = []
+    y, m = (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+    while True:
+        d = date(y, m, 1)
+        if d > end:
+            break
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        if start <= d <= end:
+            out.append(d)
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+CONTRIB_DATES = first_bdays_of_months(START, TODAY)
+
+def ref_equity(d: date) -> float:
+    """Account value for risk sizing — starting equity plus contributions to date.
+
+    Deliberately excludes trading P&L so position sizing stays independent of the
+    (later, trade-derived) equity curve rather than circular with it.
+    """
+    n = sum(1 for cd in CONTRIB_DATES if cd <= d)
+    return STARTING_EQUITY + CONTRIB_AMT * n
+
+def trade_risk_dollars(d: date) -> float:
+    """Target open risk for a trade entered on `d`: 0.5% of account, lightly jittered."""
+    return ref_equity(d) * RISK_PCT * random.uniform(0.85, 1.15)
+
 # ── Tags ─────────────────────────────────────────────────────────────────────
 
 TAGS = [
@@ -90,7 +130,7 @@ def rand_tags(n_min=1, n_max=2):
 
 with get_connection() as conn:
     for k, v in {
-        "account_balance":      "28500",
+        "account_balance":      "25000",  # placeholder — recomputed from trades at the end
         "starting_equity":      "25000",
         "starting_date":        iso(START),
         "euro_dates":           "0",
@@ -180,13 +220,19 @@ def gen_stock_trade(conn, *, open_pos=False):
     # price with ±15% noise around base
     ep = round(base * random.uniform(0.85, 1.15), 2)
 
-    # quantity scaled to rough $5k–$20k position size
-    position_size = random.uniform(5000, 20000)
-    qty = max(1, round(position_size / ep / 10) * 10)  # round to nearest 10
-
     # stop: 4–8% below entry for longs, above for shorts; opening stop is never edited
     stop_pct = random.uniform(0.04, 0.08)
     stop = round(ep * (1 - stop_pct) if side == "long" else ep * (1 + stop_pct), 2)
+
+    # quantity is sized FROM the risk, not the other way round: pick shares so that
+    # open risk = (entry − stop) × shares ≈ the 0.5%-of-account target. Round to a
+    # clean lot without letting the rounding distort the risk much.
+    risk_per_share = abs(ep - stop)
+    raw_qty = trade_risk_dollars(ed) / risk_per_share if risk_per_share else 0
+    if   raw_qty >= 200: qty = max(10, round(raw_qty / 10) * 10)
+    elif raw_qty >= 40:  qty = max(5,  round(raw_qty / 5) * 5)
+    else:                qty = max(1,  round(raw_qty))
+
     # current stop only ever trails toward entry (locking in), never loosens away from it
     trail = random.uniform(0.0, 0.6)            # 0 = untouched, 1 = pulled up to entry
     cur_stop = round(stop + (ep - stop) * trail, 2)
@@ -213,19 +259,19 @@ def gen_stock_trade(conn, *, open_pos=False):
         if xd >= TODAY:
             xd = bday(TODAY, -1)
 
-        # exit price: ~55% win-rate
+        # exit price: ~55% win-rate. Both winners and losers are expressed as a
+        # multiple of the trade's own risk-per-share, so results scale with the
+        # (normalized) risk taken and R-multiples stay in a believable band.
+        rps = abs(ep - stop)                    # 1R, per share
         win = random.random() < 0.55
         if win:
-            chg = random.uniform(0.01, 0.14)
-            xp = ep * (1 + chg) if side == "long" else ep * (1 - chg)
+            r_mult = random.uniform(0.4, 1.8)   # winners run ~0.4R–1.8R
+            xp = ep + rps * r_mult if side == "long" else ep - rps * r_mult
         else:
-            # a loss never runs far past the stop — exit at/near the stop (with a touch
-            # of slippage) or a smaller discretionary loss between entry and the stop
+            # a loss never runs far past the stop — at/near it (a touch of slippage)
+            # or a smaller discretionary loss between entry and the stop
             frac = random.uniform(0.4, 1.05)    # 1.0 = right at the opening stop
-            if side == "long":
-                xp = ep - (ep - stop) * frac
-            else:  # short: loss when price rises toward the stop
-                xp = ep + (stop - ep) * frac
+            xp = ep - rps * frac if side == "long" else ep + rps * frac
         xp = round(max(0.01, xp), 2)
         trade_kw["exit_date"]  = iso(xd)
         trade_kw["exit_price"] = xp
@@ -275,229 +321,256 @@ def add_option_leg(conn, ticker, ed, xd, side, qty, ep, xp,
 def new_grp():
     return str(uuid.uuid4())[:8]
 
+# ── Options: defined-risk, risk-normalized ────────────────────────────────────
+# Options don't have a stop, so their "open risk" is the defined max loss of the
+# structure (debit paid, or width − credit for verticals). Each position is sized
+# so that max loss ≈ the same 0.5%-of-account target as the stock trades — on a
+# ~$25k account that floors most structures at 1 contract. Outcomes are expressed
+# in R (multiples of that max risk), and the leg premiums are derived from R so the
+# recorded P&L always equals R × risk.
+
+OPT_MULT = 100.0
+
+def _opt_qty(per_contract_risk: float, ed: date) -> int:
+    """Contracts so that per-contract risk × qty ≈ the account risk target (min 1)."""
+    if per_contract_risk <= 0:
+        return 1
+    return max(1, round(trade_risk_dollars(ed) / per_contract_risk))
+
+def _tail() -> float:
+    """A small residual premium for a leg that expires near-worthless."""
+    return round(random.uniform(0.02, 0.10), 2)
+
+def _dates(ed_off, hold, *, extra=(6, 12), open_pos=False):
+    """Resolve (entry, exit, expiry). For open positions ed_off is measured back
+    from TODAY and the trade is left open (no exit) with an expiry still in the future."""
+    if open_pos:
+        ed  = bday(TODAY, ed_off)
+        exp = bday(TODAY, random.randint(16, 28))
+    else:
+        ed  = bday(START, ed_off)
+        exp = bday(ed, (hold if hold is not None else 25) + random.randint(*extra))
+    xd = None if hold is None else bday(ed, hold)
+    return ed, xd, exp
+
+def emit_vertical(conn, ticker, ed_off, hold, direction, outcome_R, tags, *, kind, open_pos=False):
+    """Debit or credit vertical spread, sized to the risk target.
+
+    kind='debit'  : long the near strike, short one width out (bull call / bear put).
+    kind='credit' : short the near strike, long one width out (put/call credit).
+    direction     : 'call' or 'put' (drives strike placement & labels).
+    """
+    ed, xd, exp = _dates(ed_off, hold, open_pos=open_pos)
+    base = STOCK_MAP[ticker][0]
+
+    if kind == "debit":
+        W = 5.0
+        long_ep  = round(random.uniform(2.4, 3.4), 2)
+        debit    = round(random.uniform(1.4, 2.2), 2)
+        short_ep = round(max(0.05, long_ep - debit), 2)
+        debit    = round(long_ep - short_ep, 2)
+        risk_pc  = debit * OPT_MULT
+        long_k   = float(round(base))
+        short_k  = long_k + W if direction == "call" else long_k - W
+        spread_type = "Bull Call Spread" if direction == "call" else "Bear Put Spread"
+        # Spread is worth `debit` at entry; grows toward the width on a win.
+        val = min(W, max(0.0, debit * (1 + outcome_R)))
+        if open_pos:
+            long_x = short_x = None                 # still open — no exit fills
+        elif val <= 0.02:
+            long_x = short_x = _tail()
+        else:
+            short_x = _tail()
+            long_x  = round(short_x + val, 2)
+        legs = [
+            ("long",  long_ep,  long_x,  long_k,  f"Long {direction.title()} ${long_k:g}"),
+            ("short", short_ep, short_x, short_k, f"Short {direction.title()} ${short_k:g}"),
+        ]
+    else:  # credit
+        W = 2.5
+        short_ep = round(random.uniform(1.0, 1.6), 2)
+        credit   = round(random.uniform(0.85, 1.15), 2)
+        long_ep  = round(max(0.05, short_ep - credit), 2)
+        credit   = round(short_ep - long_ep, 2)
+        risk_pc  = (W - credit) * OPT_MULT
+        short_k  = round(base * (0.96 if direction == "put" else 1.04) * 2) / 2.0
+        long_k   = short_k - W if direction == "put" else short_k + W
+        spread_type = "Put Credit Spread" if direction == "put" else "Call Credit Spread"
+        # Spread is worth `credit` at entry; a win buys it back near zero, a loss
+        # toward the full width.
+        val = min(W, max(0.0, credit - outcome_R * (W - credit)))
+        long_x  = _tail()
+        short_x = round(long_x + val, 2)
+        legs = [
+            ("short", short_ep, short_x, short_k, f"Short {direction.title()} ${short_k:g}"),
+            ("long",  long_ep,  long_x,  long_k,  f"Long {direction.title()} ${long_k:g}"),
+        ]
+
+    qty = _opt_qty(risk_pc, ed)
+    grp = new_grp()
+    for lside, lep, lxp, lk, label in legs:
+        lid = add_option_leg(conn, ticker, ed, xd, lside, qty, lep, lxp, lk, exp,
+                             direction, grp, label, spread_type=spread_type)
+        tag_trade(conn, lid, *tags)
+
+def emit_iron_condor(conn, ticker, ed_off, hold, outcome_R, *, open_pos=False):
+    """Four-leg iron condor (put spread + call spread), sized to the risk target.
+
+    Max loss = one wing width − total credit collected; only one side can lose.
+    """
+    ed, xd, exp = _dates(ed_off, hold, extra=(6, 10), open_pos=open_pos)
+    base = STOCK_MAP[ticker][0]
+    W = 2.5
+    put_c  = round(random.uniform(0.45, 0.60), 2)   # credit per side
+    call_c = round(random.uniform(0.45, 0.60), 2)
+    total_c = round(put_c + call_c, 2)
+    risk_pc = (W - total_c) * OPT_MULT
+
+    ph = round(base * 0.96 * 2) / 2.0               # short put strike
+    pl = ph - W                                     # long put strike
+    cl = round(base * 1.04 * 2) / 2.0               # short call strike
+    ch = cl + W                                     # long call strike
+
+    sp_ep = round(random.uniform(0.75, 1.05), 2); lp_ep = round(max(0.05, sp_ep - put_c), 2)
+    sc_ep = round(random.uniform(0.75, 1.05), 2); lc_ep = round(max(0.05, sc_ep - call_c), 2)
+
+    if outcome_R >= 0 or open_pos:                  # win / still open → decays toward 0
+        sp_xp, lp_xp = _tail(), _tail()
+        sc_xp, lc_xp = _tail(), _tail()
+    else:                                           # loss on the put side → put spread → width
+        lp_xp = _tail()
+        sp_xp = round(lp_xp + W, 2)
+        sc_xp, lc_xp = _tail(), _tail()
+
+    qty = _opt_qty(risk_pc, ed)
+    grp = new_grp()
+    legs = [
+        ("short", sp_ep, sp_xp, ph, "put",  f"Short Put ${ph:g}"),
+        ("long",  lp_ep, lp_xp, pl, "put",  f"Long Put ${pl:g}"),
+        ("short", sc_ep, sc_xp, cl, "call", f"Short Call ${cl:g}"),
+        ("long",  lc_ep, lc_xp, ch, "call", f"Long Call ${ch:g}"),
+    ]
+    for lside, lep, lxp, lk, otype, label in legs:
+        lid = add_option_leg(conn, ticker, ed, xd, lside, qty, lep, lxp, lk, exp,
+                             otype, grp, label, spread_type="Iron Condor")
+        tag_trade(conn, lid, "Options Income")
+
+def emit_single(conn, ticker, ed_off, hold, direction, outcome_R, tags, *, open_pos=False):
+    """Single long call/put, sized so premium × 100 × qty ≈ the risk target."""
+    ed, xd, exp = _dates(ed_off, hold, extra=(6, 10), open_pos=open_pos)
+    base = STOCK_MAP[ticker][0]
+    ep  = round(random.uniform(1.4, 2.2), 2)        # premium; risk = ep × 100
+    xp  = None if open_pos else round(max(0.02, ep * (1 + outcome_R)), 2)
+    strike = float(round(base))
+    qty = _opt_qty(ep * OPT_MULT, ed)
+    lid = add_option_leg(conn, ticker, ed, xd, "long", qty, ep, xp, strike, exp,
+                         direction, None, None)
+    tag_trade(conn, lid, *tags)
+
 # ── Closed option trades ──────────────────────────────────────────────────────
+# (ticker, entry-offset, hold, direction, outcome in R)
 
-# --- Bull call spreads (6) ---
-BULL_CALL_PARAMS = [
-    ("AAPL",  20, 25, 230, 240, 4.50, 8.20, 1.80, 0.30, 5, "call"),  # win
-    ("MSFT",  35, 20, 420, 430, 5.20, 9.10, 2.10, 0.35, 8, "call"),  # win
-    ("NVDA",  50, 15, 880, 900, 8.50, 2.10, 3.20, 0.80, 4, "call"),  # loss — stock pulled back
-    ("META",  65, 18, 570, 585, 6.30, 1.50, 2.60, 0.55, 6, "call"),  # loss — failed to break out
-    ("AMD",   80, 20, 150, 160, 2.80, 5.10, 1.10, 0.20, 10,"call"),  # win
-    ("GOOG",  95, 22, 190, 200, 4.10, 7.50, 1.65, 0.25, 7, "call"),  # win
-]
-
-with get_connection() as conn:
-    for ticker, ed_off, hold, lo, hi, ep_lo, xp_lo, ep_hi, xp_hi, qty, _ in BULL_CALL_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 10)
-        grp = new_grp()
-        i1 = add_option_leg(conn, ticker, ed, xd, "long",  qty, ep_lo, xp_lo, lo, exp, "call", grp, f"Long Call ${lo}", spread_type="Bull Call Spread")
-        i2 = add_option_leg(conn, ticker, ed, xd, "short", qty, ep_hi, xp_hi, hi, exp, "call", grp, f"Short Call ${hi}", spread_type="Bull Call Spread")
-        tag_trade(conn, i1, *rand_tags(1, 2))
-        tag_trade(conn, i2, *rand_tags(1, 2))
-
-# --- Bear put spreads (5) ---
-BEAR_PUT_PARAMS = [
-    ("SPY",   110, 15, 590, 580, 3.20, 5.80, 1.10, 0.20, 10, "put"),  # win
-    ("QQQ",   130, 12, 490, 480, 2.90, 4.70, 1.05, 0.18, 8,  "put"),  # win
-    ("TSLA",  145, 18, 320, 305, 5.50, 0.25, 2.30, 0.10, 6,  "put"),  # loss — TSLA rallied
-    ("NFLX",  160, 14, 880, 860, 8.10, 13.5, 3.20, 0.55, 3,  "put"),  # win
-    ("IWM",   175, 16, 210, 200, 2.40, 0.10, 0.95, 0.05, 12, "put"),  # loss — market rallied
-]
+BULL_CALLS = [("AAPL", 20, 15, "call", 1.2), ("MSFT", 40, 18, "call", 1.0),
+              ("NVDA", 55, 12, "call", -1.0), ("META", 70, 16, "call", -1.0),
+              ("AMD", 95, 14, "call", 1.3), ("GOOG", 115, 13, "call", 0.9)]
+BEAR_PUTS  = [("SPY", 110, 12, "put", 1.1), ("QQQ", 130, 14, "put", 1.0),
+              ("TSLA", 145, 16, "put", -1.0), ("NFLX", 160, 13, "put", 1.3),
+              ("IWM", 175, 15, "put", -1.0)]
+PUT_CREDITS = [("AAPL", 280, 18, "put", 0.6), ("MSFT", 295, 16, "put", 0.6),
+               ("V", 310, 20, "put", 0.6), ("JPM", 325, 18, "put", -1.0)]
+IRON_CONDORS = [("SPY", 200, 20, 0.67), ("QQQ", 220, 18, 0.67),
+                ("IWM", 240, 22, 0.67), ("SPY", 255, 15, -1.0)]
+LONG_CALLS = [("NFLX", 45, 6, "call", 1.3), ("NVDA", 55, 7, "call", 1.5),
+              ("TSLA", 70, 5, "call", 1.0), ("AMD", 120, 6, "call", -1.0),
+              ("PLTR", 185, 8, "call", -1.0)]
+LONG_PUTS  = [("META", 110, 6, "put", -1.0), ("SPY", 155, 7, "put", 1.2),
+              ("TSLA", 205, 5, "put", 1.3), ("QQQ", 230, 6, "put", -1.0)]
 
 with get_connection() as conn:
-    for ticker, ed_off, hold, hi, lo, ep_hi, xp_hi, ep_lo, xp_lo, qty, _ in BEAR_PUT_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 10)
-        grp = new_grp()
-        i1 = add_option_leg(conn, ticker, ed, xd, "long",  qty, ep_hi, xp_hi, hi, exp, "put", grp, f"Long Put ${hi}", spread_type="Bear Put Spread")
-        i2 = add_option_leg(conn, ticker, ed, xd, "short", qty, ep_lo, xp_lo, lo, exp, "put", grp, f"Short Put ${lo}", spread_type="Bear Put Spread")
-        tag_trade(conn, i1, *rand_tags(1, 2))
-        tag_trade(conn, i2, *rand_tags(1, 2))
-
-# --- Iron condors (4 × 4 legs = 16 legs) ---
-# Columns: ticker, ed_off, hold, put_lo, put_hi, call_lo, call_hi, qty,
-#          sp_ep, sp_xp, lp_ep, lp_xp, sc_ep, sc_xp, lc_ep, lc_xp
-IRON_CONDOR_PARAMS = [
-    ("SPY", 200, 20, 560, 570, 600, 610, 8,  1.50, 0.10, 0.60, 0.02, 1.50, 0.10, 0.60, 0.02),  # win
-    ("QQQ", 220, 18, 455, 465, 505, 515, 6,  1.50, 0.10, 0.60, 0.02, 1.50, 0.10, 0.60, 0.02),  # win
-    ("IWM", 240, 22, 185, 195, 225, 235, 10, 1.50, 0.10, 0.60, 0.02, 1.50, 0.10, 0.60, 0.02),  # win
-    # Market broke through put side — max-loss on put spread, calls expired fine
-    ("SPY", 260, 15, 555, 565, 595, 605, 8,  1.50, 8.50, 0.60, 5.20, 1.50, 0.10, 0.60, 0.02),  # loss
-]
-
-with get_connection() as conn:
-    for ticker, ed_off, hold, pl, ph, cl, ch, qty, sp_ep, sp_xp, lp_ep, lp_xp, sc_ep, sc_xp, lc_ep, lc_xp in IRON_CONDOR_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 8)
-        grp = new_grp()
-        sp  = add_option_leg(conn, ticker, ed, xd, "short", qty, sp_ep, sp_xp, ph, exp, "put",  grp, f"Short Put ${ph}", spread_type="Iron Condor")
-        lp  = add_option_leg(conn, ticker, ed, xd, "long",  qty, lp_ep, lp_xp, pl, exp, "put",  grp, f"Long Put ${pl}", spread_type="Iron Condor")
-        sc  = add_option_leg(conn, ticker, ed, xd, "short", qty, sc_ep, sc_xp, cl, exp, "call", grp, f"Short Call ${cl}", spread_type="Iron Condor")
-        lc  = add_option_leg(conn, ticker, ed, xd, "long",  qty, lc_ep, lc_xp, ch, exp, "call", grp, f"Long Call ${ch}", spread_type="Iron Condor")
-        for leg_id in (sp, lp, sc, lc):
-            tag_trade(conn, leg_id, "Options Income")
-
-# --- Put credit spreads (4 × 2 legs = 8 legs) ---
-PUT_CREDIT_PARAMS = [
-    ("AAPL",  280, 20, 200, 190, 2.10, 0.15, 0.85, 0.05, 8),   # win
-    ("MSFT",  295, 18, 400, 390, 2.80, 0.20, 1.10, 0.06, 6),   # win
-    ("V",     310, 22, 285, 275, 1.90, 0.12, 0.75, 0.04, 10),  # win
-    ("JPM",   325, 20, 235, 225, 1.75, 7.20, 0.70, 4.50, 8),   # loss — JPM dropped hard
-]
-
-with get_connection() as conn:
-    for ticker, ed_off, hold, hi, lo, ep_hi, xp_hi, ep_lo, xp_lo, qty in PUT_CREDIT_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 8)
-        grp = new_grp()
-        sp = add_option_leg(conn, ticker, ed, xd, "short", qty, ep_hi, xp_hi, hi, exp, "put", grp, f"Short Put ${hi}", spread_type="Put Credit Spread")
-        lp = add_option_leg(conn, ticker, ed, xd, "long",  qty, ep_lo, xp_lo, lo, exp, "put", grp, f"Long Put ${lo}", spread_type="Put Credit Spread")
-        tag_trade(conn, sp, "Options Income")
-        tag_trade(conn, lp, "Options Income")
-
-# --- Single-leg long calls (5) ---
-LONG_CALL_PARAMS = [
-    ("NFLX",  45,  5, 900, 12.50, 28.00, 3),   # win
-    ("NVDA",  55,  6, 880, 15.20, 34.50, 2),   # win
-    ("TSLA",  70,  4, 330,  8.80, 18.40, 5),   # win
-    ("AMD",   120, 5, 155,  3.20,  0.15, 8),   # loss — stock didn't move, theta decay
-    ("PLTR",  185, 7, 90,   2.10,  0.05, 10),  # loss — expired worthless
-]
-
-with get_connection() as conn:
-    for ticker, ed_off, hold, strike, ep, xp, qty in LONG_CALL_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 8)
-        i = add_option_leg(conn, ticker, ed, xd, "long", qty, ep, xp, strike, exp, "call", None, None)
-        tag_trade(conn, i, *rand_tags(1, 2))
-
-# --- Single-leg long puts (4) ---
-LONG_PUT_PARAMS = [
-    ("META",  110, 5, 620,  8.00,  3.50, 4),   # loss — market didn't drop enough
-    ("SPY",   155, 6, 590,  4.50,  9.20, 6),   # win
-    ("TSLA",  205, 4, 310,  6.20, 13.80, 3),   # win
-    ("QQQ",   230, 5, 480,  3.80,  0.10, 5),   # loss — QQQ rallied, expired worthless
-]
-
-with get_connection() as conn:
-    for ticker, ed_off, hold, strike, ep, xp, qty in LONG_PUT_PARAMS:
-        ed  = bday(START, ed_off)
-        xd  = bday(ed, hold)
-        exp = bday(ed, hold + 8)
-        i = add_option_leg(conn, ticker, ed, xd, "long", qty, ep, xp, strike, exp, "put", None, None)
-        tag_trade(conn, i, *rand_tags(1, 2))
+    for tk, off, hold, d, r in BULL_CALLS:
+        emit_vertical(conn, tk, off, hold, d, r, rand_tags(1, 2), kind="debit")
+    for tk, off, hold, d, r in BEAR_PUTS:
+        emit_vertical(conn, tk, off, hold, d, r, rand_tags(1, 2), kind="debit")
+    for tk, off, hold, d, r in PUT_CREDITS:
+        emit_vertical(conn, tk, off, hold, d, r, ("Options Income",), kind="credit")
+    for tk, off, hold, r in IRON_CONDORS:
+        emit_iron_condor(conn, tk, off, hold, r)
+    for tk, off, hold, d, r in LONG_CALLS:
+        emit_single(conn, tk, off, hold, d, r, rand_tags(1, 2))
+    for tk, off, hold, d, r in LONG_PUTS:
+        emit_single(conn, tk, off, hold, d, r, rand_tags(1, 2))
 
 # ── Open option positions ─────────────────────────────────────────────────────
-
-# Open bull call spread — AAPL
-grp_oc1 = new_grp()
-oc1_ed  = bday(TODAY, -12)
-oc1_exp = bday(TODAY, 18)
+# entry-offset here is measured back from TODAY (negative), hold=None keeps them open.
 with get_connection() as conn:
-    i1 = add_trade(conn, entry_date=iso(oc1_ed), ticker="AAPL", quantity=8, entry_price=4.80,
-                   instrument_type="option", side="long", opening_stop=None, current_stop=None,
-                   stop_enabled=0, strike=215.0, expiration=iso(oc1_exp), option_type="call",
-                   multiplier=100, leg_group=grp_oc1, leg_label="Long Call $215",
-                   spread_type="Bull Call Spread", commission=round(8*0.65,2), notes="Demo open option")
-    i2 = add_trade(conn, entry_date=iso(oc1_ed), ticker="AAPL", quantity=8, entry_price=2.10,
-                   instrument_type="option", side="short", opening_stop=None, current_stop=None,
-                   stop_enabled=0, strike=225.0, expiration=iso(oc1_exp), option_type="call",
-                   multiplier=100, leg_group=grp_oc1, leg_label="Short Call $225",
-                   spread_type="Bull Call Spread", commission=round(8*0.65,2), notes="Demo open option")
-    tag_trade(conn, i1, "Options Income", "Breakout")
-    tag_trade(conn, i2, "Options Income", "Breakout")
+    emit_vertical(conn, "AAPL", -12, None, "call", 0.0, ("Options Income", "Breakout"), kind="debit", open_pos=True)
+    emit_iron_condor(conn, "SPY", -8, None, 0.0, open_pos=True)
+    emit_single(conn, "MSFT", -5, None, "call", 0.0, ("Speculative", "Breakout"), open_pos=True)
 
-# Open iron condor — SPY
-grp_oc2 = new_grp()
-oc2_ed  = bday(TODAY, -8)
-oc2_exp = bday(TODAY, 22)
-with get_connection() as conn:
-    for side, strike, opt_type, label, ep in [
-        ("short", 555, "put",  "Short Put $555",  1.45),
-        ("long",  545, "put",  "Long Put $545",   0.55),
-        ("short", 605, "call", "Short Call $605", 1.45),
-        ("long",  615, "call", "Long Call $615",  0.55),
-    ]:
-        li = add_trade(conn, entry_date=iso(oc2_ed), ticker="SPY", quantity=10, entry_price=ep,
-                       instrument_type="option", side=side, opening_stop=None, current_stop=None,
-                       stop_enabled=0, strike=float(strike), expiration=iso(oc2_exp),
-                       option_type=opt_type, multiplier=100, leg_group=grp_oc2, leg_label=label,
-                       spread_type="Iron Condor", commission=round(10*0.65,2), notes="Demo open option")
-        tag_trade(conn, li, "Options Income")
+# ── Equity curve — rebuilt from the trades themselves ─────────────────────────
+# The curve is no longer an independent random walk. Each day's balance is the
+# starting equity, plus contributions to date, plus the realized (net) P&L of every
+# trade closed to date — so the trade log, the equity curve, and the account balance
+# all tell the same story. A small mean-reverting wiggle stands in for the daily
+# mark-to-market of open positions so the line looks alive rather than a staircase.
 
-# Open long call — MSFT
-oc3_ed  = bday(TODAY, -5)
-oc3_exp = bday(TODAY, 25)
-with get_connection() as conn:
-    li = add_trade(conn, entry_date=iso(oc3_ed), ticker="MSFT", quantity=5, entry_price=6.20,
-                   instrument_type="option", side="long", opening_stop=None, current_stop=None,
-                   stop_enabled=0, strike=430.0, expiration=iso(oc3_exp), option_type="call",
-                   multiplier=100, leg_group=None, leg_label=None,
-                   commission=round(5*0.65,2), notes="Demo open option")
-    tag_trade(conn, li, "Speculative", "Breakout")
+from collections import defaultdict  # noqa: E402
 
-# ── Equity curve — 1 year starting at $25,000 ────────────────────────────────
-
-def generate_equity_curve(start: date, end: date, start_balance: float):
-    rows = []
-    balance = start_balance
-    d = start
-    in_drawdown = False
-    drawdown_dur = 0
-
-    while d <= end:
-        if d.weekday() >= 5:
-            d += timedelta(days=1)
-            continue
-
-        contributions = 500.0 if d.day == 1 else 0.0
-        withdrawals   = 0.0
-
-        daily_return = random.gauss(0.0006, 0.013)
-
-        if not in_drawdown and random.random() < 0.035:
-            in_drawdown = True
-            drawdown_dur = random.randint(5, 18)
-        if in_drawdown:
-            daily_return -= 0.007
-            drawdown_dur -= 1
-            if drawdown_dur <= 0:
-                in_drawdown = False
-
-        balance = balance * (1 + daily_return) + contributions - withdrawals
-        balance = max(balance, start_balance * 0.65)
-
-        rows.append((iso(d), round(balance, 2), contributions, withdrawals))
-        d += timedelta(days=1)
-
-    return rows
-
-equity_rows = generate_equity_curve(START, TODAY, 25_000.0)
+def _net_pnl(r) -> float:
+    ep, xp, q = r["entry_price"], r["exit_price"], r["quantity"]
+    m = r["multiplier"] or 1.0
+    gross = (xp - ep) * q * m if (r["side"] or "long") == "long" else (ep - xp) * q * m
+    return gross - (r["commission"] or 0.0)
 
 with get_connection() as conn:
+    closed = conn.execute(
+        "SELECT entry_price, exit_price, quantity, multiplier, side, commission, exit_date "
+        "FROM trades WHERE exit_date IS NOT NULL AND exit_price IS NOT NULL"
+    ).fetchall()
+
+realized_by_day = defaultdict(float)
+for r in closed:
+    realized_by_day[r["exit_date"]] += _net_pnl(r)
+
+contrib_by_day = {iso(cd): CONTRIB_AMT for cd in CONTRIB_DATES}
+
+bdays = []
+_d = START
+while _d <= TODAY:
+    if _d.weekday() < 5:
+        bdays.append(_d)
+    _d += timedelta(days=1)
+
+equity_rows = []
+running = STARTING_EQUITY
+dev = 0.0
+for i, dcur in enumerate(bdays):
+    iso_d   = iso(dcur)
+    contrib = contrib_by_day.get(iso_d, 0.0)
+    running += contrib + realized_by_day.get(iso_d, 0.0)
+    dev = 0.85 * dev + random.gauss(0.0, 90.0)      # AR(1) open-position mark-to-market
+    if i == len(bdays) - 1:
+        dev = 0.0                                    # land the last point on the clean value
+    equity_rows.append((iso_d, round(running + dev, 2), contrib, 0.0))
+
+final_balance = round(running, 2)
+
+with get_connection() as conn:
+    conn.execute("DELETE FROM equity_entries")
     conn.executemany(
         "INSERT OR REPLACE INTO equity_entries (date, balance, contributions, withdrawals) VALUES (?,?,?,?)",
         equity_rows,
     )
+    # Account balance now agrees with the trades + contributions instead of a guess.
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('account_balance', ?)",
+                 (str(final_balance),))
 
 # ── Cash transactions ─────────────────────────────────────────────────────────
+# Exactly the monthly contributions recorded on the equity curve — nothing that
+# isn't reflected there, so deposits never masquerade as trading profit.
 
-cash_txns = []
-d = START
-while d <= TODAY:
-    if d.day == 1 and d.weekday() < 5:
-        cash_txns.append((iso(d), "deposit", 500.0, "Monthly contribution", "manual"))
-    d += timedelta(days=1)
-
-cash_txns.append((iso(bday(START, 3)),  "deposit", 5000.0, "Initial transfer",   "manual"))
-cash_txns.append((iso(bday(START, 60)), "deposit", 2500.0, "Extra contribution", "manual"))
+cash_txns = [(iso(cd), "deposit", CONTRIB_AMT, "Monthly contribution", "manual")
+             for cd in CONTRIB_DATES]
 
 with get_connection() as conn:
     conn.executemany(
