@@ -11230,6 +11230,10 @@ elif page == "🔗  Broker Sync":
                 with st.spinner("Reading the statement…"):
                     _fres = _fidelity_mod.parse_statement(_fid_file.getvalue(), _fid_file.name)
                 if _fres.get("error"):
+                    # Drop any previously parsed statement: leaving it on screen
+                    # under the error implies the numbers below came from the file
+                    # just uploaded, including the "Update Account Balance" button.
+                    st.session_state.pop("_fidelity_result", None)
                     st.error(_fres["error"])
                 else:
                     st.session_state["_fidelity_result"] = _fres

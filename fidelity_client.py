@@ -155,6 +155,52 @@ def _norm_date(raw: str, default_year: int | None = None) -> str | None:
 
 # ── PDF text extraction ─────────────────────────────────────────────────────────
 
+def _text_from_chars(page: Any) -> str:
+    """Rebuild a page's text straight from its character stream.
+
+    ``extract_text`` groups characters into words using spacing heuristics, which
+    can yield nothing on statements with unusual kerning or rotated text even
+    though the characters are right there. This bypasses the layout analysis:
+    bucket characters into rows by vertical position, then read each row left to
+    right.
+    """
+    rows: dict[int, list[Any]] = {}
+    for ch in page.chars:
+        rows.setdefault(round(ch["top"] / 3.0), []).append(ch)
+    lines = []
+    for key in sorted(rows):
+        row = sorted(rows[key], key=lambda c: c["x0"])
+        lines.append("".join(c["text"] for c in row))
+    return "\n".join(lines)
+
+
+def _no_text_error(n_pages: int, n_chars: int, n_images: int) -> str:
+    """Explain *why* a PDF yielded no text, specifically enough to act on.
+
+    This message is often the only diagnostic available — the statement itself is
+    a private financial document that can't be passed around for debugging — so
+    it has to distinguish the failure modes on its own.
+    """
+    stats = (f"(diagnostic: {n_pages} pages, {n_chars} text characters, "
+             f"{n_images} images)")
+    if n_chars == 0 and n_images > 0:
+        return ("This statement is a scanned image, not a text PDF — there are no "
+                "text characters in it at all, only page images, so there is "
+                "nothing to read. Re-download the statement from Fidelity's site "
+                "(Accounts -> Statements) rather than scanning or printing a paper "
+                f"copy; those downloads are text PDFs and import fine. {stats}")
+    if n_chars == 0:
+        return ("No text and no images could be read from this PDF, which usually "
+                "means the file is password-protected, corrupted, or only "
+                "partially downloaded. Try opening it in a PDF reader to confirm "
+                "it displays, then re-download it from Fidelity if it does not. "
+                f"{stats}")
+    return ("This PDF contains text but it could not be decoded — the fonts are "
+            "missing the character map needed to turn glyphs back into letters. "
+            "Re-downloading the statement from Fidelity usually produces a clean "
+            f"file; if it does not, this one needs OCR. {stats}")
+
+
 def extract_text(pdf_bytes: bytes) -> tuple[str, str]:
     """Return (full_text, error). Concatenates every page's text."""
     if not _PDF_AVAILABLE:
@@ -163,14 +209,19 @@ def extract_text(pdf_bytes: bytes) -> tuple[str, str]:
     try:
         import io
         parts: list[str] = []
+        n_pages = n_chars = n_images = 0
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            n_pages = len(pdf.pages)
             for page in pdf.pages:
-                parts.append(page.extract_text(x_tolerance=1.5) or "")
+                n_chars  += len(page.chars)
+                n_images += len(page.images)
+                txt = page.extract_text(x_tolerance=1.5) or ""
+                if not txt.strip() and page.chars:
+                    txt = _text_from_chars(page)
+                parts.append(txt)
         text = "\n".join(parts)
         if not text.strip():
-            return "", ("No text could be read from this PDF. If it's a scanned "
-                        "image statement, it needs OCR first — Fidelity's own "
-                        "downloaded statements are text PDFs and should work.")
+            return "", _no_text_error(n_pages, n_chars, n_images)
         return text, ""
     except Exception as e:
         return "", f"Could not read the PDF: {e}"
