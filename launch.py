@@ -87,6 +87,13 @@ def _theme_flags() -> list:
     ]
 
 
+def _port_in_use(port: int) -> bool:
+    """True if something is already listening on 127.0.0.1:<port>."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def _find_free_port(start: int = 8502, attempts: int = 50) -> int:
     port = start
     for _ in range(attempts):
@@ -132,6 +139,22 @@ def main():
     port = _arg_value("--port")
     port = int(port) if port else _find_free_port()
     open_browser = "--no-browser" not in sys.argv
+
+    # An explicit --port that is already taken means an older copy of the app is
+    # still serving it. Streamlit would fail to bind and sit there doing nothing
+    # while the browser keeps talking to that older process — which is how a
+    # session ends up pointing at a database that has since been replaced. Hand
+    # the user over to the instance that is actually running instead.
+    if _port_in_use(port):
+        print(f"Trade Log is already running at http://localhost:{port} - "
+              f"opening that instance instead of starting a second one.")
+        print("Close the running app first if you want a fresh start.")
+        if open_browser:
+            try:
+                webbrowser.open(f"http://localhost:{port}")
+            except Exception:
+                pass
+        return
 
     if RESTART_SENTINEL.exists():
         RESTART_SENTINEL.unlink()

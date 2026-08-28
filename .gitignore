@@ -47,3 +47,6 @@ schwab_token.json
 
 # Trade Log launcher restart sentinel
 .restart_requested
+
+# Demo price history cache (re-downloaded on demand)
+demo/price_history.json

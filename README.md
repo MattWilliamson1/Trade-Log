@@ -326,7 +326,7 @@ Once your token and query ID are saved here, use the **📥 Fetch via Flex Query
 ### ⚙️ Settings
 
 #### Display
-- **Euro dates** — toggle to show dates as DD/MM/YYYY instead of MM/DD/YYYY
+- **Date format** — choose **MM/DD/YYYY (US)**, **DD/MM/YYYY (Euro)** or **YYYY/MM/DD** for every date in the app
 
 #### Row Color Coding
 Optionally color-code trade rows based on status and P&L direction:
@@ -334,7 +334,16 @@ Optionally color-code trade rows based on status and P&L direction:
 - Pick your colors for Open-Profit, Open-Loss, Closed-Profit, and Closed-Loss
 
 #### Multi-Currency
-If your account is in a non-USD currency (AUD, CAD, EUR), enable this to see P&L figures converted to your native currency alongside the USD figures. FX rates are fetched from Yahoo Finance.
+If your account is in a non-USD currency (AUD, CAD, EUR, GBP), enable this to see P&L figures converted to your native currency alongside the USD figures. FX rates are fetched from Yahoo Finance.
+
+**Default currency** sets what the Add Trade form starts on, so an account that trades in GBP does not have to change the picker on every trade. It is only a default — the Currency picker on each trade still overrides it, and trades already logged keep the currency they were entered in. Prices are always stored in USD at that date's rate, so stats stay comparable across currencies. Stock trades only: options and futures are USD-only.
+
+#### Non-US tickers
+Pick the **Exchange** next to the Ticker box on the Add Trade form, then type the plain local ticker — Tesco on the London Stock Exchange is `TSCO`, not `TSCO.L`. Trade Log appends the Yahoo Finance suffix for you (`.L`, `.DE`, `.TO`, `.AX`, `.T`, `.HK` and the rest) and uses it for the live price, the company lookup, price charts and trailing stops. The exchange you pick stays selected until you change it, so a run of London trades only needs setting once.
+
+London lines are quoted by Yahoo in **pence**, not pounds. Trade Log divides those quotes by 100 so the live price lines up with the price you typed — a Shell quote of `3311.00` GBp shows as `£33.11`. The same applies to Johannesburg (cents) and Tel Aviv (agorot). The price readout next to the ticker is labelled with the listing's own currency rather than always showing `$`.
+
+To add a market that isn't in the dropdown, add its IB exchange code and Yahoo suffix to `_IB_EXCHANGE_TO_YF` and a label to `_EXCHANGE_OPTIONS` in `app.py` — everything else reads from those two.
 
 #### Account & Equity
 - **Account Balance** — your current total account value. Used for "% of Account" calculations and risk metrics.

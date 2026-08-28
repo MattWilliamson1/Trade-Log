@@ -44,7 +44,11 @@ DEFAULT_SETTINGS = {
     "stop_dist_unit":       "%",
     "stop_dist_yellow":     "5",
     "stop_dist_red":        "2",
-    "euro_dates":           "0",
+    "euro_dates":           "0",   # legacy; superseded by date_format
+    # `date_format` is deliberately NOT seeded here: seed_default_settings() runs
+    # INSERT OR IGNORE on every startup, so seeding it would stamp "us" onto
+    # existing databases and silently override a saved euro_dates preference.
+    # resolve_date_format() falls back to euro_dates until the user saves once.
     "smtp_host":            "",
     "smtp_port":            "587",
     "smtp_user":            "",
@@ -310,11 +314,31 @@ SECTOR_ETF_MAP = {
 
 # ── Format helpers ─────────────────────────────────────────────────────────────
 
-def fmt_date(date_str, euro: bool = False) -> str:
+# Date display formats. The key is what's stored in the `date_format` setting;
+# older databases only carry the boolean `euro_dates`, which still maps in.
+DATE_FORMATS = {
+    "us":   ("%m/%d/%Y", "MM/DD/YYYY  (US)"),
+    "euro": ("%d/%m/%Y", "DD/MM/YYYY  (Euro)"),
+    "ymd":  ("%Y/%m/%d", "YYYY/MM/DD"),
+}
+DEFAULT_DATE_FORMAT = "us"
+
+
+def resolve_date_format(settings_map) -> str:
+    """Chosen format key, falling back to the legacy euro_dates boolean."""
+    key = (settings_map.get("date_format") or "").strip().lower()
+    if key in DATE_FORMATS:
+        return key
+    return "euro" if settings_map.get("euro_dates", "0") == "1" else DEFAULT_DATE_FORMAT
+
+
+def fmt_date(date_str, fmt=DEFAULT_DATE_FORMAT) -> str:
     if date_str is None or pd.isna(date_str):
         return "—"
     d = pd.to_datetime(date_str)
-    return d.strftime("%d/%m/%Y") if euro else d.strftime("%m/%d/%Y")
+    if isinstance(fmt, bool):                    # legacy euro=True/False callers
+        fmt = "euro" if fmt else "us"
+    return d.strftime(DATE_FORMATS.get(fmt, DATE_FORMATS[DEFAULT_DATE_FORMAT])[0])
 
 
 def fmt_price(v) -> str:
@@ -416,6 +440,53 @@ def _yf_symbol(ticker: str, exchange: str = "") -> str:
     return ticker
 
 
+# Yahoo quotes a handful of markets in a currency *subunit* rather than the major
+# unit — London in pence (GBp), Johannesburg in cents (ZAc), Tel Aviv in agorot
+# (ILA) — while a trade is always logged in the major unit. Unscaled, a 33.11
+# Shell entry meets a "3311.00" quote and every live price, unrealized P&L and
+# trailing stop on that trade is out by 100x.
+_SUBUNIT_DIVISOR: dict[str, float] = {"GBp": 100.0, "ZAc": 100.0, "ILA": 100.0}
+_SUBUNIT_MAJOR:   dict[str, str]   = {"GBp": "GBP",  "ZAc": "ZAR",  "ILA": "ILS"}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def quote_units(symbol: str) -> tuple:
+    """(divisor, currency code) describing how Yahoo quotes `symbol`.
+
+    Dividing a quote by the divisor lands it in the major currency unit, which
+    is the code returned — so a pence-quoted LSE line answers (100.0, "GBP")
+    and an ordinary EUR listing answers (1.0, "EUR"). The unit is a property of
+    the individual listing, not the exchange (an LSE line can be quoted in GBP,
+    USD or EUR), so it comes from the quote itself. Only suffixed symbols are
+    asked: a bare symbol is a US listing, always whole USD. Cached for a day —
+    a listing does not change the currency it trades in intraday.
+    """
+    if not symbol or "." not in symbol:
+        return 1.0, "USD"
+    try:
+        cur = str(yf.Ticker(symbol).fast_info.currency or "")
+    except Exception:
+        return 1.0, ""
+    if cur in _SUBUNIT_DIVISOR:
+        return _SUBUNIT_DIVISOR[cur], _SUBUNIT_MAJOR[cur]
+    return 1.0, cur.upper()
+
+
+def quote_divisor(symbol: str) -> float:
+    """Divisor taking a Yahoo quote for `symbol` to its major currency unit."""
+    return quote_units(symbol)[0]
+
+
+def scale_quote(value, divisor: float):
+    """Apply a `quote_divisor` result to one price. None-safe, never raises."""
+    if value is None or divisor == 1.0:
+        return value
+    try:
+        return float(value) / divisor
+    except (TypeError, ValueError):
+        return value
+
+
 def build_option_symbol(ticker: str, expiration, strike: float, opt_type: str) -> str:
     """OCC-format symbol: AAPL261231C00242500  (strike × 1000, zero-padded to 8 digits)."""
     exp       = pd.to_datetime(expiration)
@@ -511,6 +582,15 @@ def _yf_get_live_data(symbols: tuple) -> dict:
                 result[t] = {"price": fi.last_price, "prev_close": fi.previous_close}
             except Exception:
                 result[t] = {"price": None, "prev_close": None}
+    # Both paths above hand back raw Yahoo quotes, which for some non-US
+    # listings are in a currency subunit. Normalise once here so every caller —
+    # the trade table, unrealized P&L, the open-positions panel — compares like
+    # with like against the logged entry price.
+    for _sym, _row in result.items():
+        _div = quote_divisor(_sym)
+        if _div != 1.0:
+            _row["price"]      = scale_quote(_row.get("price"), _div)
+            _row["prev_close"] = scale_quote(_row.get("prev_close"), _div)
     return result
 
 
@@ -999,28 +1079,38 @@ def get_underlying_price_at_date(ticker: str, date_str: str) -> float | None:
 
 
 @st.cache_data(ttl=3600)
-def get_highest_high_since(ticker: str, entry_date: str) -> float | None:
-    """Return the highest intraday High for ticker from entry_date through today."""
+def get_highest_high_since(ticker: str, entry_date: str, exchange: str = "") -> float | None:
+    """Return the highest intraday High for ticker from entry_date through today.
+
+    Takes the trade's exchange so a non-US holding is priced off its own listing
+    rather than whatever US symbol happens to share the ticker, and returns the
+    high in the major currency unit — a trailing stop derived from a pence quote
+    would sit 100x above the position."""
+    sym = _yf_symbol(ticker, exchange)
     try:
         today = pd.Timestamp.today().strftime("%Y-%m-%d")
-        raw   = yf.download(ticker, start=entry_date, end=today,
+        raw   = yf.download(sym, start=entry_date, end=today,
                              auto_adjust=True, progress=False)
         if raw.empty:
             return None
         highs = raw["High"]
         if isinstance(highs, pd.DataFrame):
             highs = highs.iloc[:, 0]
-        return float(highs.max())
+        return scale_quote(float(highs.max()), quote_divisor(sym))
     except Exception:
         return None
 
 
 @st.cache_data(ttl=30)
 def _get_single_live_price(ticker: str, exchange: str = "") -> float | None:
-    """Fast single-ticker price lookup for trade-entry forms (30-second cache)."""
+    """Fast single-ticker price lookup for trade-entry forms (30-second cache).
+
+    Returned in the listing's major currency unit, so it is directly comparable
+    to the price the user typed (see `quote_units`)."""
+    sym = _yf_symbol(ticker, exchange)
     try:
-        p = yf.Ticker(_yf_symbol(ticker, exchange)).fast_info.last_price
-        return float(p) if p else None
+        p = yf.Ticker(sym).fast_info.last_price
+        return scale_quote(float(p), quote_divisor(sym)) if p else None
     except Exception:
         return None
 
@@ -1116,10 +1206,20 @@ def get_ticker_metadata(tickers: tuple) -> dict:
 
 @st.cache_data(ttl=3600)
 def load_chart_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """OHLCV for a Yahoo symbol, priced in the major currency unit.
+
+    `ticker` is a Yahoo symbol, so a non-US listing needs its suffix (SHEL.L).
+    Price columns are scaled out of any subunit quote; Volume is left alone."""
     try:
         raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
+        div = quote_divisor(ticker)
+        if div != 1.0 and not raw.empty:
+            raw = raw.copy()
+            for _c in ("Open", "High", "Low", "Close", "Adj Close"):
+                if _c in raw.columns:
+                    raw[_c] = raw[_c] / div
         return raw
     except Exception:
         return pd.DataFrame()
@@ -1881,6 +1981,25 @@ def load_attachments(trade_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def _link_tags(conn, trade_id: int, tag_ids) -> None:
+    """Attach tags to a trade, skipping any id that no longer exists.
+
+    A browser session caches the tag name -> id map, so a tag deleted behind a
+    live session — or a whole database swapped underneath one, which is what the
+    demo DB does since launch_demo.bat re-seeds it from scratch on every launch —
+    leaves the picker handing us ids that are gone. Inserting one raises
+    "FOREIGN KEY constraint failed" (INSERT OR IGNORE does not cover FK errors),
+    which used to roll the whole trade back. Dropping the dangling id saves the
+    trade instead; the stale tag is simply not applied.
+    """
+    for tid in tag_ids or []:
+        if conn.execute("SELECT 1 FROM tags WHERE id=?", (tid,)).fetchone():
+            conn.execute(
+                "INSERT OR IGNORE INTO trade_tags (trade_id, tag_id) VALUES (?, ?)",
+                (trade_id, tid),
+            )
+
+
 def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
               notes, stop_enabled, opening_stop, tag_ids, current_stop=None,
               instrument_type="stock", expiration=None, strike=None, option_type=None,
@@ -1934,8 +2053,7 @@ def add_trade(entry_date, ticker, quantity, entry_price, exit_date, exit_price,
             int(plan_id) if plan_id else None,
         ))
         trade_id = cur.lastrowid
-        for tid in tag_ids:
-            conn.execute("INSERT OR IGNORE INTO trade_tags (trade_id, tag_id) VALUES (?, ?)", (trade_id, tid))
+        _link_tags(conn, trade_id, tag_ids)
         # Record the opening lot so tax-lot view starts populated
         if entry_date and entry_price and quantity:
             _lot_date = entry_date.isoformat() if hasattr(entry_date, "isoformat") else str(entry_date)
@@ -2030,8 +2148,7 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
         vals.append(trade_id)
         conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", vals)
         conn.execute("DELETE FROM trade_tags WHERE trade_id=?", (trade_id,))
-        for tid in tag_ids:
-            conn.execute("INSERT OR IGNORE INTO trade_tags (trade_id, tag_id) VALUES (?, ?)", (trade_id, tid))
+        _link_tags(conn, trade_id, tag_ids)
 
 
 def update_spread_group(trade_ids: list, leg_group: str | None, spread_type: str | None):
@@ -2789,7 +2906,8 @@ def _exp_effective_stop(row):
     try:
         ta = float(ta)
         if side == "long":
-            hh = get_highest_high_since(row.get("ticker") or "", row.get("entry_date") or "")
+            hh = get_highest_high_since(row.get("ticker") or "", row.get("entry_date") or "",
+                                        row.get("exchange") or "")
             if hh is None:
                 return cs
             if tt == "$":
@@ -2865,6 +2983,11 @@ def _compute_review_rows(df: "pd.DataFrame", live_data: dict, acct_bal: float) -
             "pnl_net": pnl_net,
             "open_risk": open_risk,
             "commission": commission,
+            # NaT is truthy, so `or ""` would leak it through and blow up on
+            # strftime downstream — normalise missing exits to an empty string.
+            "exit_date": ("" if (r.get("exit_date") is None or pd.isna(r.get("exit_date")))
+                          else str(r.get("exit_date"))),
+            "exit_price": xp,
             "days_held": _exp_days_held(r.get("entry_date"), r.get("exit_date")),
             "tags": str(r.get("tags") or ""),
             "notes": str(r.get("notes") or ""),
@@ -2942,6 +3065,223 @@ def _account_summary_lines(all_rows: list, open_rows: list, closed_rows: list,
     ]
 
 
+# ── Review-export chart settings ───────────────────────────────────────────────
+# The on-screen trade chart's controls (timeframe, overlays, SMAs) live in
+# session_state and are shared across trades, so the export can't inherit them.
+# These fix what every exported chart shows, which also keeps one student's
+# report directly comparable to another's.
+REVIEW_CHART_BACK_MONTHS = 6      # history shown before the entry
+REVIEW_CHART_FWD_MONTHS  = 1      # follow-through shown after the close
+REVIEW_PRICE_SMAS        = (50, 150)
+REVIEW_VOL_SMA           = 50
+
+_RV_UP     = "#2ecc71"
+_RV_DOWN   = "#e74c3c"
+_RV_SMA    = {50: "#f39c12", 150: "#3498db"}
+_RV_VOLSMA = "#7f8c8d"
+_RV_AXIS   = "#9aa4b2"
+_RV_GRID   = "#e6eaf1"
+_RV_MARK   = "#334155"
+
+
+def _review_chart_window(entry_date, exit_date):
+    """(display_start, end) ISO strings framing one trade."""
+    entry = pd.to_datetime(entry_date, errors="coerce")
+    if pd.isna(entry):
+        return None, None
+    last = pd.to_datetime(exit_date, errors="coerce")
+    if pd.isna(last):
+        last = pd.Timestamp.today().normalize()
+    start = (entry - pd.DateOffset(months=REVIEW_CHART_BACK_MONTHS)).strftime("%Y-%m-%d")
+    end   = (last  + pd.DateOffset(months=REVIEW_CHART_FWD_MONTHS)).strftime("%Y-%m-%d")
+    return start, end
+
+
+def _review_trade_chart(t, width: float, height: float):
+    """One trade's price + volume chart as a reportlab Drawing, or None.
+
+    Mirrors the on-screen trade chart — candles, volume, and vertical entry/exit
+    markers — but draws straight into the PDF with reportlab. Plotly's static
+    export would mean shipping kaleido and a headless browser to every install;
+    this needs nothing that isn't already a dependency.
+    """
+    from reportlab.graphics.shapes import Drawing, Rect, Line, PolyLine, String
+    from reportlab.lib import colors as _c
+
+    disp_start, end = _review_chart_window(t.get("entry_date"), t.get("exit_date"))
+    if not disp_start:
+        return None
+
+    # Pull extra history before the window so the 150-day SMA is already warm at
+    # the left edge — six months is only ~126 trading days, so without this the
+    # slower average would be blank across the whole chart.
+    warm = (pd.to_datetime(disp_start) - pd.Timedelta(days=320)).strftime("%Y-%m-%d")
+    raw = load_chart_data(_yf_symbol(str(t.get("ticker") or ""), str(t.get("exchange") or "")),
+                          warm, end)
+    if raw is None or getattr(raw, "empty", True):
+        return None
+    if any(c not in raw.columns for c in ("Open", "High", "Low", "Close")):
+        return None
+    raw = raw.dropna(subset=["Open", "High", "Low", "Close"])
+    if raw.empty:
+        return None
+
+    sma_full = {n: raw["Close"].rolling(n).mean() for n in REVIEW_PRICE_SMAS}
+    vol_full = raw["Volume"] if "Volume" in raw.columns else None
+    vsm_full = vol_full.rolling(REVIEW_VOL_SMA).mean() if vol_full is not None else None
+
+    keep = raw.index >= pd.to_datetime(disp_start)
+    df   = raw[keep]
+    if len(df) < 2:
+        return None
+    smas = {n: s[keep] for n, s in sma_full.items()}
+    vol  = vol_full[keep] if vol_full is not None else None
+    vsma = vsm_full[keep] if vsm_full is not None else None
+
+    # ── Geometry ─────────────────────────────────────────────────────────────
+    L, R, B, T = 46.0, 6.0, 15.0, 18.0
+    plot_w  = width - L - R
+    body_h  = height - B - T
+    gap     = 9.0
+    price_h = body_h * 0.70
+    vol_h   = body_h - price_h - gap
+    price_y = B + vol_h + gap
+    vol_y   = B
+
+    n  = len(df)
+    bw = plot_w / n
+
+    def xc(i):
+        return L + (i + 0.5) * bw
+
+    lo = float(df["Low"].min())
+    hi = float(df["High"].max())
+    for s in smas.values():
+        s2 = s.dropna()
+        if not s2.empty:
+            lo = min(lo, float(s2.min()))
+            hi = max(hi, float(s2.max()))
+    if not (hi > lo):
+        hi = lo + 1.0
+    pad = (hi - lo) * 0.04
+    lo, hi = lo - pad, hi + pad
+
+    def py(v):
+        return price_y + (float(v) - lo) / (hi - lo) * price_h
+
+    vmax = 0.0
+    if vol is not None and not vol.dropna().empty:
+        vmax = float(vol.max())
+        if vsma is not None and not vsma.dropna().empty:
+            vmax = max(vmax, float(vsma.max()))
+
+    def vy(v):
+        return vol_y + (float(v) / vmax) * vol_h if vmax > 0 else vol_y
+
+    d = Drawing(width, height)
+    d.hAlign = "CENTER"
+
+    # ── Price gridlines + axis labels ────────────────────────────────────────
+    for k in range(5):
+        v = lo + (hi - lo) * k / 4.0
+        y = py(v)
+        d.add(Line(L, y, L + plot_w, y, strokeColor=_c.HexColor(_RV_GRID), strokeWidth=0.35))
+        d.add(String(L - 4, y - 2.4, format(v, ",.2f"),
+                     fontSize=5.5, textAnchor="end", fillColor=_c.HexColor(_RV_AXIS)))
+
+    # ── Candles ──────────────────────────────────────────────────────────────
+    o_ = df["Open"].values
+    h_ = df["High"].values
+    l_ = df["Low"].values
+    c_ = df["Close"].values
+    body_w = max(bw * 0.62, 0.5)
+    for i in range(n):
+        col = _c.HexColor(_RV_UP if c_[i] >= o_[i] else _RV_DOWN)
+        x   = xc(i)
+        d.add(Line(x, py(l_[i]), x, py(h_[i]), strokeColor=col, strokeWidth=0.4))
+        y0 = py(min(o_[i], c_[i]))
+        y1 = py(max(o_[i], c_[i]))
+        d.add(Rect(x - body_w / 2, y0, body_w, max(y1 - y0, 0.5),
+                   fillColor=col, strokeColor=col, strokeWidth=0.2))
+
+    # ── Moving averages (broken at the NaN warm-up gaps) ─────────────────────
+    def _polyline(series, mapper, color, w=0.7):
+        run = []
+        for i, v in enumerate(series.values):
+            if v is None or pd.isna(v):
+                if len(run) >= 4:
+                    d.add(PolyLine(run, strokeColor=_c.HexColor(color), strokeWidth=w))
+                run = []
+            else:
+                run.extend([xc(i), mapper(v)])
+        if len(run) >= 4:
+            d.add(PolyLine(run, strokeColor=_c.HexColor(color), strokeWidth=w))
+
+    for nsma in REVIEW_PRICE_SMAS:
+        _polyline(smas[nsma], py, _RV_SMA.get(nsma, "#888888"))
+
+    # ── Volume panel ─────────────────────────────────────────────────────────
+    if vmax > 0:
+        vv = vol.values
+        for i in range(n):
+            if pd.isna(vv[i]):
+                continue
+            col = _c.HexColor(_RV_UP if c_[i] >= o_[i] else _RV_DOWN)
+            d.add(Rect(xc(i) - body_w / 2, vol_y, body_w, max(vy(vv[i]) - vol_y, 0.3),
+                       fillColor=col, strokeColor=None, fillOpacity=0.55))
+        if vsma is not None:
+            _polyline(vsma, vy, _RV_VOLSMA, 0.6)
+        d.add(String(L + 2, vol_y + vol_h - 5,
+                     "Volume - SMA " + str(REVIEW_VOL_SMA),
+                     fontSize=5, fillColor=_c.HexColor(_RV_AXIS)))
+
+    # ── Entry / exit markers ─────────────────────────────────────────────────
+    def _bar_at(when):
+        ts = pd.to_datetime(when, errors="coerce")
+        if pd.isna(ts):
+            return None
+        pos = int(df.index.searchsorted(ts))
+        return min(max(pos, 0), n - 1)
+
+    marks = []
+    for when, label, anchor in ((t.get("entry_date"), "Entry", "start"),
+                                (t.get("exit_date"),  "Exit",  "end")):
+        i = _bar_at(when)
+        if i is not None:
+            marks.append((i, label, anchor))
+
+    # On a short hold the two markers land within a few points of each other and
+    # their labels overlap into an unreadable smear — stack them instead.
+    stacked = len(marks) == 2 and abs(xc(marks[1][0]) - xc(marks[0][0])) < 26.0
+    for k, (i, label, anchor) in enumerate(marks):
+        x = xc(i)
+        d.add(Line(x, B, x, price_y + price_h, strokeColor=_c.HexColor(_RV_MARK),
+                   strokeWidth=0.7, strokeDashArray=[2, 2]))
+        ly = price_y + price_h + 3.0 + (6.5 if (stacked and k == 1) else 0.0)
+        d.add(String(x + (2 if anchor == "start" else -2), ly,
+                     label, fontSize=6, textAnchor=anchor,
+                     fillColor=_c.HexColor(_RV_MARK)))
+
+    # ── Date axis ────────────────────────────────────────────────────────────
+    for k in range(5):
+        i = int(round(k * (n - 1) / 4.0))
+        anchor = "start" if k == 0 else ("end" if k == 4 else "middle")
+        d.add(String(xc(i), 4.0, pd.Timestamp(df.index[i]).strftime("%b %Y"),
+                     fontSize=5.5, textAnchor=anchor, fillColor=_c.HexColor(_RV_AXIS)))
+
+    # ── Legend + panel borders ───────────────────────────────────────────────
+    lx = L + 3
+    for nsma in REVIEW_PRICE_SMAS:
+        d.add(String(lx, price_y + price_h - 6, "SMA " + str(nsma), fontSize=5.5,
+                     fillColor=_c.HexColor(_RV_SMA.get(nsma, "#888888"))))
+        lx += 30
+    for y0, hh in ((price_y, price_h), (vol_y, vol_h)):
+        if hh > 0:
+            d.add(Rect(L, y0, plot_w, hh, fillColor=None,
+                       strokeColor=_c.HexColor(_RV_GRID), strokeWidth=0.4))
+    return d
+
+
 def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float) -> bytes:
     """Build the 'Export for Review' PDF (trade log + full stats) and return its bytes."""
     from io import BytesIO
@@ -2951,7 +3291,7 @@ def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float
     from reportlab.lib.units import inch
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
-                                    Paragraph, Spacer)
+                                    Paragraph, Spacer, PageBreak, KeepTogether)
 
     # ── Gather + filter (entry date within range) ────────────────────────────
     df = load_trades()
@@ -2988,7 +3328,7 @@ def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float
 
     story = []
     story.append(Paragraph("Trade Log — Export for Review", h1))
-    _range = f"{fmt_date(str(start_date), euro_dates)}  →  {fmt_date(str(end_date), euro_dates)}"
+    _range = f"{fmt_date(str(start_date), date_fmt)}  →  {fmt_date(str(end_date), date_fmt)}"
     story.append(Paragraph(
         f"Trades by entry date: <b>{_range}</b> &nbsp;·&nbsp; "
         f"Account balance: <b>{fmt_price(acct_bal) if acct_bal else '—'}</b> &nbsp;·&nbsp; "
@@ -3005,7 +3345,7 @@ def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float
         for t in rows:
             data.append([
                 _para(t["ticker"]),
-                fmt_date(str(t["entry_date"]), euro_dates),
+                fmt_date(str(t["entry_date"]), date_fmt),
                 fmt_qty(t["qty"]) if t["qty"] is not None else "—",
                 fmt_price(t["entry_price"]) if t["entry_price"] is not None else "—",
                 fmt_price(t["stop"]) if t["stop"] is not None else "—",
@@ -3061,6 +3401,46 @@ def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float
         ("RIGHTPADDING", (0, 0), (-1, -1), 10),
     ]))
     story.append(stats_layout)
+
+    # ── Per-trade charts ─────────────────────────────────────────────────────
+    # One chart per trade, framing the entry and exit the same way for every
+    # trade so reports stay comparable. Charts are the slow part of the report
+    # (one price download per ticker, cached for an hour), so a failure to draw
+    # any single one is noted in place rather than losing the whole export.
+    if rows:
+        story.append(PageBreak())
+        story.append(Paragraph("Trade Charts", h2))
+        story.append(Paragraph(
+            f"{REVIEW_CHART_BACK_MONTHS} months before entry through "
+            f"{REVIEW_CHART_FWD_MONTHS} month after the close &nbsp;·&nbsp; "
+            f"{REVIEW_PRICE_SMAS[0]}/{REVIEW_PRICE_SMAS[1]}-day SMA on price "
+            f"&nbsp;·&nbsp; {REVIEW_VOL_SMA}-day SMA on volume", sub))
+        story.append(Spacer(1, 6))
+
+        for t in rows:
+            head = (f"<b>{_xesc(t['ticker'])}</b> &nbsp;·&nbsp; "
+                    f"entry {fmt_date(str(t['entry_date']), date_fmt)}")
+            if t.get("exit_date"):
+                head += f" &nbsp;→&nbsp; exit {fmt_date(str(t['exit_date']), date_fmt)}"
+            else:
+                head += " &nbsp;·&nbsp; <i>open</i>"
+            if t.get(pnl_key) is not None:
+                head += f" &nbsp;·&nbsp; P&amp;L {_xesc(fmt_pnl(t[pnl_key]))}"
+
+            try:
+                drawing = _review_trade_chart(t, 9.4 * inch, 3.05 * inch)
+            except Exception as _ce:
+                drawing = None
+                _why = f"chart could not be drawn ({type(_ce).__name__})"
+            else:
+                _why = "no price history available for this window"
+
+            block = [Paragraph(head, h3)]
+            block.append(drawing if drawing is not None
+                         else Paragraph(f"{_xesc(t['ticker'])} — {_why}.", sub))
+            story.append(KeepTogether(block))
+            story.append(Spacer(1, 12))
+
 
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=landscape(letter),
@@ -3148,7 +3528,7 @@ for _ck in ("_v_trades", "_v_settings", "_v_tags", "_v_accounts", "_v_equity", "
 
 settings   = _cached_get_settings(st.session_state["_v_settings"])
 today_ts   = pd.Timestamp.today().normalize()
-euro_dates = settings.get("euro_dates", "0") == "1"
+date_fmt   = resolve_date_format(settings)
 
 # ── Active theme + chart color shorthands ─────────────────────────────────────
 _theme_key    = settings.get("app_theme", "ocean_dark")
@@ -3880,9 +4260,9 @@ TOUR_STEPS = [
         "page": "⚙️  Settings",
         "title": "Choose your date format",
         "body": (
-            "In the **Display** section, flip **Euro dates** on if you prefer "
-            "**DD/MM/YYYY** instead of **MM/DD/YYYY**. This changes how every date is "
-            "shown across the app."
+            "In the **Display** section, pick **MM/DD/YYYY (US)**, "
+            "**DD/MM/YYYY (Euro)** or **YYYY/MM/DD**. This changes how every "
+            "date is shown across the app."
         ),
     },
     {
@@ -3902,9 +4282,9 @@ TOUR_STEPS = [
         "title": "Add any extra currencies",
         "body": (
             "Trading in a non-USD account? Open **Multi-Currency**, switch it on, and "
-            "pick your **native currency** (AUD, CAD, EUR, GBP).\n\n"
-            "Trade Log will then show P&L converted to your currency alongside the USD "
-            "figures. USD-only? Skip ahead."
+            "pick your **default currency** (AUD, CAD, EUR, GBP).\n\n"
+            "New trades will start on that currency, and Trade Log will show P&L "
+            "converted to it alongside the USD figures. USD-only? Skip ahead."
         ),
     },
     {
@@ -4181,7 +4561,7 @@ if page == "📋  Trading Log":
         _at_lk_label = "Symbol" if _at_inst == "Future" else "Underlying Ticker" if _at_inst == "Option" else "Ticker"
         with st.container(border=True, key="add_need_ticker"):
             if _at_inst == "Stock":
-                _tlk1, _tlk2, _tlk3 = st.columns([2, 3, 1])
+                _tlk1, _tlkx, _tlk2, _tlk3 = st.columns([1.5, 1.5, 3, 1])
                 _tlk3.checkbox("Trailing Stop", key="add_trailing_en", value=False)
             else:
                 _tlk1, _tlk2 = st.columns([2, 3])
@@ -4193,7 +4573,20 @@ if page == "📋  Trading Log":
                 label_visibility="visible",
             )
             _at_ticker = _at_ticker_raw.strip().upper()
-            _at_exchange = st.session_state.get("add_stock_exchange", "") or ""
+            # Exchange sits out here beside the ticker rather than in the form's
+            # Advanced section: widgets inside an st.form do not publish to
+            # session_state until that form is submitted, so the lookup below
+            # could never see the choice until after the trade was already saved.
+            if _at_inst == "Stock":
+                _at_exchange = _tlkx.selectbox(
+                    "Exchange",
+                    options=[code for code, _ in _EXCHANGE_OPTIONS],
+                    format_func=lambda c: _EXCHANGE_LABEL.get(c, c),
+                    key="add_stock_exchange",
+                    help="Leave as US / Default for NYSE, NASDAQ and other US exchanges.",
+                ) or ""
+            else:
+                _at_exchange = ""
             if _at_ticker:
                 _at_price = _get_single_live_price(_at_ticker, _at_exchange)
                 _at_yf_sym = _yf_symbol(_at_ticker, _at_exchange)
@@ -4208,15 +4601,28 @@ if page == "📋  Trading Log":
                         "<div style='font-size:0.82rem;color:#888;margin-top:2px'>"
                         + " · ".join(_at_meta_bits) + "</div>"
                     ) if _at_meta_bits else ""
+                    # Label the quote with the listing's own currency — a bare
+                    # "$" on an LSE line reads as dollars when it is pounds.
+                    _at_ccy    = quote_units(_at_yf_sym)[1] or "USD"
+                    _at_px_txt = (f"{currency_symbol(_at_ccy)}{_at_price:,.2f}"
+                                  if _at_ccy in NATIVE_CURRENCIES
+                                  else f"{_at_price:,.2f} {_at_ccy}")
                     _tlk2.markdown(
                         f"<div style='padding-top:28px;font-size:1rem'>"
                         f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
-                        f"${_at_price:,.2f}</span>{_at_meta}</div>",
+                        f"{_at_px_txt}</span>{_at_meta}</div>",
                         unsafe_allow_html=True,
                     )
                 else:
                     _sym_hint = f" ({_at_yf_sym})" if _at_yf_sym != _at_ticker else ""
                     _tlk2.caption(f"No price found{_sym_hint} — check the ticker or exchange code.")
+            if _at_inst == "Stock":
+                st.caption(
+                    "**Non-US listing?** Pick the **Exchange** first, then type the plain local "
+                    "ticker — Tesco on the LSE is `TSCO`, not `TSCO.L`. Trade Log adds the Yahoo "
+                    "suffix itself, and converts pence-quoted London prices to pounds so they "
+                    "match what you type. The exchange sticks until you change it."
+                )
 
         # ── Optional: link a saved trading plan ───────────────────────────────
         # Outside the form so picking a plan reacts immediately — it shows the
@@ -4235,6 +4641,22 @@ if page == "📋  Trading Log":
         if _add_sel_plan:
             st.info(_plan_summary_md(_add_sel_plan))
 
+        # Default currency for new trades, from Settings -> Multi-Currency. It is
+        # only a starting point: the picker inside the form still overrides it
+        # per trade. Passed as index= so the form's clear_on_submit reset lands
+        # back on the default, and re-seeded into session state when the setting
+        # itself changes so a saved change takes effect without a restart.
+        _add_def_ccy = str(settings.get("native_currency", "USD") or "USD").upper()
+        if _add_def_ccy not in NATIVE_CURRENCIES:
+            _add_def_ccy = "USD"
+        _add_ccy_idx = list(NATIVE_CURRENCIES).index(_add_def_ccy)
+        if st.session_state.get("_add_ccy_setting") != _add_def_ccy:
+            # Drop the widget's stored choice rather than assigning to it —
+            # index= then supplies the new default, and Streamlit does not warn
+            # about a keyed widget being written to from both sides.
+            st.session_state["_add_ccy_setting"] = _add_def_ccy
+            st.session_state.pop("add_stock_ccy", None)
+
         with st.form("add_trade", clear_on_submit=True):
             inst   = st.session_state.get("add_inst_type", "Stock")
             n_legs = max(1, int(st.session_state.get("add_num_legs", 1))) if inst != "Stock" else 1
@@ -4252,10 +4674,13 @@ if page == "📋  Trading Log":
                     add_ccy = c4.selectbox(
                         "Currency",
                         options=list(NATIVE_CURRENCIES),
+                        index=_add_ccy_idx,
                         format_func=lambda c: f"{currency_symbol(c)}  {c}",
                         key="add_stock_ccy",
                         help=(
                             "The currency you are typing prices in — entry, stop, and exit. "
+                            f"Defaults to {_add_def_ccy} (Settings → Multi-Currency); change it "
+                            "here for a one-off trade. "
                             "Anything other than USD is converted at that date's FX rate and "
                             "stored in USD, so every stat stays comparable across currencies."
                         ),
@@ -4287,13 +4712,12 @@ if page == "📋  Trading Log":
                     stock_account    = ca1.selectbox("Account", options=all_accounts, key="add_stock_acct")
                     stock_commission = ca2.number_input("Commission ($)", min_value=0.0, step=0.01,
                                                         format="%.2f", value=_default_commission, key="add_stock_comm")
-                    stock_exchange = st.selectbox(
-                        "Exchange",
-                        options=[code for code, _ in _EXCHANGE_OPTIONS],
-                        format_func=lambda c: _EXCHANGE_LABEL.get(c, c),
-                        key="add_stock_exchange",
-                        help="Leave as US / Default for NYSE, NASDAQ, and other US exchanges.",
-                    )
+                    # Exchange is chosen beside the ticker above, outside the
+                    # form, so the live lookup can react to it.
+                    stock_exchange = _at_exchange
+                    if stock_exchange:
+                        st.caption(f"Exchange: **{_EXCHANGE_LABEL.get(stock_exchange, stock_exchange)}** "
+                                   "— change it next to the ticker above.")
                     uploaded_files = st.file_uploader(
                         "Attachments", accept_multiple_files=True,
                         type=["png", "jpg", "jpeg", "gif", "pdf", "webp"],
@@ -4453,7 +4877,7 @@ if page == "📋  Trading Log":
                                 "title": f"{t} added to your log.",
                                 "lines": [
                                     f"- **Quantity:** {fmt_qty(quantity)}",
-                                    f"- **Entry:** {_conf_entry} on {fmt_date(entry_date, euro_dates)}",
+                                    f"- **Entry:** {_conf_entry} on {fmt_date(entry_date, date_fmt)}",
                                 ],
                             }
                             st.rerun()
@@ -4509,7 +4933,7 @@ if page == "📋  Trading Log":
                                     "title": f"{t} option added to your log.",
                                     "lines": [
                                         f"- **Legs:** {added}",
-                                        f"- **Entry date:** {fmt_date(opt_entry_dt, euro_dates)}",
+                                        f"- **Entry date:** {fmt_date(opt_entry_dt, date_fmt)}",
                                     ],
                                 }
                                 st.rerun()
@@ -4546,7 +4970,7 @@ if page == "📋  Trading Log":
                                 "title": f"{t} futures trade added to your log.",
                                 "lines": [
                                     f"- **Contracts:** {fmt_qty(quantity)}",
-                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, euro_dates)}",
+                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, date_fmt)}",
                                 ],
                             }
                             st.rerun()
@@ -4589,7 +5013,7 @@ if page == "📋  Trading Log":
             st.info("No open trades available.")
         else:
             def _multi_label(row):
-                return (f"{row['ticker']}  ·  {fmt_date(row['entry_date'], euro_dates)}"
+                return (f"{row['ticker']}  ·  {fmt_date(row['entry_date'], date_fmt)}"
                         f"  ·  {fmt_qty(row['quantity'])} @ {fmt_price(row['entry_price'])}"
                         f"  (ID {row['id']})")
 
@@ -4714,7 +5138,7 @@ if page == "📋  Trading Log":
             st.info("No open trades to attach dividends to.")
         else:
             def _div_trade_label(row):
-                return (f"{row['ticker']}  ·  {fmt_date(row['entry_date'], euro_dates)}"
+                return (f"{row['ticker']}  ·  {fmt_date(row['entry_date'], date_fmt)}"
                         f"  ·  {fmt_qty(row['quantity'])} shares  (ID {row['id']})")
 
             # Search + select above the two-column layout so both sides share the same trade
@@ -4795,7 +5219,7 @@ if page == "📋  Trading Log":
                 st.markdown("##### Create / Extend Roll Group")
                 _opt_labels = _option_trades.apply(
                     lambda r: f"{r['ticker']} {r.get('option_type','?')} ${r.get('strike','?')} "
-                              f"exp {fmt_date(r.get('expiration'), euro_dates)} (ID {r['id']})",
+                              f"exp {fmt_date(r.get('expiration'), date_fmt)} (ID {r['id']})",
                     axis=1,
                 ).tolist()
                 _roll_search   = st.text_input("🔍 Search legs (ticker, strike, ID)",
@@ -4854,7 +5278,7 @@ if page == "📋  Trading Log":
 
     def trade_label(row):
         inst = str(row.get("instrument_type") or "stock").capitalize()
-        return f"{row['ticker']}  ·  {fmt_date(row['entry_date'], euro_dates)}  ·  {inst}  (ID {row['id']})"
+        return f"{row['ticker']}  ·  {fmt_date(row['entry_date'], date_fmt)}  ·  {inst}  (ID {row['id']})"
 
     if trades.empty:
         st.info("No trades yet. Use the form above to add your first trade.")
@@ -4891,7 +5315,7 @@ if page == "📋  Trading Log":
                         _lbl = f"**{_op['ticker']}**" + (f" · {_opinst}" if _opinst != "stock" else "")
                         cpa.markdown(
                             f"{_lbl}<br><span style='color:#888;font-size:0.85rem'>"
-                            f"{fmt_qty(_opqty)} @ {fmt_price(_opep)} · {fmt_date(_op['entry_date'], euro_dates)}"
+                            f"{fmt_qty(_opqty)} @ {fmt_price(_opep)} · {fmt_date(_op['entry_date'], date_fmt)}"
                             f"</span>",
                             unsafe_allow_html=True,
                         )
@@ -5355,8 +5779,8 @@ if page == "📋  Trading Log":
             })
 
             display["Trade ID"]       = display["Trade ID"].astype(str)
-            display["Entry Date"]     = filtered["entry_date"].apply(lambda v: fmt_date(v, euro_dates))
-            display["Exit Date"]      = filtered["exit_date"].apply(lambda v: fmt_date(v, euro_dates))
+            display["Entry Date"]     = filtered["entry_date"].apply(lambda v: fmt_date(v, date_fmt))
+            display["Exit Date"]      = filtered["exit_date"].apply(lambda v: fmt_date(v, date_fmt))
             # Adjust displayed entry price (cost basis) by total dividends received per share
             _adj_ep_vals = np.where(
                 (_qty.values > 0) & (_div_series.values > 0),
@@ -5636,7 +6060,8 @@ if page == "📋  Trading Log":
                     return cs
                 # Trailing — need highest high since entry
                 hh = get_highest_high_since(row["ticker"],
-                                            str(row["entry_date"])[:10] if row.get("entry_date") else None)
+                                            str(row["entry_date"])[:10] if row.get("entry_date") else None,
+                                            row.get("exchange") or "")
                 if hh is None:
                     return cs
                 atr = metadata.get(row["ticker"], {}).get("atr14") if metadata else None
@@ -5644,7 +6069,8 @@ if page == "📋  Trading Log":
                 if side_val == "short":
                     # For shorts: trail above the lowest low
                     ll_val = get_highest_high_since(row["ticker"],
-                                                    str(row["entry_date"])[:10] if row.get("entry_date") else None)
+                                                    str(row["entry_date"])[:10] if row.get("entry_date") else None,
+                                                    row.get("exchange") or "")
                     if tt == "$":
                         return ll_val + float(ta) if ll_val is not None else cs
                     elif tt == "%":
@@ -5737,7 +6163,7 @@ if page == "📋  Trading Log":
             if "Leg" in vis:
                 display["Leg"] = filtered["leg_label"].apply(lambda v: str(v) if v and not pd.isna(v) else "—")
             if "Expiration" in vis:
-                display["Expiration"] = filtered["expiration"].apply(lambda v: fmt_date(v, euro_dates) if v and not pd.isna(v) else "—")
+                display["Expiration"] = filtered["expiration"].apply(lambda v: fmt_date(v, date_fmt) if v and not pd.isna(v) else "—")
             if "Strike" in vis:
                 display["Strike"] = filtered["strike"].apply(fmt_price)
             if "Option Type" in vis:
@@ -6138,7 +6564,7 @@ if page == "📋  Trading Log":
                             ].copy()
                             _id_df.columns = ["ID", "Entry Date", "Qty", "Entry Price", "Account", "side"]
                             _id_df["Qty"]         = (_id_df["Qty"] * _id_df["side"].map(lambda s: -1 if str(s).lower() == "short" else 1)).apply(lambda v: int(v) if v == int(v) else v)
-                            _id_df["Entry Date"]  = _id_df["Entry Date"].apply(lambda v: fmt_date(v, euro_dates))
+                            _id_df["Entry Date"]  = _id_df["Entry Date"].apply(lambda v: fmt_date(v, date_fmt))
                             _id_df["Entry Price"] = _id_df["Entry Price"].apply(fmt_price)
                             st.dataframe(_id_df.drop(columns=["side"]), width='stretch', hide_index=True)
 
@@ -6504,7 +6930,7 @@ if page == "📋  Trading Log":
                             )
                         if "Expiration" in _leg_disp:
                             _leg_disp["Expiration"] = _leg_disp["Expiration"].apply(
-                                lambda v: fmt_date(v, euro_dates) if v is not None and not pd.isna(v) else "—"
+                                lambda v: fmt_date(v, date_fmt) if v is not None and not pd.isna(v) else "—"
                             )
                         if "Strike" in _leg_disp:
                             _leg_disp["Strike"] = _leg_disp["Strike"].apply(fmt_price)
@@ -6871,8 +7297,8 @@ if page == "📋  Trading Log":
                 trade_status = "Open" if trade_is_open else "Closed"
                 fig.update_layout(
                     title=f"{chart_ticker}  ·  "
-                          f"{fmt_date(chart_row['entry_date'], euro_dates)} → "
-                          f"{fmt_date(chart_row['exit_date'] if not trade_is_open else str(today_ts.date()), euro_dates)}"
+                          f"{fmt_date(chart_row['entry_date'], date_fmt)} → "
+                          f"{fmt_date(chart_row['exit_date'] if not trade_is_open else str(today_ts.date()), date_fmt)}"
                           f"  ({trade_status})",
                     xaxis_rangeslider_visible=False,
                     hovermode="x unified",
@@ -7290,11 +7716,19 @@ elif page == "🛠️  Trading Tools":
                                           format="%d", key="atr_period")
             if atr_ticker.strip():
                 try:
-                    _atr_raw = yf.download(atr_ticker.strip().upper(),
+                    _atr_sym = atr_ticker.strip().upper()
+                    _atr_raw = yf.download(_atr_sym,
                                            period=f"{atr_period + 10}d",
                                            auto_adjust=True, progress=False)
                     if isinstance(_atr_raw.columns, pd.MultiIndex):
                         _atr_raw.columns = _atr_raw.columns.get_level_values(0)
+                    # A pence-quoted symbol would give an ATR 100x too wide.
+                    _atr_div = quote_divisor(_atr_sym)
+                    if _atr_div != 1.0 and not _atr_raw.empty:
+                        _atr_raw = _atr_raw.copy()
+                        for _c in ("Open", "High", "Low", "Close"):
+                            if _c in _atr_raw.columns:
+                                _atr_raw[_c] = _atr_raw[_c] / _atr_div
                     if not _atr_raw.empty and len(_atr_raw) >= atr_period:
                         _h  = _atr_raw["High"]
                         _lo = _atr_raw["Low"]
@@ -8489,7 +8923,10 @@ elif page == "📝  Trading Plan":
             raw = yf.download(ticker, period="2d", auto_adjust=True, progress=False)
             closes = raw["Close"].dropna() if not isinstance(raw.columns, pd.MultiIndex) else raw["Close"][ticker].dropna()
             if len(closes) >= 1:
-                return float(closes.iloc[-1]), float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
+                _div  = quote_divisor(ticker)
+                _last = scale_quote(float(closes.iloc[-1]), _div)
+                _prev = scale_quote(float(closes.iloc[-2]), _div) if len(closes) >= 2 else _last
+                return _last, _prev
         except Exception:
             pass
         return None, None
@@ -11435,7 +11872,7 @@ elif page == "⚙️  Settings":
     s_stop_unit   = settings.get("stop_dist_unit", "%")
     s_stop_yellow = float(settings.get("stop_dist_yellow",   5))
     s_stop_red    = float(settings.get("stop_dist_red",      2))
-    s_euro        = settings.get("euro_dates", "0") == "1"
+    s_date_fmt    = resolve_date_format(settings)
 
     # ── Theme ─────────────────────────────────────────────────────────────────
     with st.form("settings_theme_form"):
@@ -11498,11 +11935,21 @@ elif page == "⚙️  Settings":
     # ── Display ───────────────────────────────────────────────────────────────
     with st.form("settings_display_form"):
         st.markdown("#### Display")
-        new_euro = st.toggle("Euro dates (DD/MM/YYYY)",
-                             value=s_euro,
-                             help="Changes date display format across the entire app.")
+        # Every format is spelled out as its own choice rather than hiding US
+        # order behind an "off" toggle.
+        _fmt_keys = list(DATE_FORMATS)
+        new_date_fmt = st.radio(
+            "Date format",
+            options=_fmt_keys,
+            format_func=lambda k: DATE_FORMATS[k][1],
+            index=_fmt_keys.index(s_date_fmt) if s_date_fmt in _fmt_keys else 0,
+            horizontal=True,
+            help="Changes date display format across the entire app.",
+        )
         if st.form_submit_button("💾  Save Display Settings", width='stretch'):
-            set_setting("euro_dates", "1" if new_euro else "0")
+            set_setting("date_format", new_date_fmt)
+            # Kept in step so anything still reading the old boolean agrees.
+            set_setting("euro_dates", "1" if new_date_fmt == "euro" else "0")
             st.success("Display settings saved.")
             st.rerun()
 
@@ -11553,7 +12000,8 @@ elif page == "⚙️  Settings":
         st.caption(
             "Adds the FX columns - P&L, Entry, and Exit in each trade's own currency - "
             "to the trade table.\n\n"
-            "Currency is chosen per trade on the Add Trade form (it defaults to USD). "
+            "The default currency below pre-fills the Add Trade form; the picker "
+            "there still overrides it per trade. "
             "Prices are converted at that date's rate and always stored in USD, so "
             "stats and totals stay comparable across currencies.\n\n"
             "Supported: "
@@ -11568,13 +12016,14 @@ elif page == "⚙️  Settings":
                                           help="Adds FX-adjusted P&L columns to the trade table.")
         _ccy_opts = list(NATIVE_CURRENCIES)
         new_native_currency = cx2.selectbox(
-            "Client native currency",
+            "Default currency",
             options=_ccy_opts,
             index=_ccy_opts.index(_cur_native) if _cur_native in _ccy_opts else 0,
             help=(
-                "The currency the client holds their account in. Individual trades "
-                "carry their own currency, set on the Add Trade form - this setting "
-                "does not override it."
+                "The currency the client holds their account in. New stock trades "
+                "start on this currency; the picker on the Add Trade form overrides "
+                "it per trade, and trades already logged keep the currency they "
+                "were entered in. Options and futures are USD-only."
             ),
         )
         if st.form_submit_button("💾  Save Currency Settings", width='stretch'):
@@ -11855,6 +12304,13 @@ elif page == "⚙️  Settings":
                 _bp_path = _backup_dir / _restore_pending
                 if _bp_path.exists():
                     _shu.copy2(_bp_path, _db_path)
+                    # Every cache is now holding rows from the file we just
+                    # replaced — including tag and plan ids that may not exist
+                    # in the restored database. Drop the lot and bump the
+                    # version counters so the next render re-reads everything.
+                    st.cache_data.clear()
+                    _bust("_v_trades", "_v_settings", "_v_tags",
+                          "_v_accounts", "_v_equity", "_v_plans")
                     st.session_state.pop("_restore_pending_bp", None)
                     st.success("Backup restored. Reloading…")
                     st.rerun()
