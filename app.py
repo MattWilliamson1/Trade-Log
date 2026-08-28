@@ -91,6 +91,8 @@ DEFAULT_SETTINGS = {
     "schwab_account_aliases":   "{}",
     # Theme
     "app_theme":            "ocean_dark",
+    # Compact (high-density) layout — see COMPACT_CSS
+    "compact_mode":         "0",
     # Onboarding / guided setup tour ("1" once completed or skipped)
     "onboarding_done":      "0",
 }
@@ -3534,6 +3536,11 @@ date_fmt   = resolve_date_format(settings)
 _theme_key    = settings.get("app_theme", "ocean_dark")
 _TH           = THEMES.get(_theme_key, THEMES["ocean_dark"])
 
+# Compact (high-density) layout. Purely presentational: CSS overrides below plus
+# a tighter default row height for the data tables.
+_compact      = settings.get("compact_mode", "0") == "1"
+COMPACT_ROW_HEIGHT = 26          # px; Streamlit's default table row is 35
+
 # Light/dark family of each theme. The data tables (Streamlit canvas grids) are
 # fixed to the light/dark base chosen at launch by launch.py, so crossing this
 # line at runtime requires a relaunch — see the Settings → Theme handler.
@@ -3929,6 +3936,169 @@ section[data-testid="stMain"] button[kind="secondaryFormSubmit"]:hover {{
 
 if _theme_key != "ocean_dark":
     st.markdown(_build_theme_css(_TH), unsafe_allow_html=True)
+
+
+# ── Compact mode CSS ──────────────────────────────────────────────────────────
+# Streamlit's defaults are built for prose-width pages: 6rem of padding above the
+# first element, 1rem of gap between every block, 36px metric values, 40px
+# controls. On a dense trade log that reads as dead space. This block rescales
+# the whole page (`html { font-size }` — Streamlit sizes almost everything in
+# rem, so one lever shrinks fonts, padding and gaps together) and then flattens
+# the vertical rhythm explicitly, which is where the real savings are.
+#
+# Injected after the theme CSS so it wins on equal specificity. Colors are never
+# touched here — compact mode composes with every theme.
+COMPACT_CSS = """
+<style>
+/* ── Global scale ───────────────────────────────────────── */
+html { font-size: 13.5px !important; }
+
+/* ── Top chrome: 60px fixed header + 6rem container padding ─ */
+header[data-testid="stHeader"] { height: 2.1rem !important; min-height: 2.1rem !important; }
+[data-testid="stToolbar"] { height: 2.1rem !important; min-height: 2.1rem !important;
+                            top: 0 !important; right: 0.3rem !important; }
+[data-testid="stMainBlockContainer"] {
+    padding-top: 2.4rem !important;
+    padding-bottom: 2rem !important;
+    padding-left: 1.6rem !important;
+    padding-right: 1.6rem !important;
+}
+
+/* ── Vertical rhythm — the single biggest source of dead space ─ */
+[data-testid="stVerticalBlock"]   { gap: 0.3rem !important; }
+[data-testid="stHorizontalBlock"] { gap: 0.45rem !important; }
+[data-testid="stLayoutWrapper"]   { gap: 0.3rem !important; }
+hr { margin: 0.4rem 0 !important; }
+
+/* Streamlit pulls these containers up by exactly -1rem: on a heading that
+   swallows the parent block's 1rem flex gap so the heading hugs its content,
+   and on markdown it swallows the last paragraph's 1rem bottom margin. Both of
+   those 1rem values are retuned above, so the compensation has to shrink by the
+   same amount — left at -1rem it over-pulls and the text lands on top of
+   whatever follows it. Matched to the gap / margin each one cancels.
+
+   Selected structurally: the -1rem lives on a hashed emotion class that changes
+   between Streamlit builds, and the markdown containers inside buttons, widget
+   labels and tooltips must NOT be pulled up. These four selectors match the
+   negative-margin elements exactly — no more, no less. */
+[data-testid="stHeading"] [data-testid="stMarkdownContainer"] { margin-bottom: -0.3rem !important; }
+[data-testid="stMarkdown"] > div > [data-testid="stMarkdownContainer"] { margin-bottom: -0.25rem !important; }
+[data-testid="stMarkdown"] > div > [data-testid="stCaptionContainer"] { margin-bottom: -0.1rem !important; }
+/* Alert bodies get the same -1rem, but their paragraph margin is zeroed below,
+   so there is nothing left to cancel. */
+[data-testid="stAlertContainer"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+
+/* ── Headings ───────────────────────────────────────────── */
+section[data-testid="stMain"] h1 { font-size: 1.6rem !important;  padding: 0.15rem 0 0.3rem !important; }
+h2 { font-size: 1.35rem !important; padding: 0.15rem 0 0.3rem !important; }
+h3 { font-size: 1.15rem !important; padding: 0.1rem 0 0.25rem !important; }
+h4 { font-size: 1.05rem !important; padding: 0.1rem 0 0.2rem !important; }
+h5, h6 { font-size: 0.95rem !important; padding: 0.1rem 0 0.2rem !important; }
+
+/* ── Text ───────────────────────────────────────────────── */
+.stMarkdown p { margin-bottom: 0.25rem !important; line-height: 1.35 !important; }
+[data-testid="stCaptionContainer"] p { margin-bottom: 0.1rem !important; line-height: 1.3 !important; }
+
+/* ── Metric cards ───────────────────────────────────────── */
+[data-testid="stMetric"] { padding: 0.3rem 0.55rem !important; border-radius: 6px !important; }
+[data-testid="stMetricValue"] { font-size: 1.35rem !important; line-height: 1.2 !important;
+                                padding-bottom: 0 !important; }
+[data-testid="stMetricLabel"] { min-height: 0 !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.72rem !important; line-height: 1.2 !important; }
+[data-testid="stMetricDelta"] { font-size: 0.72rem !important; padding: 0 !important; }
+[data-testid="stMetricDelta"] svg { height: 0.8rem !important; width: 0.8rem !important; }
+
+/* ── Widget labels + controls ───────────────────────────── */
+[data-testid="stWidgetLabel"] { min-height: 0 !important; margin-bottom: 0 !important; }
+[data-testid="stWidgetLabel"] p { font-size: 0.8rem !important; line-height: 1.25 !important; }
+input, textarea { padding-top: 0.15rem !important; padding-bottom: 0.15rem !important;
+                  font-size: 0.85rem !important; }
+[data-baseweb="input"], [data-baseweb="base-input"] { min-height: 0 !important; }
+[data-testid="stNumberInputContainer"],
+[data-testid="stTextInputRootElement"],
+[data-testid="stDateInputField"] { min-height: 1.9rem !important; height: 1.9rem !important; }
+[data-baseweb="select"] > div:first-child { min-height: 1.9rem !important; font-size: 0.85rem !important; }
+[data-testid="stTextArea"] textarea { min-height: 3.5rem !important; }
+[data-testid="stCheckbox"] label, [data-testid="stRadio"] label { font-size: 0.85rem !important; }
+[data-testid="stTooltipIcon"] svg { height: 0.85rem !important; width: 0.85rem !important; }
+
+/* Buttons keep `height: auto` so two-line labels never clip. */
+section[data-testid="stMain"] .stButton button,
+section[data-testid="stMain"] [data-testid="stFormSubmitButton"] button,
+section[data-testid="stMain"] [data-testid="stDownloadButton"] button,
+section[data-testid="stMain"] [data-testid="stPopoverButton"] {
+    min-height: 1.9rem !important; height: auto !important;
+    padding: 0.2rem 0.6rem !important; font-size: 0.83rem !important;
+}
+
+/* ── Containers ─────────────────────────────────────────── */
+[data-testid="stExpander"] { margin-bottom: 0.3rem !important; border-radius: 6px !important; }
+[data-testid="stExpander"] summary { min-height: 0 !important; padding: 0.25rem 0.6rem !important;
+                                     font-size: 0.88rem !important; }
+[data-testid="stExpanderDetails"] { padding-top: 0.3rem !important; padding-bottom: 0.3rem !important; }
+[data-testid="stForm"] { padding: 0.5rem 0.6rem !important; border-radius: 6px !important; }
+[data-testid="stAlertContainer"] { padding: 0.35rem 0.6rem !important; }
+[data-testid="stAlert"] p { margin-bottom: 0 !important; font-size: 0.85rem !important; }
+[data-testid="stTabs"] button { padding: 0.25rem 0.6rem !important; font-size: 0.88rem !important; }
+[data-testid="stFileUploaderDropzone"] { padding: 0.4rem 0.6rem !important; }
+
+/* ── Sidebar ────────────────────────────────────────────── */
+[data-testid="stSidebarContent"] { padding-top: 0.4rem !important; }
+/* The header row only holds the collapse arrow, but reserves 51px by default. */
+[data-testid="stSidebarHeader"] { height: auto !important; min-height: 0 !important;
+                                  padding-top: 0.1rem !important; padding-bottom: 0.1rem !important;
+                                  margin-bottom: 0.1rem !important; }
+[data-testid="stSidebarUserContent"] { padding-top: 0.3rem !important; padding-bottom: 0.5rem !important; }
+[data-testid="stSidebar"] h1 { font-size: 1.05rem !important; padding-bottom: 0.25rem !important;
+                               margin-bottom: 0.35rem !important; }
+[data-testid="stSidebar"] .stButton button { padding: 0.2rem 0.5rem !important; min-height: 0 !important;
+                                             height: auto !important; font-size: 0.8rem !important; }
+[data-testid="stSidebar"] hr { margin: 0.3rem 0 !important; }
+.mode-badge-live, .mode-badge-demo { font-size: 0.7rem !important; padding: 0.12rem 0.5rem !important;
+                                     margin: 0.15rem 0 0.3rem !important; }
+
+/* The two oversized hero buttons style themselves inline further down the page.
+   The leading `body` outranks those rules instead of relying on source order. */
+body div[data-testid="stSidebar"] .st-key-sb_export_review button,
+body div[data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button {
+    font-size: 0.95rem !important; padding: 0.45rem 0 !important; border-radius: 8px !important;
+}
+</style>
+"""
+
+if _compact:
+    st.markdown(COMPACT_CSS, unsafe_allow_html=True)
+
+
+# The data tables are canvas-rendered, so CSS can't reach their rows —
+# st.dataframe/st.data_editor take an explicit row_height instead. Patching the
+# two functions here keeps the ~30 call sites throughout the app untouched.
+#
+# This runs on every rerun, not just the compact ones: Streamlit executes the
+# module top-to-bottom each interaction while `st` itself persists for the life
+# of the process. So the originals are stashed on the module the first time
+# through and every rerun re-wraps *those* — otherwise each rerun would wrap the
+# previous wrapper, and turning compact back off would leave the tables patched
+# until the app restarted.
+def _install_table_defaults():
+    for _name in ("dataframe", "data_editor"):
+        _orig = getattr(st, f"_tl_orig_{_name}", None)
+        if _orig is None:
+            _orig = getattr(st, _name)
+            setattr(st, f"_tl_orig_{_name}", _orig)
+
+        if not _compact:
+            setattr(st, _name, _orig)
+            continue
+
+        def _compact_table(*a, _orig=_orig, **kw):
+            kw.setdefault("row_height", COMPACT_ROW_HEIGHT)
+            return _orig(*a, **kw)
+
+        setattr(st, _name, _compact_table)
+
+
+_install_table_defaults()
 
 st.iframe("""
 <script>
@@ -11946,10 +12116,22 @@ elif page == "⚙️  Settings":
             horizontal=True,
             help="Changes date display format across the entire app.",
         )
+        new_compact = st.toggle(
+            "Compact layout",
+            value=_compact,
+            help="High-density layout: smaller text and controls, and most of the "
+                 "whitespace between elements removed. Colors are unchanged.",
+        )
+        st.caption(
+            "Compact layout fits roughly twice as much on screen — useful on "
+            "laptops or when scanning a long trade log."
+        )
         if st.form_submit_button("💾  Save Display Settings", width='stretch'):
             set_setting("date_format", new_date_fmt)
             # Kept in step so anything still reading the old boolean agrees.
             set_setting("euro_dates", "1" if new_date_fmt == "euro" else "0")
+            set_setting("compact_mode", "1" if new_compact else "0")
+            _bust("_v_settings")
             st.success("Display settings saved.")
             st.rerun()
 
