@@ -343,6 +343,8 @@ Pick the **Exchange** next to the Ticker box on the Add Trade form, then type th
 
 London lines are quoted by Yahoo in **pence**, not pounds. Trade Log divides those quotes by 100 so the live price lines up with the price you typed — a Shell quote of `3311.00` GBp shows as `£33.11`. The same applies to Johannesburg (cents) and Tel Aviv (agorot). The price readout next to the ticker is labelled with the listing's own currency rather than always showing `$`.
 
+Live prices, unrealized P&L and portfolio value for a non-US holding are struck in USD, converted from the listing's own currency at the current rate — that is the currency every price is stored in, so the whole book stays comparable. The boxes you *type* into work the other way: the live price beside a position, the Exit Price on a close, and the Purchase Price when adding to a position are all shown in that trade's own currency and converted on save at the rate for the date you give.
+
 To add a market that isn't in the dropdown, add its IB exchange code and Yahoo suffix to `_IB_EXCHANGE_TO_YF` and a label to `_EXCHANGE_OPTIONS` in `app.py` — everything else reads from those two.
 
 #### Account & Equity

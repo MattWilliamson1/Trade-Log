@@ -489,6 +489,61 @@ def scale_quote(value, divisor: float):
         return value
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def usd_per_unit(code: str) -> "float | None":
+    """Live USD per 1 unit of `code`, or None when no rate can be had.
+
+    Deliberately broader than `get_fx_rate`, which only knows the handful of
+    currencies a trade can be *logged* in. A quote can arrive in any currency
+    its exchange trades in — JPY, HKD, CHF, KRW — and falling back to 1.0 there
+    would quietly value a Tokyo holding in yen as though it were dollars.
+    Returning None instead lets callers show "—" rather than a wrong number.
+    """
+    code = (code or "").upper()
+    if not code:
+        return None
+    if code == "USD":
+        return 1.0
+    try:
+        p = yf.Ticker(f"{code}USD=X").fast_info.last_price
+        return float(p) if p else None
+    except Exception:
+        return None
+
+
+def listing_to_usd(price, symbol: str):
+    """A price already in `symbol`'s major currency unit → USD.
+
+    The FX half only. `_get_single_live_price` has already taken its quote out
+    of any subunit, so putting its result through `quote_to_usd` would divide by
+    100 a second time and value a London holding at a hundredth of its worth.
+    """
+    if price is None:
+        return None
+    ccy = quote_units(symbol)[1]
+    try:
+        val = float(price)
+    except (TypeError, ValueError):
+        return None
+    if not ccy or ccy == "USD":
+        return val
+    rate = usd_per_unit(ccy)
+    return val * rate if rate else None
+
+
+def quote_to_usd(price, symbol: str):
+    """A RAW Yahoo quote for `symbol` → USD, the currency prices are stored in.
+
+    Both halves: out of any subunit (London pence → pounds), then across the FX
+    rate (pounds → dollars). Every number compared with a stored entry or exit
+    price has to come through here or `listing_to_usd`, or the subtraction is
+    between two different currencies.
+    """
+    if price is None:
+        return None
+    return listing_to_usd(scale_quote(price, quote_units(symbol)[0]), symbol)
+
+
 def build_option_symbol(ticker: str, expiration, strike: float, opt_type: str) -> str:
     """OCC-format symbol: AAPL261231C00242500  (strike × 1000, zero-padded to 8 digits)."""
     exp       = pd.to_datetime(expiration)
@@ -584,15 +639,16 @@ def _yf_get_live_data(symbols: tuple) -> dict:
                 result[t] = {"price": fi.last_price, "prev_close": fi.previous_close}
             except Exception:
                 result[t] = {"price": None, "prev_close": None}
-    # Both paths above hand back raw Yahoo quotes, which for some non-US
-    # listings are in a currency subunit. Normalise once here so every caller —
-    # the trade table, unrealized P&L, the open-positions panel — compares like
-    # with like against the logged entry price.
+    # Both paths above hand back raw Yahoo quotes, in whatever unit the listing
+    # trades in. This fetcher values the book, and the book is stored in USD, so
+    # normalise here once: every consumer (P&L, the trade table, current value,
+    # distance from stop) subtracts these from stored USD prices and would
+    # otherwise be mixing currencies. The single-quote helper below does NOT do
+    # this — see its docstring.
     for _sym, _row in result.items():
-        _div = quote_divisor(_sym)
-        if _div != 1.0:
-            _row["price"]      = scale_quote(_row.get("price"), _div)
-            _row["prev_close"] = scale_quote(_row.get("prev_close"), _div)
+        if quote_units(_sym) != (1.0, "USD"):
+            _row["price"]      = quote_to_usd(_row.get("price"), _sym)
+            _row["prev_close"] = quote_to_usd(_row.get("prev_close"), _sym)
     return result
 
 
@@ -968,6 +1024,7 @@ NATIVE_CURRENCIES: dict[str, dict] = {
     "CAD": {"symbol": "C$", "pair": "CADUSD=X"},
     "EUR": {"symbol": "€",  "pair": "EURUSD=X"},
     "GBP": {"symbol": "£",  "pair": "GBPUSD=X"},
+    "NZD": {"symbol": "NZ$", "pair": "NZDUSD=X"},
 }
 _FX_PAIRS = {k: v["pair"] for k, v in NATIVE_CURRENCIES.items()}
 
@@ -1107,8 +1164,10 @@ def get_highest_high_since(ticker: str, entry_date: str, exchange: str = "") -> 
 def _get_single_live_price(ticker: str, exchange: str = "") -> float | None:
     """Fast single-ticker price lookup for trade-entry forms (30-second cache).
 
-    Returned in the listing's major currency unit, so it is directly comparable
-    to the price the user typed (see `quote_units`)."""
+    Answers "what is this trading at" in the listing's own currency — pence
+    normalised to pounds, but NOT converted to USD, because the caller is
+    filling in a box the user types a local price into. Anything doing
+    arithmetic against a stored price wants `quote_to_usd` instead."""
     sym = _yf_symbol(ticker, exchange)
     try:
         p = yf.Ticker(sym).fast_info.last_price
@@ -3462,7 +3521,20 @@ def _trade_added_dialog(summary: dict):
         st.rerun()
 
 
-@st.dialog("📄  Export for Review")
+def _close_export_dialog():
+    """Forget the Export-for-Review dialog and any report built inside it.
+
+    Dismissing an st.dialog with the ✕, ESC or a click outside is handled purely
+    in the frontend, so without an on_dismiss hook `_show_export` would stay True
+    and the top-level re-render below would pop the dialog straight back open on
+    the next rerun — e.g. the moment the user hit REFRESH LIVE PRICES.
+    """
+    st.session_state["_show_export"] = False
+    st.session_state.pop("_exp_pdf", None)
+    st.session_state.pop("_exp_pdf_name", None)
+
+
+@st.dialog("📄  Export for Review", on_dismiss=_close_export_dialog)
 def _export_dialog(acct_bal: float):
     st.markdown(
         "Generate a PDF you can save or print — your **trade log** plus the **full "
@@ -3500,9 +3572,7 @@ def _export_dialog(acct_bal: float):
                            mime="application/pdf", width="stretch", key="_exp_dl")
 
     if st.button("Close", width="stretch", key="_exp_close"):
-        st.session_state["_show_export"] = False
-        st.session_state.pop("_exp_pdf", None)
-        st.session_state.pop("_exp_pdf_name", None)
+        _close_export_dialog()
         st.rerun()
 
 
@@ -4452,7 +4522,7 @@ TOUR_STEPS = [
         "title": "Add any extra currencies",
         "body": (
             "Trading in a non-USD account? Open **Multi-Currency**, switch it on, and "
-            "pick your **default currency** (AUD, CAD, EUR, GBP).\n\n"
+            "pick your **default currency** (AUD, CAD, EUR, GBP, NZD).\n\n"
             "New trades will start on that currency, and Trade Log will show P&L "
             "converted to it alongside the USD figures. USD-only? Skip ahead."
         ),
@@ -5197,20 +5267,36 @@ if page == "📋  Trading Log":
                 ap_row     = open_trades_multi.iloc[ap_idx]
                 ap_id      = int(ap_row["id"])
                 _ap_ticker = str(ap_row.get("ticker") or "").strip().upper()
+                ap_ccy     = trade_currency(ap_row)
                 if _ap_ticker:
-                    _ap_live = _get_single_live_price(_ap_ticker)
-                    if _ap_live is not None:
+                    # Quote shown in the same currency as the Purchase Price box
+                    # below, so the number can be typed straight across.
+                    _ap_exch     = str(ap_row.get("exchange") or "")
+                    _ap_live     = _get_single_live_price(_ap_ticker, _ap_exch)
+                    _ap_live_usd = listing_to_usd(_ap_live, _yf_symbol(_ap_ticker, _ap_exch))
+                    _ap_fx_live  = get_fx_rate(ap_ccy) if ap_ccy != "USD" else 1.0
+                    _ap_live_ccy = (usd_to_native(_ap_live_usd, _ap_fx_live)
+                                    if _ap_live_usd is not None and _ap_fx_live else None)
+                    if _ap_live_ccy is not None:
                         st.markdown(
                             f"<div style='margin-bottom:6px'><b>{_ap_ticker}</b> &nbsp;"
-                            f"<span style='color:#2ecc71;font-weight:700'>${_ap_live:,.2f}</span></div>",
+                            f"<span style='color:#2ecc71;font-weight:700'>"
+                            f"{currency_symbol(ap_ccy)}{_ap_live_ccy:,.2f}</span></div>",
                             unsafe_allow_html=True,
                         )
                 ap_qty     = st.number_input("Shares/Contracts to Add", min_value=0.01, step=1.0,
                                              format="%.4f", value=None, key="ap_qty",
                                              placeholder="e.g. 100")
-                ap_price   = st.number_input("Purchase Price", min_value=0.0001, step=0.01,
-                                             format="%.4f", value=None, key="ap_price",
-                                             placeholder="e.g. 150.00")
+                ap_price   = st.number_input(
+                    "Purchase Price" if ap_ccy == "USD"
+                    else f"Purchase Price ({currency_symbol(ap_ccy)} {ap_ccy})",
+                    min_value=0.0001, step=0.01,
+                    format="%.4f", value=None, key="ap_price",
+                    placeholder="e.g. 150.00",
+                    help=(f"This trade was entered in {ap_ccy}. Type the addition in the "
+                          "same currency — it is converted at the add date's rate.")
+                          if ap_ccy != "USD" else None,
+                )
                 ap_date    = st.date_input("Add Date", value=pd.Timestamp.today().date(), key="ap_date")
                 if st.button("Add to Position", key="ap_submit", type="primary"):
                     if ap_qty is None or ap_price is None:
@@ -5218,7 +5304,15 @@ if page == "📋  Trading Log":
                     elif ap_qty <= 0 or ap_price <= 0:
                         st.error("Quantity and price must be greater than zero.")
                     else:
-                        new_qty, new_avg = update_position(ap_id, float(ap_qty), float(ap_price),
+                        # The average cost this blends into is stored in USD, so
+                        # the addition has to arrive in USD too — priced at the
+                        # add date's rate. (fx_rate_entry stays on the original
+                        # entry; it only drives the native-currency display, and
+                        # a blended position has no single entry rate.)
+                        _ap_fx = (get_fx_rate_at_date(ap_ccy, str(ap_date))
+                                  if ap_ccy != "USD" else 1.0)
+                        new_qty, new_avg = update_position(ap_id, float(ap_qty),
+                                                           native_to_usd(float(ap_price), _ap_fx),
                                                            add_date=str(ap_date))
                         _bust("_v_trades")
                         st.success(f"Updated: {fmt_qty(new_qty)} total @ {fmt_price(new_avg)} avg cost")
@@ -5251,15 +5345,24 @@ if page == "📋  Trading Log":
                 ep_id    = int(ep_row["id"])
                 ep_max   = float(ep_row["quantity"] or 0)
                 _ep_ticker = str(ep_row.get("ticker") or "").strip().upper()
+                ep_ccy   = trade_currency(ep_row)
                 if _ep_ticker:
-                    _ep_live = _get_single_live_price(_ep_ticker)
-                    if _ep_live is not None:
+                    # Quote shown in the same currency as the Exit Price box below.
+                    # The exchange has to go in, or a London holding is priced off
+                    # whatever US symbol happens to share its ticker.
+                    _ep_exch     = str(ep_row.get("exchange") or "")
+                    _ep_live     = _get_single_live_price(_ep_ticker, _ep_exch)
+                    _ep_live_usd = listing_to_usd(_ep_live, _yf_symbol(_ep_ticker, _ep_exch))
+                    _ep_fx_live  = get_fx_rate(ep_ccy) if ep_ccy != "USD" else 1.0
+                    _ep_live_ccy = (usd_to_native(_ep_live_usd, _ep_fx_live)
+                                    if _ep_live_usd is not None and _ep_fx_live else None)
+                    if _ep_live_ccy is not None:
                         st.markdown(
                             f"<div style='margin-bottom:6px'><b>{_ep_ticker}</b> &nbsp;"
-                            f"<span style='color:#2ecc71;font-weight:700'>${_ep_live:,.2f}</span></div>",
+                            f"<span style='color:#2ecc71;font-weight:700'>"
+                            f"{currency_symbol(ep_ccy)}{_ep_live_ccy:,.2f}</span></div>",
                             unsafe_allow_html=True,
                         )
-                ep_ccy   = trade_currency(ep_row)
                 ep_qty   = st.number_input(f"Shares to Exit (max {fmt_qty(ep_max)})", min_value=0.0, max_value=ep_max, step=1.0, format="%.4f", value=None, key="ep_qty")
                 ep_price = st.number_input(
                     f"Exit Price ({currency_symbol(ep_ccy)} {ep_ccy})",
@@ -5457,12 +5560,39 @@ if page == "📋  Trading Log":
         # ── Open Positions — quick close ────────────────────────────────────────
         # Close any open trade in one place without hunting for it in the table.
         _open_pos = trades[trades["exit_date"].isna()].copy()
-        with st.expander(f"📌  Open Positions ({len(_open_pos)})", expanded=not _open_pos.empty):
+        # Collapsed on arrival, but a Close re-opens it: an expander resets to
+        # this argument on every rerun, so without the flag the list would snap
+        # shut after each position closed and have to be re-opened for the next.
+        _op_stay_open = bool(st.session_state.pop("_op_stay_open", False))
+        with st.expander(f"📌  Open Positions ({len(_open_pos)})",
+                         expanded=_op_stay_open):
             if _open_pos.empty:
                 st.caption("No open positions.")
             else:
                 st.caption("Enter an exit price and click Close — exit date defaults to today "
                            "but can be overridden. Live price (stocks) pre-fills the exit field.")
+                # One position per row. The per-field labels live in a single
+                # header instead of on every widget, and the forms are borderless,
+                # so a row is one line tall rather than a stacked card.
+                st.markdown(
+                    "<style>"
+                    ".st-key-open_pos_list div[data-testid='stForm']{"
+                    "  border:none !important;padding:0 !important;margin:0 !important;}"
+                    ".st-key-open_pos_list div[data-testid='stVerticalBlock']{gap:0.15rem !important;}"
+                    ".st-key-open_pos_list div[data-testid='stElementContainer']{margin-bottom:0 !important;}"
+                    "</style>",
+                    unsafe_allow_html=True,
+                )
+                _OP_COLS = [2.4, 0.9, 1.2, 1.2, 1.3, 1.0]
+                _op_list = st.container(key="open_pos_list")
+                _hdr = _op_list.columns(_OP_COLS, vertical_alignment="center")
+                for _hc, _ht in zip(_hdr, ["Position", "Live", "Unrealized",
+                                           "Exit Price", "Exit Date", ""]):
+                    _hc.markdown(
+                        f"<div style='font-size:0.72rem;color:#888;font-weight:600;"
+                        f"text-transform:uppercase;letter-spacing:0.03em'>{_ht}</div>",
+                        unsafe_allow_html=True,
+                    )
                 _close_today = pd.Timestamp.today().date()
                 for _, _op in _open_pos.iterrows():
                     _opid   = int(_op["id"])
@@ -5472,27 +5602,54 @@ if page == "📋  Trading Log":
                     _opmult = float(_op.get("multiplier") or 1.0)
                     _opside = str(_op.get("side") or "long").lower()
                     _opexch = str(_op.get("exchange") or "")
-                    # Live price + unrealized P&L for stocks only (options/futures
-                    # need the contract quote, which a plain symbol lookup can't give).
-                    _oplive = _get_single_live_price(str(_op["ticker"]), _opexch) if _opinst == "stock" else None
+                    _opsym  = _yf_symbol(str(_op["ticker"]), _opexch)
+                    _opccy  = trade_currency(_op)
+                    # Three currencies meet in this row and none of them are
+                    # interchangeable: the quote arrives in the listing's own
+                    # money, the P&L has to be struck in the USD every stored
+                    # price is in, and the exit box below is typed in the
+                    # currency the trade was entered in. Each is derived once
+                    # here so nothing downstream has to guess which it holds.
+                    # Stocks only — options and futures need the contract quote,
+                    # which a plain symbol lookup can't give.
+                    _oplive     = _get_single_live_price(str(_op["ticker"]), _opexch) if _opinst == "stock" else None
+                    _oplive_usd = listing_to_usd(_oplive, _opsym) if _oplive is not None else None
+                    # Live rate for the pre-fill; the close below re-prices at the
+                    # exit date's rate, which is the one that actually gets stored.
+                    _opfx       = get_fx_rate(_opccy) if _opccy != "USD" else 1.0
+                    _oplive_ccy = (usd_to_native(_oplive_usd, _opfx)
+                                   if _oplive_usd is not None and _opfx else None)
+                    _opep_ccy   = (usd_to_native(_opep, float(_op.get("fx_rate_entry") or 1.0))
+                                   if _opccy != "USD" else _opep)
                     _opupnl = None
-                    if _oplive is not None and _opqty and _opep:
-                        _raw = (_oplive - _opep) * _opqty * _opmult
+                    if _oplive_usd is not None and _opqty and _opep:
+                        _raw = (_oplive_usd - _opep) * _opqty * _opmult
                         _opupnl = -_raw if _opside == "short" else _raw
 
-                    with st.form(f"close_pos_{_opid}", clear_on_submit=False):
-                        cpa, cpb, cpc, cpd, cpf, cpe = st.columns([2.0, 0.8, 1.2, 1.2, 1.3, 1.2])
+                    def _op_money(v):
+                        """Format a price in this trade's own currency."""
+                        if v is None:
+                            return "—"
+                        return (fmt_price(v) if _opccy == "USD"
+                                else f"{currency_symbol(_opccy)}{float(v):,.2f}")
+
+                    with _op_list.form(f"close_pos_{_opid}", clear_on_submit=False,
+                                       border=False):
+                        cpa, cpb, cpc, cpd, cpf, cpe = st.columns(
+                            _OP_COLS, vertical_alignment="center")
                         _lbl = f"**{_op['ticker']}**" + (f" · {_opinst}" if _opinst != "stock" else "")
+                        # The currency is only spelled out when it isn't USD — the
+                        # Exit Price label that used to carry it is a shared header
+                        # now and can no longer say it per row.
+                        _ccy_tag = f" {_opccy}" if _opccy != "USD" else ""
                         cpa.markdown(
-                            f"{_lbl}<br><span style='color:#888;font-size:0.85rem'>"
-                            f"{fmt_qty(_opqty)} @ {fmt_price(_opep)} · {fmt_date(_op['entry_date'], date_fmt)}"
-                            f"</span>",
+                            f"{_lbl} <span style='color:#888;font-size:0.85rem'>· "
+                            f"{fmt_qty(_opqty)} @ {_op_money(_opep_ccy)}{_ccy_tag} · "
+                            f"{fmt_date(_op['entry_date'], date_fmt)}</span>",
                             unsafe_allow_html=True,
                         )
-                        _live_txt = fmt_price(_oplive) if _oplive is not None else "—"
                         cpb.markdown(
-                            f"<div style='padding-top:4px;font-size:0.8rem;color:#888'>Live</div>"
-                            f"<div style='font-weight:700'>{_live_txt}</div>",
+                            f"<div style='font-weight:700'>{_op_money(_oplive_ccy)}</div>",
                             unsafe_allow_html=True,
                         )
                         if _opupnl is not None:
@@ -5500,20 +5657,22 @@ if page == "📋  Trading Log":
                             _upnl_txt = f"<b style='color:{_pcol}'>{fmt_price(_opupnl)}</b>"
                         else:
                             _upnl_txt = "<span style='color:#888'>—</span>"
-                        cpc.markdown(
-                            f"<div style='padding-top:4px;font-size:0.8rem;color:#888'>Unrealized</div>"
-                            f"<div>{_upnl_txt}</div>",
-                            unsafe_allow_html=True,
-                        )
+                        cpc.markdown(f"<div>{_upnl_txt}</div>", unsafe_allow_html=True)
                         _cp_price = cpd.number_input(
-                            "Exit Price", min_value=0.0, step=0.01, format="%.4f",
-                            value=float(_oplive) if _oplive is not None else None,
+                            "Exit Price" if _opccy == "USD"
+                            else f"Exit Price ({currency_symbol(_opccy)} {_opccy})",
+                            min_value=0.0, step=0.01, format="%.4f",
+                            value=float(_oplive_ccy) if _oplive_ccy is not None else None,
                             key=f"cp_px_{_opid}",
+                            label_visibility="collapsed",
+                            help=(f"This trade was entered in {_opccy}. Type the exit in the "
+                                  "same currency — it is converted at the exit date's rate.")
+                                  if _opccy != "USD" else None,
                         )
                         _cp_date = cpf.date_input(
                             "Exit Date", value=_close_today, key=f"cp_dt_{_opid}",
+                            label_visibility="collapsed",
                         )
-                        cpe.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                         if cpe.form_submit_button("Close", width='stretch', type="primary"):
                             if not _cp_price:
                                 st.warning("Enter an exit price to close.")
@@ -5522,16 +5681,27 @@ if page == "📋  Trading Log":
                                           if _op.get("current_stop") is not None
                                           and not pd.isna(_op.get("current_stop", float("nan")))
                                           else None)
+                                # The price was typed in the trade's currency, and
+                                # the column it lands in is USD — convert at the
+                                # exit date's rate and hand that rate down with it,
+                                # exactly as Exit in Pieces does. Without this a
+                                # GBP position closed here was stored as if the
+                                # pounds were dollars.
+                                _cp_dt = _cp_date or _close_today
+                                _cp_fx = (get_fx_rate_at_date(_opccy, str(_cp_dt))
+                                          if _opccy != "USD" else 1.0)
                                 update_trade(
                                     _opid,
-                                    _cp_date or _close_today,
-                                    float(_cp_price),
+                                    _cp_dt,
+                                    native_to_usd(float(_cp_price), _cp_fx),
                                     _op.get("notes") or None,
                                     _cp_cs,
                                     bool(_op.get("stop_enabled", 1)),
                                     get_trade_tag_ids(_opid),
+                                    fx_rate_exit=_cp_fx,
                                 )
-                                st.toast(f"{_op['ticker']} closed at {fmt_price(_cp_price)}.", icon="✅")
+                                st.toast(f"{_op['ticker']} closed at {_op_money(_cp_price)}.", icon="✅")
+                                st.session_state["_op_stay_open"] = True
                                 st.rerun()
 
         # ── Filter bar ────────────────────────────────────────────────────────
@@ -6934,46 +7104,63 @@ if page == "📋  Trading Log":
                             file_name="selected_trades.csv", mime="text/csv")
         if valid_rows and len(valid_non_group_rows) == 1 and ba3.button("📊  Chart"):
             st.session_state["chart_trade_id"] = int(filtered.iloc[valid_non_group_rows[0]]["id"])
-        bulk_tag_names = ba4.multiselect("Tag all filtered",
+        bulk_tag_names = ba4.multiselect("Apply tags",
                                          options=list(tag_name_to_id.keys()), key="bulk_tag")
-        if bulk_tag_names and ba4.button("Apply Tags"):
-            for tid in _bulk_all_ids:
+        _tag_b1, _tag_b2 = ba4.columns(2)
+        _tag_sel_click = _tag_b1.button(
+            f"Tag Selected ({len(_sel_ids)})",
+            key="bulk_tag_sel",
+            disabled=not (bulk_tag_names and _sel_ids),
+        )
+        _tag_all_click = _tag_b2.button(
+            f"Tag All Filtered ({len(_bulk_all_ids)})",
+            key="bulk_tag_all",
+            disabled=not (bulk_tag_names and _bulk_all_ids),
+        )
+        if bulk_tag_names and (_tag_sel_click or _tag_all_click):
+            _tag_target_ids = _sel_ids if _tag_sel_click else _bulk_all_ids
+            for tid in _tag_target_ids:
                 for tag_name in bulk_tag_names:
                     add_tag_to_trade(tid, tag_name_to_id[tag_name])
+            st.toast(
+                f"Tagged {len(_tag_target_ids)} trade"
+                f"{'s' if len(_tag_target_ids) != 1 else ''}.",
+                icon="🏷",
+            )
             st.rerun()
 
-            # ── Spread linking (2+ rows selected) ──────────────────────────
-            if len(valid_non_group_rows) >= 2:
-                sel_ids = [int(filtered.iloc[i]["id"]) for i in valid_non_group_rows]
-                sel_groups = (
-                    filtered.iloc[valid_non_group_rows]["leg_group"].dropna().unique().tolist()
-                    if "leg_group" in filtered.columns else []
+        # ── Spread linking (2+ rows selected) ──────────────────────────
+        if len(valid_non_group_rows) >= 2:
+            sel_ids = [int(filtered.iloc[i]["id"]) for i in valid_non_group_rows]
+            sel_groups = (
+                filtered.iloc[valid_non_group_rows]["leg_group"].dropna().unique().tolist()
+                if "leg_group" in filtered.columns else []
+            )
+            all_same_group = (
+                len(sel_groups) == 1
+                and all(
+                    filtered.iloc[i].get("leg_group") == sel_groups[0]
+                    for i in valid_non_group_rows
                 )
-                all_same_group = (
-                    len(sel_groups) == 1
-                    and all(
-                        filtered.iloc[i].get("leg_group") == sel_groups[0]
-                        for i in valid_non_group_rows
-                    )
-                )
+            )
 
-                st.markdown("**Spread Linking**")
-                sl1, sl2 = st.columns([1, 3])
+            st.markdown("**Spread Linking**")
+            sl1, sl2 = st.columns([1, 3])
 
-                if all_same_group:
-                    if sl1.button("🔓  Ungroup Spread"):
-                        update_spread_group(sel_ids, None, None)
-                        st.rerun()
-
-                with sl2:
-                    _SPREAD_TYPES_BULK = ["Vertical", "Straddle", "Strangle", "Iron Condor", "Butterfly", "Calendar", "Custom"]
-                    bulk_spread_type = st.selectbox("Spread Type", ["—"] + _SPREAD_TYPES_BULK, key="bulk_spread_type")
-
-                if sl1.button("🔗  Group as Spread"):
-                    grp = str(uuid.uuid4())[:8]
-                    stype = bulk_spread_type if bulk_spread_type != "—" else None
-                    update_spread_group(sel_ids, grp, stype)
+            if all_same_group:
+                if sl1.button("🔓  Ungroup Spread"):
+                    update_spread_group(sel_ids, None, None)
                     st.rerun()
+
+            with sl2:
+                _SPREAD_TYPES_BULK = ["Vertical", "Straddle", "Strangle", "Iron Condor", "Butterfly", "Calendar", "Custom"]
+                bulk_spread_type = st.selectbox("Spread Type", ["—"] + _SPREAD_TYPES_BULK, key="bulk_spread_type")
+
+            if sl1.button("🔗  Group as Spread"):
+                grp = str(uuid.uuid4())[:8]
+                stype = bulk_spread_type if bulk_spread_type != "—" else None
+                update_spread_group(sel_ids, grp, stype)
+                st.rerun()
 
         # ── Spread Summaries ───────────────────────────────────────────────────
 
@@ -7606,15 +7793,16 @@ if page == "📋  Trading Log":
                 ea1, ea2, ea3 = st.columns(3)
                 _cur_acct = str(row.get("account_name") or "Default")
                 _acct_opts = list(set(all_accounts + [_cur_acct]))
+                # Unkeyed for the same reason as the Core Fields above: a keyed
+                # widget's session_state value wins over `value`/`index` on every
+                # rerun, so these would keep showing the first-selected trade's
+                # data and then save it onto whatever trade is picked next.
                 edit_account    = ea1.selectbox("Account", options=_acct_opts,
-                                               index=_acct_opts.index(_cur_acct) if _cur_acct in _acct_opts else 0,
-                                               key="edit_acct")
+                                               index=_acct_opts.index(_cur_acct) if _cur_acct in _acct_opts else 0)
                 edit_commission = ea2.number_input("Commission ($)", min_value=0.0, step=0.01, format="%.2f",
-                                                   value=float(row["commission"]) if row.get("commission") else 0.0,
-                                                   key="edit_comm")
+                                                   value=float(row["commission"]) if row.get("commission") else 0.0)
                 edit_side = ea3.selectbox("Side", ["long", "short"],
-                                          index=0 if str(row.get("side") or "long").lower() == "long" else 1,
-                                          key="edit_side")
+                                          index=0 if str(row.get("side") or "long").lower() == "long" else 1)
 
                 edit_tags  = st.multiselect("Tags", options=list(tag_name_to_id.keys()),
                                             default=current_tag_names)
@@ -7649,7 +7837,7 @@ if page == "📋  Trading Log":
                     edit_current_stop = es3.number_input("Current Stop", min_value=0.0, step=0.01,
                                                           format="%.4f", value=current_val)
                     _cur_trail_en = str(row.get("trail_type") or "fixed") != "fixed"
-                    edit_trailing_en = es4.checkbox("Trailing", value=_cur_trail_en, key="edit_trailing_en")
+                    edit_trailing_en = es4.checkbox("Trailing", value=_cur_trail_en)
                     if edit_trailing_en:
                         _etr1, _etr2 = st.columns(2)
                         _cur_trail_type = str(row.get("trail_type") or "$")
@@ -7657,12 +7845,10 @@ if page == "📋  Trading Log":
                             _cur_trail_type = "$"
                         _trail_opts = ["$", "%", "ATR"]
                         edit_trail_type   = _etr1.selectbox("Trail Unit", _trail_opts,
-                                                             index=_trail_opts.index(_cur_trail_type) if _cur_trail_type in _trail_opts else 0,
-                                                             key="edit_trail_type")
+                                                             index=_trail_opts.index(_cur_trail_type) if _cur_trail_type in _trail_opts else 0)
                         _cur_trail_amount = float(row["trail_amount"]) if row.get("trail_amount") and not pd.isna(row["trail_amount"]) else None
                         edit_trail_amount = _etr2.number_input("Trail Amount", min_value=0.0, step=0.01,
-                                                                format="%.2f", value=_cur_trail_amount,
-                                                                key="edit_trail_amount")
+                                                                format="%.2f", value=_cur_trail_amount)
                     else:
                         edit_trail_type, edit_trail_amount = "fixed", None
                     edit_expiration = edit_strike = edit_option_type = edit_multiplier = None
@@ -7672,22 +7858,19 @@ if page == "📋  Trading Log":
                     eo1, eo2, eo3, eo4 = st.columns(4)
                     _raw_exp = row.get("expiration")
                     _exp_val = pd.to_datetime(_raw_exp).date() if _raw_exp and not pd.isna(_raw_exp) else None
-                    edit_expiration = eo1.date_input("Expiration", value=_exp_val, key="edit_exp")
+                    edit_expiration = eo1.date_input("Expiration", value=_exp_val)
                     edit_strike     = eo2.number_input("Strike", min_value=0.0, step=0.5, format="%.2f",
-                                                       value=float(row["strike"]) if row.get("strike") else None,
-                                                       key="edit_strike")
+                                                       value=float(row["strike"]) if row.get("strike") else None)
                     _opt_choices = ["Call", "Put"]
                     _opt_idx = 0 if str(row.get("option_type") or "C").upper().startswith("C") else 1
-                    edit_opt_type_raw = eo3.selectbox("C/P", _opt_choices, index=_opt_idx, key="edit_opttype")
+                    edit_opt_type_raw = eo3.selectbox("C/P", _opt_choices, index=_opt_idx)
                     edit_option_type  = "C" if edit_opt_type_raw == "Call" else "P"
                     edit_multiplier   = eo4.number_input("Multiplier", min_value=0.1, step=1.0, format="%.0f",
-                                                          value=float(row["multiplier"]) if row.get("multiplier") else 100.0,
-                                                          key="edit_mult")
+                                                          value=float(row["multiplier"]) if row.get("multiplier") else 100.0)
                     _und_px = row.get("underlying_price_at_entry")
                     edit_underlying_px = st.number_input("Underlying Price at Entry", min_value=0.0,
                                                          step=0.01, format="%.2f",
-                                                         value=float(_und_px) if _und_px and not pd.isna(_und_px) else None,
-                                                         key="edit_und_px")
+                                                         value=float(_und_px) if _und_px and not pd.isna(_und_px) else None)
                     edit_stop_en = False
                     edit_current_stop = edit_opening_stop = None
                     st.caption(f"Contract: **{_contract_sym(row)}**")
@@ -7695,8 +7878,7 @@ if page == "📋  Trading Log":
                 else:  # future
                     st.markdown("**Future Details**")
                     edit_multiplier = st.number_input("Multiplier", min_value=0.1, step=1.0, format="%.0f",
-                                                      value=float(row["multiplier"]) if row.get("multiplier") else 50.0,
-                                                      key="edit_fut_mult")
+                                                      value=float(row["multiplier"]) if row.get("multiplier") else 50.0)
                     edit_stop_en = False
                     edit_current_stop = edit_opening_stop = edit_expiration = edit_strike = edit_option_type = None
 
@@ -7717,7 +7899,7 @@ if page == "📋  Trading Log":
                     except Exception:
                         pass
                 edit_earnings = st.date_input("Earnings Date", value=_earn_default,
-                                              help=_earn_help, key="edit_earnings_dt")
+                                              help=_earn_help)
 
                 st.caption("Ctrl+Enter to submit")
                 if st.form_submit_button("Save Changes", width='stretch'):
