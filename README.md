@@ -165,7 +165,15 @@ Use the **🗑️ Delete Trade** expander. Select the trade and confirm deletion
 Each trade has an attachments section in the Edit panel. Attach chart screenshots, trade plans, or any files you want to associate with the trade.
 
 #### Importing Trades
-Use the **📥 Import** tab to bulk-import trades from a CSV file or directly from Interactive Brokers via Flex Query. The CSV format requires columns: `entry_date`, `ticker`, `quantity`, `entry_price` — see `tradeImport.csv` for an example.
+Use the **📥 Import** tab to bulk-import trades from a CSV file or directly from Interactive Brokers via Flex Query. **📁 Import from CSV** has two tabs:
+
+**Trade Log headers** — the strict path. Your file needs the exact columns `Entry Date`, `Ticker`, `Q`, `Entry Price`, and optionally `Tags`, `Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`. See `tradeImport.csv` for an example.
+
+**✨ Any CSV · Beta** — drop in whatever you have. It decodes the file, works out the separator, skips any title block above the headers, and then matches your columns to Trade Log's fields two ways: by name (`Trade Date`, `Shares`, `Cost Per Share` and a few hundred other spellings) and by *content* — a column of parseable dates is a date column whatever its header says, and a column of BUY/SELL is an action column even when it's headed "Type". It also spots when your file has one row per **fill** rather than one per trade, and pairs buys against sells FIFO into round trips.
+
+It shows you the mapping it came up with, with a confidence mark against each field, and every field is a dropdown you can correct. Nothing is written until you press Import, and the preview lets you untick individual trades. Tick **Remember this mapping** and the next export with the same headers maps itself.
+
+It's beta: it guesses, and guesses can be wrong. Read the mapping before you import. If it can't find a required field it says so rather than importing something wrong, and the strict tab is always there as a fallback.
 
 ---
 

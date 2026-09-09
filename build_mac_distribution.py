@@ -229,6 +229,7 @@ SOURCE_FILES = [
     "ib_client.py",
     "schwab_client.py",
     "fidelity_client.py",
+    "csv_smart.py",
     "updater.py",
     "launch.py",
     "requirements.txt",

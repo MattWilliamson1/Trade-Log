@@ -31,6 +31,12 @@ except Exception:
     # handles _fidelity_mod being None gracefully.
     _fidelity_mod = None
 import updater as _upd
+try:
+    import csv_smart as _csvs
+except Exception:
+    # Optional, same rationale as the broker clients above — the Smart CSV tab
+    # checks for None and falls back to the fixed-header importer.
+    _csvs = None
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
@@ -2947,6 +2953,245 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
     return success, errors
 
 
+# ── Smart CSV import (BETA) ───────────────────────────────────────────────────
+# `import_trades_from_csv` above needs the exact headers it was written for.
+# This path takes an arbitrary export instead: csv_smart proposes a mapping, the
+# user confirms or corrects it, and only then does anything reach the database.
+# A confirmed mapping is remembered against the file's layout, so the same broker
+# export imports in one click next time.
+
+_SMART_CSV_PROFILES_KEY = "csv_import_profiles"
+_SMART_UNMAPPED         = "—  not mapped  —"
+_SMART_MAX_PROFILES     = 40
+
+
+def _load_csv_profiles() -> dict:
+    import json as _json
+    try:
+        return _json.loads(get_setting(_SMART_CSV_PROFILES_KEY, "") or "{}")
+    except Exception:
+        return {}
+
+
+def _save_csv_profile(fingerprint: str, label: str, columns: dict, shape: str):
+    """Remember a confirmed mapping, keyed by the file's column layout."""
+    import json as _json
+    profiles = _load_csv_profiles()
+    profiles[fingerprint] = {
+        "label":   label,
+        "columns": columns,
+        "shape":   shape,
+        "saved":   pd.Timestamp.today().strftime("%Y-%m-%d"),
+    }
+    # A classroom churns through layouts; don't let the oldest accumulate forever.
+    if len(profiles) > _SMART_MAX_PROFILES:
+        stale = sorted(profiles, key=lambda k: profiles[k].get("saved", ""))
+        for k in stale[:len(profiles) - _SMART_MAX_PROFILES]:
+            profiles.pop(k, None)
+    set_setting(_SMART_CSV_PROFILES_KEY, _json.dumps(profiles))
+
+
+_SMART_CONF_BADGE = {"high": "●●●", "medium": "●●○", "low": "●○○"}
+
+
+def _smart_csv_read(raw: bytes, name: str):
+    """Parse an upload into session state — once per file, not once per rerun."""
+    df, rep = _csvs.read_table(raw)
+    mapping = _csvs.propose_mapping(df)
+    fingerprint = _csvs.header_fingerprint(df.columns)
+
+    saved = _load_csv_profiles().get(fingerprint)
+    if saved:
+        # A remembered layout outranks a fresh guess — the user already corrected
+        # this one by hand. Columns that have since vanished are dropped.
+        keep = {k: v for k, v in (saved.get("columns") or {}).items() if v in df.columns}
+        mapping.columns.update(keep)
+        mapping.scores.update({k: 1.0 for k in keep})
+
+    st.session_state.update({
+        "_scsv_df":       df,
+        "_scsv_rep":      rep,
+        "_scsv_map":      mapping,
+        "_scsv_fp":       fingerprint,
+        "_scsv_saved":    bool(saved),
+        "_scsv_name":     name,
+        "_scsv_user_set": [],
+        "_scsv_shape":    (saved or {}).get("shape") or _csvs.detect_shape(df, mapping),
+    })
+    # The mapping editor is keyed, so its previous contents would otherwise
+    # survive into a file with entirely different columns.
+    st.session_state.pop("_scsv_editor", None)
+
+
+def _smart_csv_import(dayfirst: bool):
+    """Beta importer: read any CSV, confirm the column mapping, then import."""
+    st.warning(
+        "🧪 **Beta** — this reads the file and *guesses* which column is which. "
+        "It gets most exports right, but check the mapping and the preview before "
+        "you import. Nothing is written until you press Import."
+    )
+
+    up = st.file_uploader("Upload CSV", type=["csv", "txt"], key="scsv_upload")
+    if not up:
+        st.caption(
+            "Works with broker statements, spreadsheets kept by hand, and most things "
+            "in between — including files with a title block above the headers, "
+            "semicolon or tab separators, and one row per fill rather than per trade."
+        )
+        return
+
+    raw = up.getvalue()
+    sig = f"{up.name}:{len(raw)}"
+    if st.session_state.get("_scsv_sig") != sig:
+        try:
+            _smart_csv_read(raw, up.name)
+        except Exception as e:
+            st.error(f"Could not read this file: {e}")
+            return
+        st.session_state["_scsv_sig"] = sig
+
+    df      = st.session_state["_scsv_df"]
+    rep     = st.session_state["_scsv_rep"]
+    mapping = st.session_state["_scsv_map"]
+
+    # ── What came off the disk ────────────────────────────────────────────────
+    _dname = {",": "comma", ";": "semicolon", "\t": "tab", "|": "pipe"}
+    _m1, _m2, _m3 = st.columns(3)
+    _m1.metric("Rows", f"{len(df):,}")
+    _m2.metric("Columns", len(df.columns))
+    _m3.metric("Separator", _dname.get(rep.delimiter, repr(rep.delimiter)))
+    for _msg in rep.messages:
+        st.caption(f"· {_msg}")
+    if st.session_state.get("_scsv_saved"):
+        st.success("Using the column mapping you saved for this layout last time.")
+
+    if st.toggle("Show the file as read", key="_scsv_show_raw"):
+        st.dataframe(df.head(10), width='stretch', hide_index=True)
+
+    # ── Mapping, open to correction ───────────────────────────────────────────
+    st.markdown("**Column mapping** — change anything it got wrong. ● is how sure "
+                "it is; required fields are starred.")
+    user_set = set(st.session_state.get("_scsv_user_set", []))
+    options  = [_SMART_UNMAPPED] + list(df.columns)
+
+    map_df = pd.DataFrame([{
+        "Field":      spec.label + (" *" if spec.required else ""),
+        "Column":     mapping.get(spec.key) or _SMART_UNMAPPED,
+        "Confidence": ("set by you" if spec.key in user_set else
+                       _SMART_CONF_BADGE[_csvs.confidence_label(mapping.scores.get(spec.key, 0.0))]
+                       if mapping.get(spec.key) else "—"),
+    } for spec in _csvs.FIELDS])
+
+    edited = st.data_editor(
+        map_df, width='stretch', hide_index=True,
+        disabled=["Field", "Confidence"],
+        column_config={
+            "Field": st.column_config.TextColumn("Field", width="medium"),
+            "Column": st.column_config.SelectboxColumn(
+                "Source column", options=options, required=True, width="medium",
+                help="Pick the column in your file that holds this value."),
+            "Confidence": st.column_config.TextColumn("Sure?", width="small"),
+        },
+        key="_scsv_editor",
+    )
+
+    new_cols, changed = {}, False
+    for spec, (_, r) in zip(_csvs.FIELDS, edited.iterrows()):
+        pick = r["Column"]
+        if (mapping.get(spec.key) or _SMART_UNMAPPED) != pick:
+            user_set.add(spec.key)
+            changed = True
+        if pick and pick != _SMART_UNMAPPED:
+            new_cols[spec.key] = pick
+    if changed:
+        mapping.columns = new_cols
+        mapping.scores.update({k: 1.0 for k in user_set if k in new_cols})
+        st.session_state["_scsv_user_set"] = sorted(user_set)
+        st.session_state["_scsv_map"] = mapping
+        # The table above was drawn from the pre-edit mapping, so its confidence
+        # column is a beat behind. Re-run once and it catches up; `changed` is
+        # False next time round, so this settles immediately.
+        st.rerun()
+
+    _picked_cols = list(new_cols.values())
+    _dupes = sorted({c for c in _picked_cols if _picked_cols.count(c) > 1})
+    if _dupes:
+        st.warning(f"Column(s) {', '.join(_dupes)} feed more than one field. "
+                   "Allowed, but usually a mistake.")
+
+    missing = mapping.missing_required()
+    if missing:
+        st.error("Can't import yet — still need a column for: "
+                 + ", ".join(_csvs.FIELDS_BY_KEY[k].label for k in missing))
+        return
+
+    # ── Row shape ─────────────────────────────────────────────────────────────
+    _shapes = ["trades", "fills"]
+    shape = st.radio(
+        "How the rows are laid out",
+        _shapes,
+        index=_shapes.index(st.session_state.get("_scsv_shape", "trades")),
+        format_func=lambda s: ("One row per trade — entry and exit on the same line"
+                               if s == "trades" else
+                               "One row per fill — buy and sell lines, paired into round trips"),
+        key="_scsv_shape_pick",
+    )
+
+    try:
+        trades, msgs = _csvs.build_trades(df, mapping, shape, dayfirst)
+    except Exception as e:
+        st.error(f"Could not build trades from this mapping: {e}")
+        return
+
+    for _msg in msgs:
+        st.caption(f"· {_msg}")
+    if not trades:
+        st.info("No importable rows under this mapping.")
+        return
+
+    # ── Preview and import ────────────────────────────────────────────────────
+    st.markdown(f"**{len(trades)} trade(s) ready.** Untick anything you don't want.")
+    picked = select_trades_to_import(trades, key="_scsv_preview")
+
+    remember = st.checkbox(
+        "Remember this mapping for files with these columns", value=True,
+        key="_scsv_remember",
+        help="Next time you upload an export with the same headers, this mapping "
+             "is applied automatically.")
+
+    if st.button(f"Import {len(picked)} trade(s)", type="primary",
+                 key="_scsv_import", disabled=not picked):
+        # Tags arrive as names; create any that don't exist yet, then hand
+        # import_parsed_trades the tag_ids it expects.
+        tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
+        for td in picked:
+            ids = []
+            for tname in td.pop("tags", None) or []:
+                if tname.lower() not in tag_cache:
+                    add_tag(tname, "")
+                    tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
+                if tag_cache.get(tname.lower()):
+                    ids.append(tag_cache[tname.lower()])
+            td["tag_ids"] = ids
+
+        counts = import_parsed_trades(picked)
+
+        if remember:
+            _save_csv_profile(st.session_state["_scsv_fp"],
+                              st.session_state.get("_scsv_name", "CSV"),
+                              mapping.columns, shape)
+        if counts["errors"]:
+            st.warning(f"{len(counts['errors'])} trade(s) failed:\n"
+                       + "\n".join(f"• {e}" for e in counts["errors"][:5]))
+        if counts["dupes"]:
+            st.info(f"{counts['dupes']} duplicate(s) skipped — already in the log.")
+        if counts["closed"]:
+            st.info(f"{counts['closed']} existing open trade(s) updated with closing data.")
+        st.success(f"Imported {counts['imported']} trade(s).")
+        st.session_state.pop("_scsv_sig", None)      # force a fresh read on the next upload
+        st.rerun()
+
+
 # ── Export for Review (PDF report) ────────────────────────────────────────────
 
 def _exp_to_float(v):
@@ -5220,28 +5465,41 @@ if page == "📋  Trading Log":
     # ── CSV Import ────────────────────────────────────────────────────────────
 
     with st.expander("📁  Import from CSV"):
-        st.markdown(
-            "Expected headers: `Entry Date`, `Ticker`, `Q`, `Entry Price`, `Tags`, "
-            "`Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`"
-        )
-        csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
-        if csv_file:
-            try:
-                csv_df = pd.read_csv(csv_file)
-                st.dataframe(csv_df.head(5), width='stretch', hide_index=True)
-                st.caption(f"{len(csv_df)} rows detected")
-                if st.button("Import Trades", type="primary"):
-                    n_ok, errs = import_trades_from_csv(csv_df)
-                    if n_ok:
-                        st.success(f"Imported {n_ok} trade(s).")
-                    if errs:
-                        st.warning("Some rows had issues:")
-                        for e in errs:
-                            st.caption(e)
-                    if n_ok:
-                        st.rerun()
-            except Exception as e:
-                st.error(f"Could not read CSV: {e}")
+        # Two importers side by side while the smart one earns its keep: the
+        # fixed-header path is unchanged and still the one to fall back to.
+        _smart_tab, _fixed_tab = st.tabs(
+            ["✨  Any CSV  ·  Beta", "📋  Trade Log headers"])
+
+        with _smart_tab:
+            if _csvs is None:
+                st.info("Smart import is unavailable in this build — use the "
+                        "**Trade Log headers** tab.")
+            else:
+                _smart_csv_import(dayfirst=(date_fmt == "euro"))
+
+        with _fixed_tab:
+            st.markdown(
+                "Expected headers: `Entry Date`, `Ticker`, `Q`, `Entry Price`, `Tags`, "
+                "`Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`"
+            )
+            csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
+            if csv_file:
+                try:
+                    csv_df = pd.read_csv(csv_file)
+                    st.dataframe(csv_df.head(5), width='stretch', hide_index=True)
+                    st.caption(f"{len(csv_df)} rows detected")
+                    if st.button("Import Trades", type="primary"):
+                        n_ok, errs = import_trades_from_csv(csv_df)
+                        if n_ok:
+                            st.success(f"Imported {n_ok} trade(s).")
+                        if errs:
+                            st.warning("Some rows had issues:")
+                            for e in errs:
+                                st.caption(e)
+                        if n_ok:
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Could not read CSV: {e}")
 
     # ── Multiple Buy / Sell ───────────────────────────────────────────────────
 
