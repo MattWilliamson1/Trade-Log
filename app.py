@@ -3766,6 +3766,20 @@ def _trade_added_dialog(summary: dict):
         st.rerun()
 
 
+@st.dialog("📤  Trade Closed")
+def _trade_closed_dialog(summary: dict):
+    """Closing confirmation — the mirror of _trade_added_dialog above.
+
+    A close used to land as a toast that was gone before it was read, which is a
+    thin acknowledgement for the action that finalises a trade's P&L.
+    """
+    st.markdown(f"**{summary.get('title', 'Trade closed.')}**")
+    for _ln in summary.get("lines", []):
+        st.markdown(_ln)
+    if st.button("OK", type="primary", width="stretch", key="_trade_closed_ok"):
+        st.rerun()
+
+
 def _close_export_dialog():
     """Forget the Export-for-Review dialog and any report built inside it.
 
@@ -4881,7 +4895,7 @@ TOUR_STEPS = [
             "and **Entry Price** (plus the **Entry Date**). Everything else — exit "
             "price/date, stop loss, tags, notes — is optional and can be filled in "
             "later.\n\n"
-            "Press **Ctrl+Enter** or click **Add Trade** to save. That's it — you're "
+            "Press **Ctrl+Enter** or click **Save and Log Trade** to save. That's it — you're "
             "set up!"
         ),
     },
@@ -5065,6 +5079,10 @@ if page == "📋  Trading Log":
     # On the rerun after a successful add, surface the confirmation dialog. Popping
     # the flag before opening it makes the dialog one-shot: OK (or dismiss) reruns
     # with no flag → it closes.
+    _just_closed = st.session_state.pop("_trade_closed", None)
+    if _just_closed:
+        _trade_closed_dialog(_just_closed)
+
     _just_added = st.session_state.pop("_trade_added", None)
     if _just_added:
         # Reset the ticker field by bumping its key seed: the ticker lives outside
@@ -5253,7 +5271,10 @@ if page == "📋  Trading Log":
                     _trailing_en = st.session_state.get("add_trailing_en", False)
                     sc1, sc2 = st.columns([1, 2])
                     stop_enabled = sc1.checkbox("Enabled", value=True)
-                    opening_stop = sc2.number_input("Opening Stop", min_value=0.0, step=0.01, format="%.2f", value=None)
+                    opening_stop = sc2.number_input("Stop Loss", min_value=0.0, step=0.01, format="%.2f", value=None,
+                                                    help="Where you'll get out if the trade goes against you. "
+                                                         "Stored as the opening stop and copied to the current "
+                                                         "stop, which you can move later.")
                     if _trailing_en:
                         _tr1, _tr2 = st.columns(2)
                         _add_trail_type   = _tr1.selectbox("Trail Unit", ["$", "%", "ATR"], key="add_trail_type")
@@ -5368,7 +5389,7 @@ if page == "📋  Trading Log":
                 uploaded_files = []
 
             st.caption("\\* Required  ·  Ctrl+Enter to submit")
-            if st.form_submit_button("Add Trade", width='stretch', type="primary"):
+            if st.form_submit_button("Save and Log Trade", width='stretch', type="primary"):
 
                 if inst == "Stock":
                     missing = []
@@ -5433,12 +5454,29 @@ if page == "📋  Trading Log":
                                     f"  →  {native_to_usd(entry_price, _fx_entry):,.2f} USD"
                                     f"  (rate {_fx_entry:.4f})"
                                 )
+                            _conf_lines = [
+                                f"- **Quantity:** {fmt_qty(quantity)}",
+                                f"- **Entry:** {_conf_entry} on {fmt_date(entry_date, date_fmt)}",
+                            ]
+                            if exit_price or exit_date:
+                                # Same no-bare-second-$ rule as the entry line above.
+                                if _cur_nat == "USD":
+                                    _conf_exit = fmt_price(exit_price) if exit_price else "—"
+                                elif exit_price:
+                                    _conf_exit = (
+                                        f"{currency_symbol(_cur_nat)}{float(exit_price):,.2f}"
+                                        f"  →  {native_to_usd(exit_price, _fx_exit_eff):,.2f} USD"
+                                        f"  (rate {_fx_exit_eff:.4f})"
+                                    )
+                                else:
+                                    _conf_exit = "—"
+                                _conf_lines.append(
+                                    f"- **Exit:** {_conf_exit} on "
+                                    f"{fmt_date(exit_date, date_fmt) if exit_date else '—'}"
+                                )
                             st.session_state["_trade_added"] = {
                                 "title": f"{t} added to your log.",
-                                "lines": [
-                                    f"- **Quantity:** {fmt_qty(quantity)}",
-                                    f"- **Entry:** {_conf_entry} on {fmt_date(entry_date, date_fmt)}",
-                                ],
+                                "lines": _conf_lines,
                             }
                             st.rerun()
                         except Exception as _err:
@@ -5526,12 +5564,19 @@ if page == "📋  Trading Log":
                                 account_name=fut_account,
                                 plan_id=_add_plan_id,
                             )
+                            _fut_lines = [
+                                f"- **Contracts:** {fmt_qty(quantity)}",
+                                f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, date_fmt)}",
+                            ]
+                            if exit_price or exit_date:
+                                _fut_lines.append(
+                                    f"- **Exit:** "
+                                    f"{fmt_price(exit_price) if exit_price else '—'} on "
+                                    f"{fmt_date(exit_date, date_fmt) if exit_date else '—'}"
+                                )
                             st.session_state["_trade_added"] = {
                                 "title": f"{t} futures trade added to your log.",
-                                "lines": [
-                                    f"- **Contracts:** {fmt_qty(quantity)}",
-                                    f"- **Entry:** {fmt_price(entry_price)} on {fmt_date(entry_date, date_fmt)}",
-                                ],
+                                "lines": _fut_lines,
                             }
                             st.rerun()
                         except Exception as _err:
@@ -6112,20 +6157,68 @@ if page == "📋  Trading Log":
                                     get_trade_tag_ids(_opid),
                                     fx_rate_exit=_cp_fx,
                                 )
-                                st.toast(f"{_op['ticker']} closed at {_op_money(_cp_price)}.", icon="✅")
+                                # Realised P&L in USD, the currency every stored
+                                # price is in — the same arithmetic the trade
+                                # table does, short side flipped.
+                                _cp_exit_usd = native_to_usd(float(_cp_price), _cp_fx)
+                                _cp_pnl = None
+                                if _opqty and _opep:
+                                    _cp_raw = (_cp_exit_usd - _opep) * _opqty * _opmult
+                                    _cp_pnl = -_cp_raw if _opside == "short" else _cp_raw
+                                _cp_lines = [
+                                    f"- **Quantity:** {fmt_qty(_opqty)}",
+                                    f"- **Entry:** {_op_money(_opep_ccy)} on "
+                                    f"{fmt_date(_op['entry_date'], date_fmt)}",
+                                    f"- **Exit:** {_op_money(_cp_price)} on {fmt_date(_cp_dt, date_fmt)}",
+                                ]
+                                if _cp_pnl is not None:
+                                    _cp_lines.append(
+                                        f"- **Realised P&L:** {fmt_price(_cp_pnl)}"
+                                        + (" USD" if _opccy != "USD" else "")
+                                    )
+                                st.session_state["_trade_closed"] = {
+                                    "title": f"{_op['ticker']} closed.",
+                                    "lines": _cp_lines,
+                                }
                                 st.session_state["_op_stay_open"] = True
                                 st.rerun()
 
         # ── Filter bar ────────────────────────────────────────────────────────
 
-        fr1c1, fr1c2, fr1c3 = st.columns(3)
+        # The filter row sat flush against the table with nothing to separate it,
+        # so it read as part of the page rather than as controls. A tinted panel
+        # groups it. Both the shade and the border are neutral translucent grey
+        # rather than fixed colours, so it lands correctly on every app theme
+        # (and in light mode) instead of only the one it was designed against.
+        st.markdown(
+            "<style>"
+            ".st-key-trade_filters {"
+            "  background: rgba(125,140,170,0.10);"
+            "  border: 1px solid rgba(125,140,170,0.28);"
+            "  border-left: 4px solid rgba(78,142,247,0.75);"
+            "  border-radius: 10px;"
+            "  padding: 0.75rem 0.9rem 0.35rem 0.9rem;"
+            "  margin: 0.35rem 0 0.9rem 0;"
+            "}"
+            ".tl-filter-head {"
+            "  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em;"
+            "  text-transform: uppercase; opacity: 0.62; margin-bottom: 0.15rem;"
+            "}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+        _filter_box = st.container(key="trade_filters")
+        _filter_box.markdown("<div class='tl-filter-head'>🔎 Filters</div>",
+                             unsafe_allow_html=True)
+
+        fr1c1, fr1c2, fr1c3 = _filter_box.columns(3)
         ticker_filter = fr1c1.multiselect("Ticker",
                             options=sorted(trades["ticker"].dropna().unique()),
                             placeholder="All tickers", key="filter_ticker")
         status_filter = fr1c2.selectbox("Status",        ["All", "Open", "Closed"], key="filter_status")
         pnl_filter    = fr1c3.selectbox("Winners/Losers", ["All", "Profit (+)", "Loss (-)"], key="filter_pnl")
 
-        fr2c1, fr2c2, fr2c3, fr2c4 = st.columns([1, 1, 1, 0.45])
+        fr2c1, fr2c2, fr2c3, fr2c4 = _filter_box.columns([1, 1, 1, 0.45])
         tag_filter   = fr2c1.multiselect("Tags (any match)",
                             options=sorted(tag_name_to_id.keys()), placeholder="All tags", key="filter_tags")
         date_col_sel = fr2c2.selectbox("Filter date", ["Entry Date", "Exit Date"], key="filter_date_col")
