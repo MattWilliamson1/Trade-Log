@@ -3757,6 +3757,28 @@ def build_review_pdf(start_date, end_date, net_commission: bool, acct_bal: float
     return buf.getvalue()
 
 
+def _exit_before_entry(entry_date, exit_date) -> bool:
+    """True when an exit date falls before the entry date it belongs to.
+
+    A trade cannot close before it opens, and the pair drives days held,
+    annualised return and where the P&L lands on the equity curve — reversed,
+    it yields a negative holding period that quietly poisons all three. Either
+    side missing is not an error: an open trade simply has no exit yet.
+    """
+    if entry_date is None or exit_date is None:
+        return False
+    ent = pd.to_datetime(entry_date, errors="coerce")
+    ext = pd.to_datetime(exit_date, errors="coerce")
+    if pd.isna(ent) or pd.isna(ext):
+        return False
+    return ext.normalize() < ent.normalize()
+
+
+def _exit_before_entry_msg(entry_date, exit_date) -> str:
+    return (f"Exit date ({fmt_date(exit_date, date_fmt)}) is before the entry date "
+            f"({fmt_date(entry_date, date_fmt)}). Check the dates.")
+
+
 @st.dialog("✅  Trade Added")
 def _trade_added_dialog(summary: dict):
     st.markdown(f"**{summary.get('title', 'Trade added to your log.')}**")
@@ -5398,6 +5420,8 @@ if page == "📋  Trading Log":
                     if not entry_price:       missing.append("Entry Price")
                     if missing:
                         st.error(f"Please fill in: {', '.join(missing)}")
+                    elif _exit_before_entry(entry_date, exit_date):
+                        st.error(_exit_before_entry_msg(entry_date, exit_date))
                     else:
                         try:
                             t       = s_ticker.upper().strip()
@@ -5547,6 +5571,8 @@ if page == "📋  Trading Log":
                     if not entry_price:      missing.append("Entry Price")
                     if missing:
                         st.error(f"Please fill in: {', '.join(missing)}")
+                    elif _exit_before_entry(entry_date, exit_date):
+                        st.error(_exit_before_entry_msg(entry_date, exit_date))
                     else:
                         try:
                             t       = s_ticker.upper().strip()
@@ -5755,6 +5781,8 @@ if page == "📋  Trading Log":
                         st.error("Shares and exit price are required.")
                     elif ep_qty > ep_max:
                         st.error(f"Cannot exit more than {fmt_qty(ep_max)} shares.")
+                    elif _exit_before_entry(ep_row.get("entry_date"), ep_date):
+                        st.error(_exit_before_entry_msg(ep_row.get("entry_date"), ep_date))
                     else:
                         # Exit side of the conversion: price the sale at the exit
                         # date's rate and hand that rate down so it lands on the
@@ -6133,6 +6161,10 @@ if page == "📋  Trading Log":
                         if cpe.form_submit_button("Close", width='stretch', type="primary"):
                             if not _cp_price:
                                 st.warning("Enter an exit price to close.")
+                            elif _exit_before_entry(_op.get("entry_date"),
+                                                    _cp_date or _close_today):
+                                st.error(_exit_before_entry_msg(
+                                    _op.get("entry_date"), _cp_date or _close_today))
                             else:
                                 _cp_cs = (float(_op["current_stop"])
                                           if _op.get("current_stop") is not None
@@ -7541,23 +7573,26 @@ if page == "📋  Trading Log":
                             placeholder="Add tags…",
                         )
                         if st.form_submit_button("💾  Save Quick Edit", width='stretch'):
-                            _qe_tag_ids = [tag_name_to_id[n] for n in _qe_sel_tag_names if n in tag_name_to_id]
-                            _qe_cs = float(_dd_row["current_stop"]) if _dd_row.get("current_stop") and not pd.isna(_dd_row.get("current_stop", float("nan"))) else None
-                            update_trade(
-                                _dd_id,
-                                _qe_exit_date,
-                                float(_qe_exit_price) if _qe_exit_price else None,
-                                _dd_row.get("notes") or None,
-                                _qe_cs,
-                                bool(_dd_row.get("stop_enabled", 1)),
-                                _qe_tag_ids,
-                                entry_date=_qe_entry_date,
-                                ticker=_qe_ticker.strip() if _qe_ticker.strip() else None,
-                                quantity=float(_qe_qty) if _qe_qty else None,
-                                entry_price=float(_qe_entry_price) if _qe_entry_price else None,
-                            )
-                            st.toast("Trade updated.", icon="✅")
-                            st.rerun()
+                            if _exit_before_entry(_qe_entry_date, _qe_exit_date):
+                                st.error(_exit_before_entry_msg(_qe_entry_date, _qe_exit_date))
+                            else:
+                                _qe_tag_ids = [tag_name_to_id[n] for n in _qe_sel_tag_names if n in tag_name_to_id]
+                                _qe_cs = float(_dd_row["current_stop"]) if _dd_row.get("current_stop") and not pd.isna(_dd_row.get("current_stop", float("nan"))) else None
+                                update_trade(
+                                    _dd_id,
+                                    _qe_exit_date,
+                                    float(_qe_exit_price) if _qe_exit_price else None,
+                                    _dd_row.get("notes") or None,
+                                    _qe_cs,
+                                    bool(_dd_row.get("stop_enabled", 1)),
+                                    _qe_tag_ids,
+                                    entry_date=_qe_entry_date,
+                                    ticker=_qe_ticker.strip() if _qe_ticker.strip() else None,
+                                    quantity=float(_qe_qty) if _qe_qty else None,
+                                    entry_price=float(_qe_entry_price) if _qe_entry_price else None,
+                                )
+                                st.toast("Trade updated.", icon="✅")
+                                st.rerun()
                     # Linked trading plan (read-only summary)
                     _dd_plan = _plan_by_id(
                         _cached_load_trading_plans(st.session_state["_v_plans"]),
@@ -8433,66 +8468,69 @@ if page == "📋  Trading Log":
 
                 st.caption("Ctrl+Enter to submit")
                 if st.form_submit_button("Save Changes", width='stretch'):
-                    edit_tag_ids = [tag_name_to_id[n] for n in edit_tags]
-                    if edit_plan_choice == "— None —":
-                        _edit_plan_id = None
+                    if _exit_before_entry(edit_entry_date, edit_exit_date):
+                        st.error(_exit_before_entry_msg(edit_entry_date, edit_exit_date))
                     else:
-                        _edit_plan_id = int(_et_plans[_et_plan_opts.index(edit_plan_choice) - 1]["id"])
-                    # The entry rate is only re-looked-up when it could actually
-                    # have changed — currency or entry date. Re-fetching on every
-                    # save would let a slightly different quote drift the stored
-                    # USD entry price a little each time the form is submitted.
-                    _ed_ccy_new = edit_ccy or "USD"
-                    if _ed_ccy_new == "USD":
-                        _fx_e_new = 1.0
-                    elif _ed_ccy_new != _ed_ccy0 or edit_entry_date != _ed_entry_date0:
-                        _fx_e_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_entry_date))
-                    else:
-                        _fx_e_new = _ed_fx_e
-                    # The exit rate is always resolved from the exit date: this is
-                    # the side that used to be left unset, and the date is the only
-                    # thing that determines it. No exit date -> no rate.
-                    if not edit_exit_date:
-                        _fx_x_new = None
-                    elif _ed_ccy_new == "USD":
-                        _fx_x_new = 1.0
-                    else:
-                        _fx_x_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_exit_date))
-                    _fx_x_eff = _fx_x_new or _fx_e_new
+                        edit_tag_ids = [tag_name_to_id[n] for n in edit_tags]
+                        if edit_plan_choice == "— None —":
+                            _edit_plan_id = None
+                        else:
+                            _edit_plan_id = int(_et_plans[_et_plan_opts.index(edit_plan_choice) - 1]["id"])
+                        # The entry rate is only re-looked-up when it could actually
+                        # have changed — currency or entry date. Re-fetching on every
+                        # save would let a slightly different quote drift the stored
+                        # USD entry price a little each time the form is submitted.
+                        _ed_ccy_new = edit_ccy or "USD"
+                        if _ed_ccy_new == "USD":
+                            _fx_e_new = 1.0
+                        elif _ed_ccy_new != _ed_ccy0 or edit_entry_date != _ed_entry_date0:
+                            _fx_e_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_entry_date))
+                        else:
+                            _fx_e_new = _ed_fx_e
+                        # The exit rate is always resolved from the exit date: this is
+                        # the side that used to be left unset, and the date is the only
+                        # thing that determines it. No exit date -> no rate.
+                        if not edit_exit_date:
+                            _fx_x_new = None
+                        elif _ed_ccy_new == "USD":
+                            _fx_x_new = 1.0
+                        else:
+                            _fx_x_new = get_fx_rate_at_date(_ed_ccy_new, str(edit_exit_date))
+                        _fx_x_eff = _fx_x_new or _fx_e_new
 
-                    update_trade(
-                        trade_id,
-                        edit_exit_date, native_to_usd(edit_exit_price, _fx_x_eff),
-                        edit_notes, native_to_usd(edit_current_stop, _fx_e_new),
-                        edit_stop_en, edit_tag_ids,
-                        plan_id=_edit_plan_id,
-                        entry_date=edit_entry_date,
-                        ticker=edit_ticker if edit_ticker.strip() else None,
-                        quantity=edit_qty,
-                        entry_price=native_to_usd(edit_entry_price, _fx_e_new),
-                        opening_stop=(native_to_usd(edit_opening_stop, _fx_e_new)
-                                      if inst_type == "stock" else None),
-                        native_currency=_ed_ccy_new,
-                        fx_rate_entry=_fx_e_new,
-                        fx_rate_exit=_fx_x_new,
-                        expiration=edit_expiration,
-                        strike=edit_strike,
-                        option_type=edit_option_type,
-                        multiplier=edit_multiplier,
-                        side=edit_side,
-                        commission=edit_commission,
-                        account_name=edit_account,
-                        trail_type=edit_trail_type if inst_type == "stock" else None,
-                        trail_amount=float(edit_trail_amount) if inst_type == "stock" and edit_trail_amount else None,
-                    )
-                    if inst_type == "option" and "edit_underlying_px" in locals():
-                        with get_connection() as _conn:
-                            _conn.execute("UPDATE trades SET underlying_price_at_entry=? WHERE id=?",
-                                         (edit_underlying_px or None, trade_id))
-                    earn_str = edit_earnings.isoformat() if edit_earnings else ""
-                    update_earnings_override(trade_id, earn_str)
-                    st.success("Trade updated.")
-                    st.rerun()
+                        update_trade(
+                            trade_id,
+                            edit_exit_date, native_to_usd(edit_exit_price, _fx_x_eff),
+                            edit_notes, native_to_usd(edit_current_stop, _fx_e_new),
+                            edit_stop_en, edit_tag_ids,
+                            plan_id=_edit_plan_id,
+                            entry_date=edit_entry_date,
+                            ticker=edit_ticker if edit_ticker.strip() else None,
+                            quantity=edit_qty,
+                            entry_price=native_to_usd(edit_entry_price, _fx_e_new),
+                            opening_stop=(native_to_usd(edit_opening_stop, _fx_e_new)
+                                          if inst_type == "stock" else None),
+                            native_currency=_ed_ccy_new,
+                            fx_rate_entry=_fx_e_new,
+                            fx_rate_exit=_fx_x_new,
+                            expiration=edit_expiration,
+                            strike=edit_strike,
+                            option_type=edit_option_type,
+                            multiplier=edit_multiplier,
+                            side=edit_side,
+                            commission=edit_commission,
+                            account_name=edit_account,
+                            trail_type=edit_trail_type if inst_type == "stock" else None,
+                            trail_amount=float(edit_trail_amount) if inst_type == "stock" and edit_trail_amount else None,
+                        )
+                        if inst_type == "option" and "edit_underlying_px" in locals():
+                            with get_connection() as _conn:
+                                _conn.execute("UPDATE trades SET underlying_price_at_entry=? WHERE id=?",
+                                             (edit_underlying_px or None, trade_id))
+                        earn_str = edit_earnings.isoformat() if edit_earnings else ""
+                        update_earnings_override(trade_id, earn_str)
+                        st.success("Trade updated.")
+                        st.rerun()
 
             st.markdown("**Attachments**")
             existing_atts = load_attachments(trade_id)
