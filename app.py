@@ -5822,13 +5822,24 @@ if page == "📋  Trading Log":
         # this argument on every rerun, so without the flag the list would snap
         # shut after each position closed and have to be re-opened for the next.
         _op_stay_open = bool(st.session_state.pop("_op_stay_open", False))
+        # Widgets in these forms keep their submitted value — clear_on_submit is
+        # False, which the exit fields rely on — so a saved stop would go on
+        # showing the figure just sent (0.0000 after a clear) until the page was
+        # reloaded. A per-trade revision in the key makes the next run build a
+        # fresh widget, which reads its value from the database instead. The
+        # superseded key is dropped here, before any widget exists, because
+        # Streamlit forbids touching a live widget's state.
+        _op_stop_rev = st.session_state.setdefault("_op_stop_rev", {})
+        for _op_stale in st.session_state.pop("_op_stop_drop", []):
+            st.session_state.pop(_op_stale, None)
         with st.expander(f"📌  Open Positions ({len(_open_pos)})",
                          expanded=_op_stay_open):
             if _open_pos.empty:
                 st.caption("No open positions.")
             else:
-                st.caption("Enter an exit price and click Close — exit date defaults to today "
-                           "but can be overridden. Live price (stocks) pre-fills the exit field.")
+                st.caption("Move a stop with 💾, or enter an exit price and click Close — exit "
+                           "date defaults to today but can be overridden. Live price (stocks) "
+                           "pre-fills the exit field.")
                 # One position per row. The per-field labels live in a single
                 # header instead of on every widget, and the forms are borderless,
                 # so a row is one line tall rather than a stacked card.
@@ -5841,10 +5852,10 @@ if page == "📋  Trading Log":
                     "</style>",
                     unsafe_allow_html=True,
                 )
-                _OP_COLS = [2.4, 0.9, 1.2, 1.2, 1.3, 1.0]
+                _OP_COLS = [2.2, 0.85, 1.05, 1.0, 0.45, 1.1, 1.15, 0.9]
                 _op_list = st.container(key="open_pos_list")
                 _hdr = _op_list.columns(_OP_COLS, vertical_alignment="center")
-                for _hc, _ht in zip(_hdr, ["Position", "Live", "Unrealized",
+                for _hc, _ht in zip(_hdr, ["Position", "Live", "Unrealized", "Stop", "",
                                            "Exit Price", "Exit Date", ""]):
                     _hc.markdown(
                         f"<div style='font-size:0.72rem;color:#888;font-weight:600;"
@@ -5893,7 +5904,7 @@ if page == "📋  Trading Log":
 
                     with _op_list.form(f"close_pos_{_opid}", clear_on_submit=False,
                                        border=False):
-                        cpa, cpb, cpc, cpd, cpf, cpe = st.columns(
+                        cpa, cpb, cpc, cpg, cph, cpd, cpf, cpe = st.columns(
                             _OP_COLS, vertical_alignment="center")
                         _lbl = f"**{_op['ticker']}**" + (f" · {_opinst}" if _opinst != "stock" else "")
                         # The currency is only spelled out when it isn't USD — the
@@ -5916,6 +5927,50 @@ if page == "📋  Trading Log":
                         else:
                             _upnl_txt = "<span style='color:#888'>—</span>"
                         cpc.markdown(f"<div>{_upnl_txt}</div>", unsafe_allow_html=True)
+                        # Stops are stored in USD like every other price, and the
+                        # entry rate is what Edit Trade converts them with — so use
+                        # the same one here or the two panels would disagree.
+                        _opfx_e   = float(_op.get("fx_rate_entry") or 1.0)
+                        _op_trail = str(_op.get("trail_type") or "fixed") != "fixed"
+                        _op_stop_usd = _op.get("current_stop")
+                        if _op_stop_usd is None or pd.isna(_op_stop_usd):
+                            _op_stop_usd = _op.get("opening_stop")
+                        _op_stop_ccy = (
+                            float(usd_to_native(float(_op_stop_usd), _opfx_e)
+                                  if _opccy != "USD" else float(_op_stop_usd))
+                            if _op_stop_usd is not None and not pd.isna(_op_stop_usd) else None
+                        )
+                        # Only stocks carry a typed stop — Edit Trade offers the
+                        # field for stocks alone, and a trailing stop is derived
+                        # from the high rather than entered. Both cells are still
+                        # drawn so every row keeps the same shape as the header.
+                        _op_stop_editable = _opinst == "stock" and not _op_trail
+                        _op_stop_key = f"cp_stop_{_opid}_{_op_stop_rev.get(_opid, 0)}"
+                        if _op_stop_editable:
+                            _cp_stop = cpg.number_input(
+                                "Stop", min_value=0.0, step=0.01, format="%.4f",
+                                value=_op_stop_ccy, key=_op_stop_key,
+                                label_visibility="collapsed",
+                                placeholder="No stop",
+                                help=(f"Stop in {_opccy}. Save with 💾 — this moves the "
+                                      "current stop only; the opening stop is left as it was."
+                                      if _opccy != "USD" else
+                                      "Save with 💾 — this moves the current stop only; "
+                                      "the opening stop is left as it was."),
+                            )
+                        else:
+                            _cp_stop = None
+                            _op_stop_note = ("trailing stop — edit in Edit Trade" if _op_trail
+                                             else "stops are set in Edit Trade")
+                            cpg.markdown(
+                                f"<div style='color:#888' title='{_op_stop_note}'>"
+                                f"{_op_money(_op_stop_ccy)}{' ↗' if _op_trail else ''}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        _cp_save_stop = cph.form_submit_button(
+                            "💾", width='stretch', disabled=not _op_stop_editable,
+                            help="Save this stop without closing the position",
+                        )
                         _cp_price = cpd.number_input(
                             "Exit Price" if _opccy == "USD"
                             else f"Exit Price ({currency_symbol(_opccy)} {_opccy})",
@@ -5931,6 +5986,30 @@ if page == "📋  Trading Log":
                             "Exit Date", value=_close_today, key=f"cp_dt_{_opid}",
                             label_visibility="collapsed",
                         )
+                        if _cp_save_stop:
+                            # A stop-only save: exit_date and exit_price go in as
+                            # None, which is what they already are on an open
+                            # trade. Clearing the box removes the stop entirely.
+                            _new_stop = float(_cp_stop) if _cp_stop else None
+                            _new_usd  = (native_to_usd(_new_stop, _opfx_e)
+                                         if _new_stop is not None and _opccy != "USD"
+                                         else _new_stop)
+                            update_trade(
+                                _opid, None, None, _op.get("notes") or None,
+                                _new_usd, _new_usd is not None,
+                                get_trade_tag_ids(_opid),
+                            )
+                            st.toast(
+                                f"{_op['ticker']} stop set to {_op_money(_new_stop)}."
+                                if _new_stop is not None else
+                                f"{_op['ticker']} stop removed.",
+                                icon="🛑",
+                            )
+                            st.session_state["_op_stay_open"] = True
+                            st.session_state["_op_stop_drop"] = [_op_stop_key]
+                            _op_stop_rev[_opid] = _op_stop_rev.get(_opid, 0) + 1
+                            st.rerun()
+
                         if cpe.form_submit_button("Close", width='stretch', type="primary"):
                             if not _cp_price:
                                 st.warning("Enter an exit price to close.")
