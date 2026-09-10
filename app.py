@@ -6218,6 +6218,12 @@ if page == "📋  Trading Log":
 
         # Apply a deferred column removal here — BEFORE the multiselect widget is
         # instantiated (Streamlit forbids mutating a widget's state afterwards).
+        # Same deferral as the removal below: visible_cols is a widget, so its
+        # state can only be rewritten before the widget is instantiated.
+        if st.session_state.pop("_col_restore_pending", False):
+            st.session_state["visible_cols"] = list(DEFAULT_COLS)
+            st.session_state["col_order"]    = list(DEFAULT_COLS)
+
         _rm_pending = st.session_state.pop("_col_remove_pending", None)
         if _rm_pending:
             st.session_state["visible_cols"] = [
@@ -6234,15 +6240,15 @@ if page == "📋  Trading Log":
                 # ── Built-in presets ───────────────────────────────────────
                 _pr1, _pr2, _pr3 = st.columns(3)
                 if _pr1.button("Stock", key="preset_stock", width='stretch'):
-                    st.session_state["visible_cols"] = PRESET_STOCK
+                    st.session_state["visible_cols"] = list(PRESET_STOCK)
                     st.session_state["col_order"]    = list(PRESET_STOCK)
                     st.rerun()
                 if _pr2.button("Options", key="preset_options", width='stretch'):
-                    st.session_state["visible_cols"] = PRESET_OPTIONS
+                    st.session_state["visible_cols"] = list(PRESET_OPTIONS)
                     st.session_state["col_order"]    = list(PRESET_OPTIONS)
                     st.rerun()
                 if _pr3.button("Default", key="preset_default", width='stretch'):
-                    st.session_state["visible_cols"] = DEFAULT_COLS
+                    st.session_state["visible_cols"] = list(DEFAULT_COLS)
                     st.session_state["col_order"]    = list(DEFAULT_COLS)
                     st.rerun()
 
@@ -6341,6 +6347,16 @@ if page == "📋  Trading Log":
                     st.toast("Saved as your default startup view.", icon="📌")
 
         vis = _col_order
+
+        # Clearing the last column leaves a table with nothing in it, and the
+        # reorder expander hides itself at zero columns — so the only way back
+        # is the Columns popover, which is not obvious mid-mess. Offer the door.
+        if not vis:
+            st.info("No columns are selected, so the table below is empty. "
+                    "Pick some in **⚙️ Columns**, or start again from the default set.")
+            if st.button("↺  Restore default columns", key="restore_default_cols"):
+                st.session_state["_col_restore_pending"] = True
+                st.rerun()
 
         # ── Lazy metadata ──────────────────────────────────────────────────────
 
@@ -6823,16 +6839,18 @@ if page == "📋  Trading Log":
                     return fmt_num((lp - cs) / atr) if atr else "—"
                 display["Stop Dist ATR"] = filtered.apply(_sd_atr, axis=1)
 
-            if metadata:
-                if "Sector" in vis:
-                    display["Sector"]      = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("sector") or "—")
-                if "Industry" in vis:
-                    display["Industry"]    = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("industry") or "—")
-                if "Beta" in vis:
-                    display["Beta"]        = filtered["ticker"].apply(lambda t: fmt_num(metadata.get(t, {}).get("beta")))
-                if "Correlation" in vis:
-                    display["Correlation"] = filtered["ticker"].apply(
-                        lambda t: fmt_num(metadata.get(t, {}).get("correlation_spy"), decimals=3))
+            # No `if metadata` guard: when the lookup comes back empty these read
+            # as "—" on their own, and skipping them instead made the column
+            # disappear from the table altogether.
+            if "Sector" in vis:
+                display["Sector"]      = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("sector") or "—")
+            if "Industry" in vis:
+                display["Industry"]    = filtered["ticker"].apply(lambda t: metadata.get(t, {}).get("industry") or "—")
+            if "Beta" in vis:
+                display["Beta"]        = filtered["ticker"].apply(lambda t: fmt_num(metadata.get(t, {}).get("beta")))
+            if "Correlation" in vis:
+                display["Correlation"] = filtered["ticker"].apply(
+                    lambda t: fmt_num(metadata.get(t, {}).get("correlation_spy"), decimals=3))
 
             # Options / Futures columns
             if "Contract" in vis:
@@ -7252,7 +7270,14 @@ if page == "📋  Trading Log":
 
             # ── Render table ───────────────────────────────────────────────────────
 
-            safe_vis   = [c for c in vis if c in display.columns]
+            # A column that was selected but never built would otherwise be
+            # dropped here and simply not appear — the user picks it, nothing
+            # happens, and there is nothing on screen to say why. Fill the gap
+            # with an em dash instead, so a chosen column is always present,
+            # empty rather than absent.
+            for _missing_col in [c for c in vis if c not in display.columns]:
+                display[_missing_col] = "—"
+            safe_vis   = list(vis)
             _grp_keys  = (
                 filtered["leg_group"].reset_index(drop=True)
                 if "leg_group" in filtered.columns else None
