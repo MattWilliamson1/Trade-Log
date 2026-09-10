@@ -4372,10 +4372,14 @@ section[data-testid="stMain"] [data-testid="stPopoverButton"] {
 .mode-badge-live, .mode-badge-demo { font-size: 0.7rem !important; padding: 0.12rem 0.5rem !important;
                                      margin: 0.15rem 0 0.3rem !important; }
 
-/* The two oversized hero buttons style themselves inline further down the page.
-   The leading `body` outranks those rules instead of relying on source order. */
-body div[data-testid="stSidebar"] .st-key-sb_export_review button,
-body div[data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button {
+/* The oversized hero buttons style themselves inline further down the page.
+   The leading `body` outranks those rules instead of relying on source order.
+   The update pair belongs here too — left out, they fell to the generic 0.8rem
+   sidebar size and ended up *smaller* than the buttons they sit next to. */
+body [data-testid="stSidebar"] .st-key-sb_export_review button,
+body [data-testid="stSidebar"] .st-key-sb_fetch_live button,
+body [data-testid="stSidebar"] .st-key-sb_do_update button,
+body [data-testid="stSidebar"] .st-key-sb_upd_restart button {
     font-size: 0.95rem !important; padding: 0.45rem 0 !important; border-radius: 8px !important;
 }
 </style>
@@ -4600,7 +4604,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "<style>"
-        "div[data-testid='stSidebar'] .st-key-sb_export_review button {"
+        "[data-testid='stSidebar'] .st-key-sb_export_review button {"
         "  background: linear-gradient(135deg,#3b1d6e,#6d28d9,#8b5cf6) !important;"
         "  color:#fff !important; font-size:1.35rem !important; font-weight:900 !important;"
         "  border:none !important; border-radius:12px !important; padding:1.0rem 0 !important;"
@@ -4608,7 +4612,7 @@ with st.sidebar:
         "  box-shadow:0 4px 18px rgba(139,92,246,0.5),0 2px 6px #0008 !important;"
         "  text-shadow:0 1px 4px #0005 !important; transition:transform .1s, box-shadow .1s !important;"
         "}"
-        "div[data-testid='stSidebar'] .st-key-sb_export_review button:hover {"
+        "[data-testid='stSidebar'] .st-key-sb_export_review button:hover {"
         "  transform:scale(1.03) !important;"
         "  box-shadow:0 6px 24px rgba(139,92,246,0.65),0 3px 8px #000a !important;"
         "}"
@@ -4642,8 +4646,58 @@ with st.sidebar:
     elif _upd_status == "current":
         st.success("You're up to date.")
     elif _upd_status == "available":
-        st.info(f"Update available → {st.session_state.get('_upd_remote_ver', '')}")
-        if st.button("⬇  Install update", width="stretch", key="sb_do_update", type="primary"):
+        # This is the one sidebar item the user is meant to act on, and as a
+        # plain st.info + default button it read as a status line rather than a
+        # prompt. Same treatment as EXPORT FOR REVIEW above — green rather than
+        # purple so the two loud buttons stay distinguishable — plus a slow glow
+        # to catch the eye, and the version being moved *from* as well as *to*.
+        st.markdown(
+            "<style>"
+            ".tl-upd-banner {"
+            "  background:linear-gradient(135deg,#78350f,#b45309,#f59e0b);"
+            "  color:#fff; border-radius:12px; padding:0.7rem 0.85rem;"
+            "  margin:0.2rem 0 0.55rem; font-weight:800; font-size:1.05rem;"
+            "  line-height:1.25; letter-spacing:0.02em;"
+            "  box-shadow:0 4px 18px rgba(245,158,11,0.45),0 2px 6px #0008;"
+            "  text-shadow:0 1px 4px #0005;"
+            "}"
+            ".tl-upd-banner span {"
+            "  display:block; font-weight:600; font-size:0.85rem;"
+            "  opacity:0.92; margin-top:0.15rem; letter-spacing:0;"
+            "}"
+            "[data-testid='stSidebar'] .st-key-sb_do_update button {"
+            "  background:linear-gradient(135deg,#7c2d12,#d97706,#f59e0b) !important;"
+            "  color:#fff !important; font-size:1.45rem !important; font-weight:900 !important;"
+            "  border:none !important; border-radius:12px !important; padding:0.95rem 0 !important;"
+            "  letter-spacing:0.05em !important; text-shadow:0 1px 4px #0005 !important;"
+            "  box-shadow:0 4px 18px rgba(245,158,11,0.5),0 2px 6px #0008 !important;"
+            # Glow on `filter`, not `box-shadow`: an !important box-shadow would
+            # beat the keyframes and the pulse would never show.
+            "  animation:tlUpdGlow 2.4s ease-in-out infinite !important;"
+            "  transition:transform .1s !important;"
+            "}"
+            "[data-testid='stSidebar'] .st-key-sb_do_update button:hover {"
+            "  transform:scale(1.03) !important; animation:none !important;"
+            "  box-shadow:0 6px 24px rgba(245,158,11,0.8),0 3px 8px #000a !important;"
+            "}"
+            "@keyframes tlUpdGlow {"
+            "  0%,100% { filter:drop-shadow(0 0 0 rgba(251,191,36,0)); }"
+            "  50%     { filter:drop-shadow(0 0 12px rgba(251,191,36,0.9)); }"
+            "}"
+            "@media (prefers-reduced-motion: reduce) {"
+            "  [data-testid='stSidebar'] .st-key-sb_do_update button {"
+            "    animation:none !important;"
+            "  }"
+            "}"
+            "</style>"
+            "<div class='tl-upd-banner'>⬆&nbsp; Update available"
+            f"<span>v{_upd.get_local_version()} → v{st.session_state.get('_upd_remote_ver', '')}</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("⬇  INSTALL UPDATE", width="stretch", key="sb_do_update",
+                     type="primary",
+                     help="Download the new version now — Trade Log restarts to finish"):
             with st.spinner("Downloading and installing…"):
                 _ok, _err = _upd.download_updates()
             if _ok:
@@ -4661,21 +4715,42 @@ with st.sidebar:
             st.info("🔄  Restarting to finish the update…")
             _trigger_supervised_restart()
         else:
-            st.success("✅  Update installed.")
+            st.success("✅  Update installed — but not running yet.")
             if os.environ.get("TRADELOG_SUPERVISED") == "1":
-                if st.button("🔄  Restart to finish", width="stretch",
-                             key="sb_upd_restart", type="primary"):
+                # Half-finished is the worst state to leave quietly: the files
+                # are on disk but the old code is still running. Amber, not the
+                # install button's green — this one still wants a click.
+                st.markdown(
+                    "<style>"
+                    "[data-testid='stSidebar'] .st-key-sb_upd_restart button {"
+                    "  background:linear-gradient(135deg,#7c2d12,#d97706,#f59e0b) !important;"
+                    "  color:#fff !important; font-size:1.15rem !important; font-weight:900 !important;"
+                    "  border:none !important; border-radius:12px !important; padding:0.85rem 0 !important;"
+                    "  letter-spacing:0.04em !important; text-shadow:0 1px 4px #0005 !important;"
+                    "  box-shadow:0 4px 18px rgba(245,158,11,0.5),0 2px 6px #0008 !important;"
+                    "  transition:transform .1s !important;"
+                    "}"
+                    "[data-testid='stSidebar'] .st-key-sb_upd_restart button:hover {"
+                    "  transform:scale(1.03) !important;"
+                    "  box-shadow:0 6px 24px rgba(245,158,11,0.75),0 3px 8px #000a !important;"
+                    "}"
+                    "</style>",
+                    unsafe_allow_html=True,
+                )
+                if st.button("🔄  RESTART TO FINISH", width="stretch",
+                             key="sb_upd_restart", type="primary",
+                             help="Reloads Trade Log so the new version takes effect"):
                     st.session_state["_upd_restart_running"] = True
                     st.rerun()
             else:
-                st.caption("Close and reopen Trade Log to finish applying it.")
+                st.warning("Close and reopen Trade Log to finish applying it.")
 
     # ── Live data fetch (sidebar, always docked) ───────────────────────────
     st.markdown("---")
     st.markdown(
         "<style>"
         "#sb_fetch_live_container { margin: 0.5rem 0 0.25rem 0; }"
-        "div[data-testid='stSidebar'] div[data-testid='stButton']:last-of-type button {"
+        "[data-testid='stSidebar'] .st-key-sb_fetch_live button {"
         "  background: linear-gradient(135deg,#0d4a28,#1a8a40,#22c55e) !important;"
         "  color: #fff !important; font-size: 1.45rem !important;"
         "  font-weight: 900 !important; border: none !important;"
@@ -4685,7 +4760,7 @@ with st.sidebar:
         "  text-shadow: 0 1px 4px #0005 !important;"
         "  transition: transform 0.1s, box-shadow 0.1s !important;"
         "}"
-        "div[data-testid='stSidebar'] div[data-testid='stButton']:last-of-type button:hover {"
+        "[data-testid='stSidebar'] .st-key-sb_fetch_live button:hover {"
         "  transform: scale(1.03) !important;"
         "  box-shadow: 0 6px 24px rgba(34,197,94,0.65), 0 3px 8px #000a !important;"
         "}"
