@@ -223,6 +223,19 @@ def _p_instrument(values) -> float:
     return _frac(values, ok)
 
 
+_CURRENCY_CODES = {
+    "USD", "EUR", "GBP", "AUD", "CAD", "NZD", "JPY", "CHF", "HKD", "SGD", "SEK",
+    "NOK", "DKK", "ZAR", "INR", "CNY", "KRW", "MXN", "BRL", "PLN", "CZK", "HUF",
+    "ILS", "TRY", "TWD", "THB",
+}
+
+
+def _p_currency(values) -> float:
+    """ISO currency codes. Membership, not shape: IBM, AMD and GE are also
+    three capital letters, and a ticker column must not read as currency."""
+    return _frac(values, lambda v: str(v).strip().upper() in _CURRENCY_CODES)
+
+
 def _p_any(values) -> float:
     """No usable value signature — the header has to carry the mapping alone."""
     return 0.0
@@ -359,6 +372,25 @@ FIELDS: list[FieldSpec] = [
     FieldSpec("exchange", "Exchange", ("exchange", "listing exchange", "venue",
                                        "primary exchange", "mic", "market centre",
                                        "market center")),
+    FieldSpec(
+        "currency", "Currency", (
+            "currency", "ccy", "curr", "cur", "native currency", "price currency",
+            "trade currency", "currency code", "denomination", "fx currency",
+        ),
+        _p_currency, strict=True, distinct=True,
+        help="The currency the prices in this file are in. Trades are converted "
+             "to USD at each trade's own entry and exit dates on import.",
+    ),
+    FieldSpec(
+        "transaction_id", "Transaction #", (
+            "transaction id", "transaction number", "transaction no", "trans id",
+            "txn id", "txn", "trade id", "trade number", "trade no", "order id",
+            "order number", "execution id", "exec id", "reference", "ref", "ref no",
+            "confirmation number", "confirm no", "id",
+        ),
+        help="The broker's reference for the fill. Kept in the trade's Notes as "
+             "\"Ref: …\" — both sides when a buy and sell are paired.",
+    ),
 ]
 
 FIELDS_BY_KEY = {f.key: f for f in FIELDS}
@@ -696,7 +728,12 @@ def _common_fields(row, mapping: Mapping, dayfirst: bool) -> dict:
     pc = _cell(row, mapping, "option_type")
     tags_raw = _cell(row, mapping, "tags")
 
+    ccy = _cell(row, mapping, "currency")
+    ref = _cell(row, mapping, "transaction_id")
+
     return {
+        "native_currency": str(ccy).strip().upper() if ccy else None,
+        "transaction_id": str(ref).strip() if ref else None,
         "instrument_type": _instrument_of(_cell(row, mapping, "instrument_type"),
                                           expiration, strike),
         "expiration":   expiration,
@@ -854,6 +891,7 @@ def _build_from_fills(df: pd.DataFrame, mapping: Mapping, dayfirst: bool) -> tup
                 "exit_date": f["date"], "exit_price": f["price"], "side": "long",
             }
             td.update(lot["common"])
+            td["exit_transaction_id"] = f["common"].get("transaction_id")
             trades.append(td)
             lot["qty"] -= take
             remaining -= take
@@ -867,6 +905,8 @@ def _build_from_fills(df: pd.DataFrame, mapping: Mapping, dayfirst: bool) -> tup
                 "side": "long", "close_only": True,
             }
             td.update(f["common"])
+            # The only reference we hold is the sell's; it is the exit side.
+            td["exit_transaction_id"] = td.pop("transaction_id", None)
             trades.append(td)
             closed_only += 1
 

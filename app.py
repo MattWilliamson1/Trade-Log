@@ -2650,7 +2650,7 @@ def import_parsed_trades(trade_list: list[dict]) -> dict:
                     "exit_price", "notes", "stop_enabled", "opening_stop", "tag_ids",
                     "current_stop", "instrument_type", "expiration", "strike",
                     "option_type", "multiplier", "leg_group", "leg_label", "side",
-                    "exchange",
+                    "exchange", "native_currency", "fx_rate_entry", "fx_rate_exit",
                 ] if k in td})
                 imported += 1
         except Exception as e:
@@ -3039,6 +3039,26 @@ def _smart_csv_import(dayfirst: bool):
         "you import. Nothing is written until you press Import."
     )
 
+    # Result of the previous import, shown once. Popped on render so it clears
+    # on the next interaction rather than lingering under a new file.
+    _res = st.session_state.pop("_scsv_result", None)
+    if _res:
+        _c = _res["counts"]
+        st.success(f"Imported {_c['imported']} trade(s).")
+        if _c["closed"]:
+            st.info(f"{_c['closed']} existing open trade(s) updated with closing data.")
+        if _c["dupes"]:
+            st.info(f"{_c['dupes']} duplicate(s) skipped — already in the log.")
+        if _c["errors"]:
+            st.warning(f"{len(_c['errors'])} trade(s) failed: " + " · ".join(_c["errors"][:5]))
+        if _res["ccy_skipped"]:
+            _sk = _res["ccy_skipped"]
+            st.warning(
+                f"{len(_sk)} trade(s) not imported — Trade Log can't log trades in "
+                f"that currency: {', '.join(_sk[:6])}{' …' if len(_sk) > 6 else ''}. "
+                f"Supported: {', '.join(NATIVE_CURRENCIES)}."
+            )
+
     up = st.file_uploader("Upload CSV", type=["csv", "txt"], key="scsv_upload")
     if not up:
         st.caption(
@@ -3172,6 +3192,8 @@ def _smart_csv_import(dayfirst: bool):
         # Tags arrive as names; create any that don't exist yet, then hand
         # import_parsed_trades the tag_ids it expects.
         tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
+        _ccy_skipped: list = []
+        _to_import: list = []
         for td in picked:
             ids = []
             for tname in td.pop("tags", None) or []:
@@ -3182,20 +3204,46 @@ def _smart_csv_import(dayfirst: bool):
                     ids.append(tag_cache[tname.lower()])
             td["tag_ids"] = ids
 
-        counts = import_parsed_trades(picked)
+            # The broker's reference lives in Notes — there is no column for
+            # it, and a reference is exactly what Notes is for. Both sides
+            # when a buy and sell were paired into one trade.
+            _ref = " → ".join(r for r in (td.pop("transaction_id", None),
+                                          td.pop("exit_transaction_id", None)) if r)
+            if _ref:
+                td["notes"] = f"Ref: {_ref}" + (chr(10) + td["notes"] if td.get("notes") else "")
 
+            # Prices were typed in the file's currency; the columns they land
+            # in are USD. Convert at each trade's own dates and hand the rates
+            # down, exactly as the Add Trade form does. A currency the app
+            # can't log a trade in is refused rather than stored as dollars.
+            _ccy = (td.pop("native_currency", None) or "USD").upper()
+            if _ccy == "USD":
+                td["native_currency"], td["fx_rate_entry"], td["fx_rate_exit"] = "USD", 1.0, 1.0
+            elif _ccy not in NATIVE_CURRENCIES:
+                _ccy_skipped.append(f"{td.get('ticker', '?')} ({_ccy})")
+                continue
+            else:
+                _fx_e = (get_fx_rate_at_date(_ccy, str(td["entry_date"]))
+                         if td.get("entry_date") else None)
+                _fx_x = (get_fx_rate_at_date(_ccy, str(td["exit_date"]))
+                         if td.get("exit_date") else None)
+                for _k, _fx in (("entry_price", _fx_e), ("opening_stop", _fx_e),
+                                ("current_stop", _fx_e), ("exit_price", _fx_x or _fx_e)):
+                    if td.get(_k) is not None and _fx:
+                        td[_k] = native_to_usd(float(td[_k]), _fx)
+                td["native_currency"] = _ccy
+                td["fx_rate_entry"]   = _fx_e or 1.0
+                td["fx_rate_exit"]    = _fx_x
+            _to_import.append(td)
+
+        counts = import_parsed_trades(_to_import)
         if remember:
             _save_csv_profile(st.session_state["_scsv_fp"],
                               st.session_state.get("_scsv_name", "CSV"),
                               mapping.columns, shape)
-        if counts["errors"]:
-            st.warning(f"{len(counts['errors'])} trade(s) failed:\n"
-                       + "\n".join(f"• {e}" for e in counts["errors"][:5]))
-        if counts["dupes"]:
-            st.info(f"{counts['dupes']} duplicate(s) skipped — already in the log.")
-        if counts["closed"]:
-            st.info(f"{counts['closed']} existing open trade(s) updated with closing data.")
-        st.success(f"Imported {counts['imported']} trade(s).")
+        # Anything written here is gone the instant rerun() fires, so the
+        # summary is parked in session state and drawn on the next run.
+        st.session_state["_scsv_result"] = {"counts": counts, "ccy_skipped": _ccy_skipped}
         st.session_state.pop("_scsv_sig", None)      # force a fresh read on the next upload
         st.rerun()
 
