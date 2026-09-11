@@ -14,6 +14,7 @@ SOURCE_FILES = [
     "ib_client.py",
     "schwab_client.py",
     "fidelity_client.py",
+    "csv_smart.py",
     "launch.py",
     "requirements.txt",
     "updater.py",
@@ -40,6 +41,15 @@ def get_remote_version() -> "str | None":
         return None
 
 
+def _source_files_in(updater_src: bytes) -> list:
+    """SOURCE_FILES as declared in another copy of this file, read without
+    importing it — a regex over the literal, so nothing untrusted executes."""
+    import re
+    text = updater_src.decode("utf-8", errors="replace")
+    m = re.search(r"SOURCE_FILES\s*=\s*\[(.*?)\]", text, re.S)
+    return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
+
 def download_updates() -> "tuple[bool, str | None]":
     """Download all source files from GitHub main. Returns (success, error_message).
 
@@ -54,6 +64,14 @@ def download_updates() -> "tuple[bool, str | None]":
         for name in SOURCE_FILES:
             with urllib.request.urlopen(f"{RAW_BASE}/{name}", timeout=30) as r:
                 downloaded[name] = r.read()
+        # The list driving that loop is the *installed* updater's. A module
+        # added to SOURCE_FILES upstream would otherwise arrive one update late:
+        # skipped this round because this copy never heard of it, and fetched
+        # only after the next version bump. Read the fresh list and top up.
+        for name in _source_files_in(downloaded.get("updater.py", b"")):
+            if name not in downloaded:
+                with urllib.request.urlopen(f"{RAW_BASE}/{name}", timeout=30) as r:
+                    downloaded[name] = r.read()
     except Exception as e:
         return False, str(e)
 
