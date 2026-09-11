@@ -31,6 +31,14 @@ except Exception:
     # handles _fidelity_mod being None gracefully.
     _fidelity_mod = None
 import updater as _upd
+# An install brought up to date by an older updater has only the files that
+# copy knew to fetch; a module listed since is absent until the next bump.
+# Close the gap before the optional imports below go looking. getattr, not a
+# direct call: a stale updater.py without the function must not stop startup.
+try:
+    getattr(_upd, "fetch_missing_source_files", lambda: [])()
+except Exception:
+    pass
 try:
     import csv_smart as _csvs
 except Exception:

@@ -28,6 +28,38 @@ _WIN_LAUNCHER_SRC = "installer/launch.bat"
 _WIN_LAUNCHER_DST = "launch.bat"
 
 
+_topped_up = False
+
+
+def fetch_missing_source_files() -> list:
+    """Download any module in SOURCE_FILES that is absent on disk; return the names.
+
+    An install brought up to date by an *older* updater has only the files that
+    copy knew to fetch, so a module added to the list since is missing until
+    the next version bump. app.py calls this at startup, before its optional
+    imports, so the gap closes on first run rather than next release. Modules
+    only, and never an overwrite: a file that exists is left alone whatever it
+    holds. Runs once per process; the cost when nothing is missing is a stat
+    per name.
+    """
+    global _topped_up
+    if _topped_up:
+        return []
+    _topped_up = True
+    fetched = []
+    for name in SOURCE_FILES:
+        if not name.endswith(".py") or (APP_DIR / name).exists():
+            continue
+        try:
+            with urllib.request.urlopen(f"{RAW_BASE}/{name}", timeout=15) as r:
+                data = r.read()
+            (APP_DIR / name).write_bytes(data)
+            fetched.append(name)
+        except Exception:
+            continue
+    return fetched
+
+
 def get_local_version() -> str:
     v = APP_DIR / "VERSION"
     return v.read_text().strip() if v.exists() else "unknown"
