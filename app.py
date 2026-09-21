@@ -418,6 +418,7 @@ _IB_EXCHANGE_TO_YF: dict[str, str] = {
     "HKEX":     ".HK",   # Hong Kong
     "SEHK":     ".HK",
     "ASX":      ".AX",   # Australian Securities Exchange
+    "NZX":      ".NZ",   # New Zealand Exchange
     "TSX":      ".TO",   # Toronto Stock Exchange
     "VENTURE":  ".V",    # TSX Venture
     "SGX":      ".SI",   # Singapore
@@ -440,6 +441,7 @@ _EXCHANGE_OPTIONS: list[tuple[str, str]] = [
     ("BVME",      "BVME - Italy"),
     ("TSEJ",      "TSEJ - Japan"),
     ("AEB",       "AEB - Netherlands"),
+    ("NZX",       "NZX - New Zealand"),
     ("SGX",       "SGX - Singapore"),
     ("KSE",       "KSE - South Korea"),
     ("VIRTX",     "VIRTX - Switzerland"),
@@ -3082,6 +3084,17 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
         "underlying":        "underlying_ticker",
         "underlying ticker": "underlying_ticker",
         "symbol":            "ticker",
+        # multi-currency / broker detail (all optional)
+        "currency":          "currency",
+        "ccy":               "currency",
+        "fx rate entry":     "fx_rate_entry",
+        "fx rate exit":      "fx_rate_exit",
+        "exchange":          "exchange",
+        "market":            "exchange",
+        "commission":        "commission",
+        "fees":              "commission",
+        "notes":             "notes",
+        "account":           "account_name",
     }
     col_lookup = {}
     for df_col in df.columns:
@@ -3203,6 +3216,35 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
             _entry_date  = _date(row, "entry_date")
             _quantity    = _float(row, "quantity")
             _entry_price = _float(row, "entry_price")
+            _exit_date   = _date(row, "exit_date")
+            _exit_price  = _float(row, "exit_price")
+
+            # Prices in the file are in the row's currency; stored prices are
+            # USD. Convert at each trade's own dates — using the file's FX
+            # columns when present, otherwise the historical rate — and keep
+            # the currency + rates so the trade displays in its own money.
+            _ccy = str(_val(row, "currency") or "USD").upper().strip()
+            _fx_e = _float(row, "fx_rate_entry")
+            _fx_x = _float(row, "fx_rate_exit")
+            if _ccy == "USD":
+                _fx_e, _fx_x = 1.0, 1.0
+            elif _ccy not in NATIVE_CURRENCIES:
+                errors.append(f"Row {i+2}: currency {_ccy} isn't supported — skipped")
+                continue
+            else:
+                if _fx_e is None and _entry_date:
+                    _fx_e = get_fx_rate_at_date(_ccy, str(_entry_date))
+                if _fx_x is None and _exit_date:
+                    _fx_x = get_fx_rate_at_date(_ccy, str(_exit_date))
+                _fx_e = _fx_e or 1.0
+                if _entry_price is not None:
+                    _entry_price = native_to_usd(_entry_price, _fx_e)
+                if opening_stop is not None:
+                    opening_stop = native_to_usd(opening_stop, _fx_e)
+                if current_stop is not None:
+                    current_stop = native_to_usd(current_stop, _fx_e)
+                if _exit_price is not None:
+                    _exit_price = native_to_usd(_exit_price, _fx_x or _fx_e)
 
             if is_duplicate_trade(
                 ticker, _entry_date, _quantity, _entry_price,
@@ -3211,14 +3253,15 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
                 skipped_dupes += 1
                 continue
 
+            _notes_v = _val(row, "notes")
             add_trade(
                 entry_date               = _entry_date,
                 ticker                   = ticker,
                 quantity                 = _quantity,
                 entry_price              = _entry_price,
-                exit_date                = _date(row, "exit_date"),
-                exit_price               = _float(row, "exit_price"),
-                notes                    = None,
+                exit_date                = _exit_date,
+                exit_price               = _exit_price,
+                notes                    = str(_notes_v).strip() if _notes_v else None,
                 stop_enabled             = stop_enabled,
                 opening_stop             = opening_stop,
                 tag_ids                  = tag_ids,
@@ -3230,6 +3273,12 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
                 multiplier               = mult_v,
                 side                     = side,
                 underlying_price_at_entry= underlying_px,
+                commission               = _float(row, "commission") or 0.0,
+                account_name             = str(_val(row, "account_name") or "Default").strip(),
+                native_currency          = _ccy,
+                fx_rate_entry            = _fx_e,
+                fx_rate_exit             = _fx_x,
+                exchange                 = str(_val(row, "exchange") or "").upper().strip(),
             )
             success += 1
         except Exception as e:
@@ -5961,7 +6010,10 @@ if page == "📋  Trading Log":
         with _fixed_tab:
             st.markdown(
                 "Expected headers: `Entry Date`, `Ticker`, `Q`, `Entry Price`, `Tags`, "
-                "`Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`"
+                "`Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`  \n"
+                "Optional: `Side`, `Currency` (prices in that currency — converted at the "
+                "trade's dates, or use `FX Rate Entry` / `FX Rate Exit`), `Exchange`, "
+                "`Commission`, `Notes`, `Account`"
             )
             csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
             if csv_file:
