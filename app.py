@@ -2490,6 +2490,278 @@ def find_duplicate_trade_groups() -> list:
     return [{"key": k, "trades": v} for k, v in groups.items() if len(v) >= 2]
 
 
+def _scale_group_key(r) -> tuple:
+    """Identity of a position for scale-in / scale-out detection.
+
+    Everything that makes two fills part of the *same* instrument on the same
+    side of the book. leg_group and roll_group are included so legs of one
+    spread (or one roll chain) are never blended with another's.
+    """
+    return (
+        (r["ticker"] or "").upper().strip(),
+        (r["instrument_type"] or "stock").lower(),
+        str(r["expiration"] or "")[:10],
+        round(float(r["strike"]), 4) if r["strike"] is not None else None,
+        (r["option_type"] or "").lower(),
+        (r["side"] or "long").lower(),
+        (r["account_name"] or "Default"),
+        r["leg_group"] or "",
+        r["roll_group"] or "",
+    )
+
+
+def find_scale_groups(same_day_overlaps: bool = False) -> list:
+    """Find clusters of separate trade rows that are really one scaled position.
+
+    Broker imports write one trade per fill cycle, so buying 100 on Monday and
+    100 more on Wednesday before selling 200 on Friday lands as two rows. This
+    walks each instrument's trades in entry order and chains any trade that was
+    entered while an earlier trade in the chain was still open (its exit date is
+    later, or it has no exit yet). Each chain of 2+ trades is one group.
+
+    With ``same_day_overlaps`` False (default) a trade entered on the day an
+    earlier one closed is treated as a fresh position, not a scale-in — the
+    log has no intraday times, so a same-day re-entry is indistinguishable from
+    a same-day add. Read-only — never writes.
+    """
+    from collections import defaultdict
+    by_key: dict = defaultdict(list)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, entry_date, ticker, quantity, entry_price, exit_date,
+                      exit_price, side, instrument_type, expiration, strike,
+                      option_type, account_name, leg_group, roll_group, notes,
+                      commission
+                 FROM trades
+                WHERE entry_date IS NOT NULL AND entry_date != ''
+                ORDER BY entry_date, id"""
+        ).fetchall()
+    for r in rows:
+        by_key[_scale_group_key(r)].append(dict(r))
+
+    groups: list = []
+    for key, members in by_key.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda t: (str(t["entry_date"])[:10], t["id"]))
+        chain: list = []
+        chain_end: str | None = None          # latest exit in chain; None = still open
+        chain_open = False
+        for t in members:
+            entry = str(t["entry_date"])[:10]
+            exit_ = str(t["exit_date"])[:10] if t.get("exit_date") else None
+            overlaps = bool(chain) and (
+                chain_open
+                or (chain_end is not None
+                    and (entry < chain_end or (same_day_overlaps and entry == chain_end)))
+            )
+            if not overlaps:
+                if len(chain) >= 2:
+                    groups.append({"key": key, "trades": chain})
+                chain, chain_end, chain_open = [], None, False
+            chain.append(t)
+            if exit_ is None:
+                chain_open = True
+            elif chain_end is None or exit_ > chain_end:
+                chain_end = exit_
+        if len(chain) >= 2:
+            groups.append({"key": key, "trades": chain})
+    groups.sort(key=lambda g: (g["key"][0], str(g["trades"][0]["entry_date"])))
+    return groups
+
+
+def _scale_member_lots(member: dict, lots: list) -> tuple[list, list]:
+    """Split a trade's lot ledger into (buy_lots, exit_lots), filling gaps.
+
+    Trades created before lot tracking (or by importers) may have no lots, or
+    may be closed with no exit lot recorded — synthesise those from the trade
+    row so every member contributes a complete buy/exit picture. Synthesised
+    lots carry no ``id`` so the caller knows to insert rather than re-point.
+    """
+    buys  = [dict(l) for l in lots if l["lot_type"] != "exit"]
+    exits = [dict(l) for l in lots if l["lot_type"] == "exit"]
+    if not buys and member.get("quantity") and member.get("entry_price") is not None:
+        buys.append({
+            "date": str(member["entry_date"])[:10],
+            "quantity": float(member["quantity"]),
+            "price": float(member["entry_price"]),
+            "lot_type": "open", "notes": "",
+        })
+    if member.get("exit_date") and not exits:
+        sold = sum(float(l["quantity"]) for l in buys)
+        if sold > 0 and member.get("exit_price") is not None:
+            exits.append({
+                "date": str(member["exit_date"])[:10],
+                "quantity": sold,
+                "price": float(member["exit_price"]),
+                "lot_type": "exit", "notes": "",
+            })
+    return buys, exits
+
+
+def summarize_scale_group(members: list, lots_map: dict | None = None) -> dict:
+    """Compute what a group of trades would look like merged into one.
+
+    Mirrors the arithmetic of ``update_position`` / ``partial_exit_trade``:
+    entry price is the size-weighted average of every buy lot; while any
+    shares remain the position is open with ``quantity`` = remaining; once
+    everything is sold the trade closes on the last exit date with the
+    size-weighted average exit price and ``quantity`` = total sold.
+    """
+    if lots_map is None:
+        lots_map = load_lots_for_trades([int(m["id"]) for m in members])
+    buys: list = []
+    exits: list = []
+    for m in members:
+        b, e = _scale_member_lots(m, lots_map.get(int(m["id"]), []))
+        buys.extend(b)
+        exits.extend(e)
+    bought = sum(float(l["quantity"]) for l in buys)
+    sold   = sum(float(l["quantity"]) for l in exits)
+    avg_entry = sum(float(l["quantity"]) * float(l["price"]) for l in buys) / bought if bought else 0.0
+    avg_exit  = sum(float(l["quantity"]) * float(l["price"]) for l in exits) / sold if sold else None
+    remaining = bought - sold
+    is_open   = remaining > 1e-9
+    return {
+        "entry_date": min(str(l["date"])[:10] for l in buys) if buys else None,
+        "exit_date":  None if is_open else (max(str(l["date"])[:10] for l in exits) if exits else None),
+        "bought": bought, "sold": sold, "remaining": max(remaining, 0.0),
+        "quantity": remaining if is_open else sold,
+        "avg_entry": avg_entry,
+        "avg_exit": None if is_open else avg_exit,
+        "is_open": is_open,
+        "n_buys": len(buys), "n_exits": len(exits),
+        "commission": sum(float(m.get("commission") or 0) for m in members),
+    }
+
+
+def consolidate_trades(trade_ids: list) -> int:
+    """Merge several trade rows for one scaled position into a single trade.
+
+    The earliest-entered trade (lowest id on ties) survives and keeps its id;
+    every other member's lots, tags, attachments and dividends are re-pointed
+    to it (their opening lot becomes an ``add`` lot) and the member rows are
+    deleted. Closed members with no exit lot get one synthesised so the
+    survivor's ledger is complete. Quantity, average entry, exit date/price
+    and commission are recomputed from the merged ledger via
+    ``summarize_scale_group``. Runs in one transaction. Returns the survivor id.
+    """
+    ids = sorted({int(i) for i in trade_ids})
+    if len(ids) < 2:
+        raise ValueError("Need at least two trades to consolidate")
+    placeholders = ",".join("?" for _ in ids)
+    with get_connection() as conn:
+        members = [dict(r) for r in conn.execute(
+            f"SELECT * FROM trades WHERE id IN ({placeholders})", ids
+        ).fetchall()]
+        if len(members) != len(ids):
+            raise ValueError("One or more trades no longer exist")
+        if len({_scale_group_key(m) for m in members}) != 1:
+            raise ValueError("Trades are not the same instrument / side / account")
+        members.sort(key=lambda t: (str(t["entry_date"] or "")[:10], t["id"]))
+        survivor = members[0]
+        sid      = int(survivor["id"])
+        others   = members[1:]
+
+        lot_rows = conn.execute(
+            f"SELECT id, trade_id, date, quantity, price, lot_type, notes "
+            f"FROM trade_lots WHERE trade_id IN ({placeholders}) ORDER BY date, id", ids
+        ).fetchall()
+        lots_map: dict = {i: [] for i in ids}
+        for l in lot_rows:
+            lots_map[int(l["trade_id"])].append(dict(l))
+        summary = summarize_scale_group(members, lots_map)
+
+        # Rebuild the lot ledger under the survivor. The survivor's own opening
+        # lot stays "open"; every other member's buys become "add".
+        for m in members:
+            mid = int(m["id"])
+            buys, exits = _scale_member_lots(m, lots_map[mid])
+            for l in buys + exits:
+                lt = l["lot_type"]
+                if mid != sid and lt == "open":
+                    lt = "add"
+                note = (l.get("notes") or "")
+                if mid != sid:
+                    note = (note + " " if note else "") + f"merged from trade #{mid}"
+                if l.get("id"):
+                    conn.execute("UPDATE trade_lots SET trade_id=?, lot_type=?, notes=? WHERE id=?",
+                                 (sid, lt, note, int(l["id"])))
+                else:
+                    conn.execute("INSERT INTO trade_lots (trade_id, date, quantity, price, lot_type, notes) "
+                                 "VALUES (?,?,?,?,?,?)",
+                                 (sid, l["date"], float(l["quantity"]), float(l["price"]), lt, note))
+
+        other_ids = [int(m["id"]) for m in others]
+        oph = ",".join("?" for _ in other_ids)
+        conn.execute(f"INSERT OR IGNORE INTO trade_tags (trade_id, tag_id) "
+                     f"SELECT ?, tag_id FROM trade_tags WHERE trade_id IN ({oph})", [sid, *other_ids])
+        conn.execute(f"UPDATE trade_attachments SET trade_id=? WHERE trade_id IN ({oph})", [sid, *other_ids])
+        conn.execute(f"UPDATE trade_dividends   SET trade_id=? WHERE trade_id IN ({oph})", [sid, *other_ids])
+
+        # Merge free-text fields: keep distinct values in entry order.
+        def _merge_text(field):
+            seen, parts = set(), []
+            for m in members:
+                v = (m.get(field) or "").strip()
+                if v and v not in seen:
+                    seen.add(v)
+                    parts.append(v)
+            return "\n".join(parts) or None
+        notes = _merge_text("notes")
+        audit = "Consolidated from trades #" + ", #".join(str(i) for i in ids)
+        notes = f"{notes}\n{audit}" if notes else audit
+
+        # Stops: opening stop belongs to the first entry; current stop is the
+        # most recently set one. Latest-known greeks win.
+        def _last(field):
+            for m in reversed(members):
+                if m.get(field) is not None and m.get(field) != "":
+                    return m[field]
+            return None
+        def _first(field):
+            for m in members:
+                if m.get(field) is not None and m.get(field) != "":
+                    return m[field]
+            return None
+        closed_members = [m for m in members if m.get("exit_date")]
+        last_closed = max(closed_members, key=lambda m: str(m["exit_date"])[:10]) if closed_members else None
+        fx_exit = (last_closed.get("fx_rate_exit") if (last_closed and not summary["is_open"])
+                   else survivor.get("fx_rate_exit"))
+
+        conn.execute(
+            """UPDATE trades SET entry_date=?, quantity=?, entry_price=?, exit_date=?, exit_price=?,
+                                 notes=?, commission=?, stop_enabled=?, opening_stop=?, current_stop=?,
+                                 chart_notes=?, earnings_date=?, delta=?, theta=?,
+                                 underlying_price_at_entry=?, fx_rate_exit=?, plan_id=?,
+                                 trail_type=?, trail_amount=?
+               WHERE id=?""",
+            (
+                summary["entry_date"] or survivor["entry_date"],
+                summary["quantity"],
+                summary["avg_entry"],
+                summary["exit_date"],
+                summary["avg_exit"],
+                notes,
+                summary["commission"],
+                1 if any(m.get("stop_enabled") for m in members) else 0,
+                _first("opening_stop"),
+                _last("current_stop"),
+                _merge_text("chart_notes"),
+                _first("earnings_date"),
+                _last("delta"), _last("theta"),
+                _first("underlying_price_at_entry"),
+                fx_exit,
+                _first("plan_id"),
+                _last("trail_type") or "fixed",
+                _last("trail_amount"),
+                sid,
+            ),
+        )
+        conn.execute(f"DELETE FROM trades WHERE id IN ({oph})", other_ids)
+    return sid
+
+
 def add_tag(name: str, description: str):
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO tags (name, description) VALUES (?, ?)",
@@ -2551,6 +2823,13 @@ def bulk_delete_trades(trade_ids: list):
 _raw_partial_exit_trade = partial_exit_trade
 def partial_exit_trade(*a, **kw):
     r = _raw_partial_exit_trade(*a, **kw)
+    _cached_load_trades.clear()
+    _bust("_v_trades")
+    return r
+
+_raw_consolidate_trades = consolidate_trades
+def consolidate_trades(trade_ids: list):
+    r = _raw_consolidate_trades(trade_ids)
     _cached_load_trades.clear()
     _bust("_v_trades")
     return r
@@ -12824,6 +13103,128 @@ elif page == "🔗  Broker Sync":
                         st.rerun()
             else:
                 st.info("No copies checked — tick the trade(s) you want to remove above.")
+
+    # ── Find Scale-In / Scale-Out Lots ────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 🧩 Consolidate Scaled Positions")
+    st.caption(
+        "Broker imports log one trade per fill, so scaling into or out of a "
+        "position leaves several open rows on the same ticker. This finds trades "
+        "that were entered while an earlier trade on the same instrument, side and "
+        "account was still open, and merges each cluster into one trade with an "
+        "average entry price and a full lot history — the same shape the "
+        "**Add to position** / **Partial exit** actions produce. Nothing changes "
+        "until you review each group and confirm."
+    )
+
+    _sc_c1, _sc_c2 = st.columns([1, 2])
+    _sc_same_day = _sc_c2.checkbox(
+        "Treat an entry on the same day an earlier trade closed as part of the same position",
+        key="scale_same_day",
+        help="Off by default: without intraday times, a same-day re-entry looks identical "
+             "to a same-day add, so it's safer to leave those as separate trades.",
+    )
+    if _sc_c1.button("🧩  Scan for scaled positions", key="scale_scan_btn"):
+        _sgroups = find_scale_groups(same_day_overlaps=_sc_same_day)
+        _all_ids = [int(t["id"]) for g in _sgroups for t in g["trades"]]
+        _lots_all = load_lots_for_trades(_all_ids)
+        for _g in _sgroups:
+            _g["summary"] = summarize_scale_group(_g["trades"], _lots_all)
+        st.session_state["_scale_groups"]  = _sgroups
+        st.session_state["_scale_scanned"] = True
+        st.session_state["_scale_confirm"] = False
+        # Seed one "merge this group" checkbox per group, keyed by the survivor id.
+        for _g in _sgroups:
+            st.session_state[f"_scale_merge_{_g['trades'][0]['id']}"] = True
+
+    if st.session_state.get("_scale_scanned"):
+        _scale_groups = st.session_state.get("_scale_groups", [])
+        if not _scale_groups:
+            st.success("No scaled positions found — every trade stands alone. ✅")
+        else:
+            _n_rows = sum(len(g["trades"]) for g in _scale_groups)
+            st.warning(
+                f"Found {len(_scale_groups)} scaled position(s) spread across {_n_rows} trade rows. "
+                "Untick any group you want to keep as separate trades."
+            )
+            _merge_groups: list = []
+            for _g in _scale_groups:
+                _members = _g["trades"]
+                _head    = _members[0]
+                _sm      = _g["summary"]
+                _status  = (
+                    f"open · {fmt_qty(_sm['remaining'])} remaining"
+                    if _sm["is_open"] else
+                    f"closed {fmt_date(_sm['exit_date'])} @ {fmt_price(_sm['avg_exit'])}"
+                )
+                _exp_label = (
+                    f"**{_head['ticker']}** · {_head.get('side') or 'long'} · "
+                    f"{len(_members)} rows → {fmt_qty(_sm['bought'])} @ avg {fmt_price(_sm['avg_entry'])} · "
+                    f"{fmt_date(_sm['entry_date'])} · {_status}"
+                )
+                with st.expander(_exp_label, expanded=True):
+                    _rows = []
+                    for _m in _members:
+                        _rows.append({
+                            "ID":     int(_m["id"]),
+                            "Entry":  fmt_date(str(_m["entry_date"])[:10]),
+                            "Qty":    fmt_qty(_m["quantity"]),
+                            "Price":  fmt_price(_m["entry_price"]),
+                            "Exit":   fmt_date(str(_m["exit_date"])[:10]) if _m.get("exit_date") else "open",
+                            "Exit $": fmt_price(_m["exit_price"]) if _m.get("exit_price") is not None else "",
+                            "Notes":  ((_m.get("notes") or "").strip()[:60]),
+                        })
+                    st.dataframe(pd.DataFrame(_rows), hide_index=True, width="stretch")
+                    _pv = (
+                        f"**Merged →** trade #{_head['id']} · entry {fmt_date(_sm['entry_date'])} · "
+                        f"{_sm['n_buys']} buy lot(s) totalling {fmt_qty(_sm['bought'])} @ avg {fmt_price(_sm['avg_entry'])}"
+                    )
+                    if _sm["n_exits"]:
+                        _pv += f" · {_sm['n_exits']} exit lot(s) totalling {fmt_qty(_sm['sold'])}"
+                    _pv += " · " + (
+                        f"still open with {fmt_qty(_sm['remaining'])}"
+                        if _sm["is_open"] else
+                        f"closed {fmt_date(_sm['exit_date'])} @ avg {fmt_price(_sm['avg_exit'])}"
+                    )
+                    st.markdown(_pv)
+                    if st.checkbox("Consolidate this group", key=f"_scale_merge_{_head['id']}"):
+                        _merge_groups.append(_g)
+
+            st.divider()
+            if _merge_groups:
+                _n_gone = sum(len(g["trades"]) - 1 for g in _merge_groups)
+                if not st.session_state.get("_scale_confirm"):
+                    if st.button(f"🧩  Consolidate {len(_merge_groups)} selected group(s)",
+                                 key="scale_merge_btn", type="primary"):
+                        st.session_state["_scale_confirm"] = True
+                        st.rerun()
+                else:
+                    st.error(
+                        f"Merge {len(_merge_groups)} group(s)? {_n_gone} trade row(s) will be folded into "
+                        "the earliest trade of each group (its tags, attachments and dividends move with it) "
+                        "and then removed. Cannot be undone."
+                    )
+                    _scc1, _scc2 = st.columns(2)
+                    if _scc1.button("Yes, consolidate", key="scale_merge_yes"):
+                        _done, _errs = 0, []
+                        for _g in _merge_groups:
+                            try:
+                                consolidate_trades([int(t["id"]) for t in _g["trades"]])
+                                _done += 1
+                            except Exception as _e:
+                                _errs.append(f"{_g['trades'][0]['ticker']}: {_e}")
+                        st.session_state["_scale_confirm"] = False
+                        st.session_state.pop("_scale_groups",  None)
+                        st.session_state.pop("_scale_scanned", None)
+                        if _errs:
+                            st.warning("Some groups could not be merged:\n\n- " + "\n- ".join(_errs))
+                        st.success(f"Consolidated {_done} position(s).")
+                        st.rerun()
+                    if _scc2.button("Cancel", key="scale_merge_no"):
+                        st.session_state["_scale_confirm"] = False
+                        st.rerun()
+            else:
+                st.info("No groups selected — tick the ones you want merged above.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
