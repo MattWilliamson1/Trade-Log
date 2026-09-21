@@ -13137,6 +13137,21 @@ elif page == "🔗  Broker Sync":
         for _g in _sgroups:
             st.session_state[f"_scale_merge_{_g['trades'][0]['id']}"] = True
 
+    # Outcome of the last consolidation, kept until acknowledged so it survives
+    # the rerun that refreshes the trade log.
+    _scale_result = st.session_state.get("_scale_result")
+    if _scale_result:
+        if _scale_result["merged"]:
+            st.success(
+                f"✅  Consolidated {len(_scale_result['merged'])} position(s):\n\n- "
+                + "\n- ".join(_scale_result["merged"])
+            )
+        if _scale_result["errors"]:
+            st.warning("Some groups could not be merged:\n\n- " + "\n- ".join(_scale_result["errors"]))
+        if st.button("✓  OK", key="scale_result_ok"):
+            st.session_state.pop("_scale_result", None)
+            st.rerun()
+
     if st.session_state.get("_scale_scanned"):
         _scale_groups = st.session_state.get("_scale_groups", [])
         if not _scale_groups:
@@ -13206,19 +13221,21 @@ elif page == "🔗  Broker Sync":
                     )
                     _scc1, _scc2 = st.columns(2)
                     if _scc1.button("Yes, consolidate", key="scale_merge_yes"):
-                        _done, _errs = 0, []
+                        _merged, _errs = [], []
                         for _g in _merge_groups:
                             try:
-                                consolidate_trades([int(t["id"]) for t in _g["trades"]])
-                                _done += 1
+                                _sid = consolidate_trades([int(t["id"]) for t in _g["trades"]])
+                                _merged.append(
+                                    f"**{_g['trades'][0]['ticker']}** — {len(_g['trades'])} rows → trade #{_sid}"
+                                )
                             except Exception as _e:
                                 _errs.append(f"{_g['trades'][0]['ticker']}: {_e}")
                         st.session_state["_scale_confirm"] = False
                         st.session_state.pop("_scale_groups",  None)
                         st.session_state.pop("_scale_scanned", None)
-                        if _errs:
-                            st.warning("Some groups could not be merged:\n\n- " + "\n- ".join(_errs))
-                        st.success(f"Consolidated {_done} position(s).")
+                        # The rerun below wipes anything drawn now — stash the
+                        # outcome so the next run can show it until dismissed.
+                        st.session_state["_scale_result"] = {"merged": _merged, "errors": _errs}
                         st.rerun()
                     if _scc2.button("Cancel", key="scale_merge_no"):
                         st.session_state["_scale_confirm"] = False
