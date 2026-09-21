@@ -41,17 +41,24 @@ UV_MAC_CACHE = DIST_DIR / "_uv_mac"   # local cache dir (dist/ is gitignored)
 #
 # What it does on FIRST launch:
 #   1. Uses the bundled uv to install Python 3.12 (no system Python needed)
-#   2. Creates a venv inside the .app bundle
+#   2. Creates a venv in ~/.tradelog/venv (NOT inside the .app bundle — see below)
 #   3. Installs pip dependencies from requirements.txt
 #
 # On SUBSEQUENT launches:
-#   • venv already exists → skips straight to starting Streamlit
+#   • venv already exists → re-installs deps only if requirements.txt changed
+#     (the venv now outlives any single download of the app)
 #   • Kills any stale Streamlit on port 8502 first (safe to re-launch)
+#
+# Why the venv lives in $HOME: an unsigned .app that still carries the download
+# quarantine flag is run by Gatekeeper from a random READ-ONLY copy under
+# /private/var/folders/.../AppTranslocation/ ("App Translocation"). Writing the
+# venv into Contents/Resources there fails with "Read-only file system (os error
+# 30)". Keeping it in $HOME works whether the bundle is translocated, sitting on
+# a read-only volume, or in a locked-down /Applications.
 LAUNCHER = r"""#!/bin/bash
 # Trade Log — Mac launcher
 MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCES_DIR="$(cd "$MACOS_DIR/../Resources" && pwd)"
-VENV_DIR="$RESOURCES_DIR/.venv"
 PORT=8502
 
 # When the .app is double-clicked in Finder, macOS launches it with a bare-bones
@@ -67,6 +74,13 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 # in the path) so they don't depend on whatever the launch environment provides.
 export UV_CACHE_DIR="$HOME/.tradelog/uv-cache"
 export UV_PYTHON_INSTALL_DIR="$HOME/.tradelog/python"
+
+# The venv lives next to them, outside the bundle — the bundle may be read-only
+# (App Translocation, see header comment) and is replaced on every new download.
+VENV_DIR="$HOME/.tradelog/venv"
+# Copy of the requirements.txt the venv was last built from. When a new version
+# of the app ships different requirements, deps get re-installed.
+VENV_STAMP="$VENV_DIR/requirements.installed"
 
 # Force copy instead of hardlink. If the install path sits under a cloud-synced
 # folder (iCloud Drive, OneDrive, Dropbox), hardlinking from the cache can fail;
@@ -97,18 +111,24 @@ fail() {
     exit 1
 }
 
-# ── First-run setup ─────────────────────────────────────────────────────────
-if [ ! -x "$VENV_DIR/bin/python" ]; then
-
+# Make sure the bundled uv is present and runnable. Called before any step that
+# needs it (first-run setup and dependency updates).
+prepare_uv() {
     if [ ! -f "$UV_BIN" ]; then
         alert "Setup tools are missing.\n\nPlease re-download Trade Log and try again."
         exit 1
     fi
-
     # Strip the macOS quarantine flag from the bundled tools so Gatekeeper
-    # doesn't silently block them when launched from Finder.
+    # doesn't silently block them when launched from Finder. (No-op when the
+    # bundle is a read-only translocated copy — uv still runs there.)
     xattr -dr com.apple.quarantine "$RESOURCES_DIR" 2>/dev/null || true
     chmod +x "$UV_BIN" 2>/dev/null || true
+}
+
+# ── First-run setup ─────────────────────────────────────────────────────────
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+
+    prepare_uv
 
     # Clear any half-built venv left behind by a previous failed attempt.
     rm -rf "$VENV_DIR" 2>/dev/null
@@ -129,7 +149,15 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
     "$UV_BIN" venv --python 3.12 "$VENV_DIR" >>"$LOG" 2>&1 \
         || fail "Could not create a Python environment."
 
-    # Install Trade Log dependencies.
+fi
+
+# ── Install / update dependencies ───────────────────────────────────────────
+# Runs on first launch, and again whenever the shipped requirements.txt differs
+# from the one the venv was last built against (i.e. a new app version).
+if ! cmp -s "$RESOURCES_DIR/requirements.txt" "$VENV_STAMP" 2>/dev/null; then
+
+    prepare_uv
+
     # --only-binary=cryptography forces uv to use cryptography's prebuilt wheel
     # instead of compiling it from source. Building cryptography needs a Rust
     # toolchain + OpenSSL, which end-user Macs don't have — without this, the
@@ -139,6 +167,7 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
         --only-binary=cryptography \
         --python "$VENV_DIR/bin/python" >>"$LOG" 2>&1 \
         || { rm -rf "$VENV_DIR"; fail "Could not install dependencies.\n\nPlease check your internet connection and try again."; }
+    cp "$RESOURCES_DIR/requirements.txt" "$VENV_STAMP" 2>/dev/null || true
 
 fi
 
