@@ -3356,6 +3356,7 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
             # columns when present, otherwise the historical rate — and keep
             # the currency + rates so the trade displays in its own money.
             _ccy = str(_val(row, "currency") or "USD").upper().strip()
+            _commission = _float(row, "commission") or 0.0
             _fx_e = _float(row, "fx_rate_entry")
             _fx_x = _float(row, "fx_rate_exit")
             if _ccy == "USD":
@@ -3377,6 +3378,9 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
                     current_stop = native_to_usd(current_stop, _fx_e)
                 if _exit_price is not None:
                     _exit_price = native_to_usd(_exit_price, _fx_x or _fx_e)
+                # Fees are charged in the same money as the fill, so they convert
+                # with it — an NZ$34 brokerage is not a US$34 one.
+                _commission = native_to_usd(_commission, _fx_e) if _commission else _commission
 
             if is_duplicate_trade(
                 ticker, _entry_date, _quantity, _entry_price,
@@ -3405,7 +3409,7 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
                 multiplier               = mult_v,
                 side                     = side,
                 underlying_price_at_entry= underlying_px,
-                commission               = _float(row, "commission") or 0.0,
+                commission               = _commission,
                 account_name             = str(_val(row, "account_name") or "Default").strip(),
                 native_currency          = _ccy,
                 fx_rate_entry            = _fx_e,
@@ -9681,9 +9685,15 @@ elif page == "📈  Equity Curve":
                 _last_bal     = float(_ec_plot_df["balance"].iloc[-1])
                 _net_contribs = float(_ec_plot_df["contributions"].sum() - _ec_plot_df["withdrawals"].sum())
                 _twr_total    = float(_ec_plot_df["twr_pct"].iloc[-1])
-                _peak_twr     = float(_ec_plot_df["twr_pct"].max())
-                _trough_twr   = float(_ec_plot_df.loc[_ec_plot_df["twr_pct"].idxmax():, "twr_pct"].min())
-                _max_dd       = _peak_twr - _trough_twr
+                # Drawdown is a fall from the peak *relative to that peak*, so it
+                # has to be measured on the growth index rather than by
+                # subtracting cumulative percentages. Going from +120% to -16%
+                # is a 62% drawdown, not the 136 percentage points that
+                # subtraction gives — which could print an impossible >100%
+                # figure and fed a Calmar ratio to match.
+                _twr_index    = 1 + _ec_plot_df["twr_pct"] / 100.0
+                _dd_series    = _twr_index / _twr_index.cummax() - 1.0
+                _max_dd       = float(-_dd_series.min() * 100.0)
 
                 # ── Daily sub-period returns for the filtered range ────────────
                 _ec_plot_prev  = _ec_plot_df["balance"].shift(1)
@@ -9695,7 +9705,14 @@ elif page == "📈  Equity Curve":
 
                 # ── Annualised return (CAGR) ──────────────────────────────────
                 _n_days = max(1, (_ec_plot_df["date"].iloc[-1] - _ec_plot_df["date"].iloc[0]).days)
-                _cagr   = ((1 + _twr_total / 100) ** (365.25 / _n_days) - 1) * 100
+                # An account that went to zero at some point has a TWR of -100% or
+                # worse, so the growth factor is non-positive — and a fractional
+                # power of a negative number is complex in Python, which then
+                # poisons Calmar and the metric formatting. Nothing is left to
+                # compound in that case, so call it what it is: a total loss.
+                _growth = 1 + _twr_total / 100
+                _cagr   = ((_growth ** (365.25 / _n_days) - 1) * 100
+                           if _growth > 0 else -100.0)
 
                 # ── Annualised std dev ─────────────────────────────────────────
                 _std_ann = (float(_daily_ret_ser.std(ddof=1)) * np.sqrt(252) * 100
