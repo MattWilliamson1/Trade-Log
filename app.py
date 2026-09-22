@@ -2764,6 +2764,138 @@ def consolidate_trades(trade_ids: list) -> int:
     return sid
 
 
+_DB_REQUIRED_TABLES = ("trades", "tags", "settings")
+
+
+def checkpoint_db():
+    """Flush the write-ahead log back into the main .db file.
+
+    Connections run in WAL mode, so freshly committed rows can still be sitting
+    in ``tradelog.db-wal`` rather than the database file itself. Anything that
+    treats the database as a *file* — downloading it, backing it up, swapping
+    it out — has to checkpoint first or it ships a stale snapshot.
+    """
+    try:
+        with get_connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
+
+
+def inspect_db_file(path) -> dict:
+    """Summarise a .db file so its contents can be shown before it replaces anything.
+
+    Opens read-only and never writes. Raises ValueError when the file isn't a
+    Trade Log database — the wrong file entirely, or a truncated upload, is
+    caught here rather than after the live data has been overwritten.
+    """
+    import sqlite3 as _sq
+    conn = None
+    try:
+        conn = _sq.connect(f"file:{path}?mode=ro", uri=True)
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    except _sq.DatabaseError as e:
+        if conn is not None:
+            conn.close()
+        raise ValueError(f"Not a readable SQLite database ({e}).")
+    try:
+        missing = [t for t in _DB_REQUIRED_TABLES if t not in names]
+        if missing:
+            raise ValueError(
+                "This doesn't look like a Trade Log database — no "
+                f"{', '.join(missing)} table. Upload the file produced by "
+                "**⬇️ Download DB**.")
+
+        def _n(table, where=""):
+            if table not in names:
+                return 0
+            try:
+                return int(conn.execute(
+                    f"SELECT COUNT(*) FROM {table} {where}").fetchone()[0] or 0)
+            except Exception:
+                return 0
+
+        info = {
+            "trades":   _n("trades"),
+            "open":     _n("trades", "WHERE exit_date IS NULL OR exit_date = ''"),
+            "tags":     _n("tags"),
+            "accounts": _n("accounts"),
+            "equity":   _n("equity_entries"),
+            "plans":    _n("trading_plans"),
+            "lots":     _n("trade_lots"),
+        }
+        try:
+            row = conn.execute(
+                "SELECT MIN(entry_date), MAX(entry_date) FROM trades "
+                "WHERE entry_date IS NOT NULL AND entry_date != ''").fetchone()
+            info["first_entry"], info["last_entry"] = row[0], row[1]
+        except Exception:
+            info["first_entry"] = info["last_entry"] = None
+        return info
+    finally:
+        conn.close()
+
+
+def replace_database(src_path) -> str:
+    """Swap the live database for another file, keeping a safety copy first.
+
+    Returns the path of that copy — it is the only way back, so the caller
+    shows it to the user. The stale ``-wal``/``-shm`` sidecars belong to the
+    file being discarded; left in place SQLite would replay them over the new
+    database. ``init_db()`` runs afterwards so a file from an older release
+    picks up any columns added since.
+
+    Caches are the caller's problem: every cached frame still holds rows from
+    the database that was just replaced.
+    """
+    import datetime as _dt
+    import os as _os
+    import shutil as _shu
+    from db import BACKUP_DIR as _bd, DB_PATH as _p, init_db as _init
+
+    checkpoint_db()
+    _bd.mkdir(exist_ok=True)
+    # Stage the incoming file beside the database first. It may itself live in
+    # the backups folder — restoring one of these safety copies is the obvious
+    # way back — and the copy taken below would otherwise be at risk of
+    # overwriting the very file being imported. Staging in the same directory
+    # also lets the swap itself be an atomic rename rather than a part-written
+    # copy.
+    _staged = _p.with_name(_p.name + ".incoming")
+    _shu.copy2(src_path, _staged)
+    try:
+        _stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        safety, _n = _bd / f"before-import-{_stamp}.db", 1
+        while safety.exists():
+            safety = _bd / f"before-import-{_stamp}-{_n}.db"
+            _n += 1
+        if _p.exists():
+            _shu.copy2(_p, safety)
+        # Clear these *before* the swap: a leftover write-ahead log belongs to the
+        # database being discarded, and SQLite would replay it over the new
+        # file. If one can't be removed something else still holds the database
+        # open, and overwriting underneath it would corrupt both — stop while
+        # nothing has been touched.
+        for _sidecar in ("-wal", "-shm"):
+            _s = _p.with_name(_p.name + _sidecar)
+            if not _s.exists():
+                continue
+            try:
+                _s.unlink()
+            except OSError as _e:
+                raise RuntimeError(
+                    f"Another copy of Trade Log still has the database open (`{_s.name}` "
+                    "is locked). Close any other Trade Log windows and try again — "
+                    "nothing has been changed.") from _e
+        _os.replace(_staged, _p)
+    finally:
+        if _staged.exists():
+            _staged.unlink()
+    _init()
+    return str(safety)
+
+
 def add_tag(name: str, description: str):
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO tags (name, description) VALUES (?, ?)",
@@ -13727,6 +13859,7 @@ elif page == "⚙️  Settings":
     )
     _db_col1, _db_col2, _db_col3 = st.columns(3)
     if _db_path.exists():
+        checkpoint_db()          # WAL: fold pending commits in before copying
         _db_size_kb = _db_path.stat().st_size / 1024
         st.caption(f"Current size: **{_db_size_kb:.1f} KB**")
         with open(_db_path, "rb") as _f:
@@ -13739,6 +13872,7 @@ elif page == "⚙️  Settings":
             width='stretch',
         )
     if _db_col2.button("📦  Backup Now", width='stretch'):
+        checkpoint_db()
         _manual_backup()
         _latest = _backup_dir / f"backup-{_dt.date.today().isoformat()}.db"
         if _latest.exists():
@@ -13746,8 +13880,136 @@ elif page == "⚙️  Settings":
         else:
             st.info("Database is too large for automatic backup (>10 MB). Download manually above.")
 
+    # ── Import a database file ────────────────────────────────────────────────
+    st.divider()
+    st.markdown("##### 📤  Import a database file")
+    st.caption(
+        "Load a `.db` file from somewhere else — a log you've had fixed, or one "
+        "sent to you. It **replaces** this install's data rather than merging "
+        "into it; a safety copy is saved first so there's a way back."
+    )
+
+    # Result of the last import, kept until acknowledged so it survives the
+    # rerun that reloads the page against the new database.
+    _imp_done = st.session_state.get("_db_import_done")
+    if _imp_done:
+        st.success(
+            f"✅  Database replaced — now showing **{_imp_done['trades']} trade(s)**.\n\n"
+            f"The previous data was saved to `{_imp_done['safety']}` and can be "
+            "restored from the backup list below."
+        )
+        if st.button("✓  OK", key="db_import_done_ok"):
+            st.session_state.pop("_db_import_done", None)
+            st.rerun()
+
+    # The uploader's contents live in the browser, so popping its key doesn't
+    # clear it — the panel would re-arm with the file just imported. Changing
+    # the key builds a fresh widget instead.
+    _imp_nonce = st.session_state.get("_db_import_nonce", 0)
+    _imp_file = st.file_uploader(
+        "Upload a Trade Log .db file",
+        type=["db", "sqlite", "sqlite3"],
+        key=f"db_import_upload_{_imp_nonce}",
+        help="The file produced by ⬇️ Download DB, from this or any other install.",
+    )
+    if _imp_file is not None:
+        import os as _os
+        import tempfile as _tf
+        _imp_tmp = _os.path.join(_tf.gettempdir(), f"tradelog-import-{_os.getpid()}.db")
+        with open(_imp_tmp, "wb") as _f:
+            _f.write(_imp_file.getvalue())
+        try:
+            _inc = inspect_db_file(_imp_tmp)
+        except ValueError as _e:
+            st.error(f"❌  {_e}")
+        else:
+            try:
+                checkpoint_db()
+                _cur = inspect_db_file(_db_path) if _db_path.exists() else None
+            except ValueError:
+                _cur = None
+
+            st.markdown(
+                "<style>"
+                ".tl-danger-banner {"
+                "  background:linear-gradient(135deg,#7f1d1d,#b91c1c,#ef4444);"
+                "  color:#fff; border-radius:12px; padding:0.9rem 1rem;"
+                "  margin:0.6rem 0 0.8rem; font-weight:900; font-size:1.2rem;"
+                "  line-height:1.3; letter-spacing:0.02em;"
+                "  box-shadow:0 4px 20px rgba(239,68,68,0.45),0 2px 6px #0008;"
+                "  text-shadow:0 1px 4px #0006;"
+                "}"
+                ".tl-danger-banner span {"
+                "  display:block; font-weight:600; font-size:0.9rem;"
+                "  opacity:0.95; margin-top:0.35rem; letter-spacing:0;"
+                "}"
+                "</style>"
+                "<div class='tl-danger-banner'>⚠️ THIS WILL OVERWRITE <u>ALL</u> OF YOUR DATA"
+                "<span>Every trade, tag, note, stop, plan, equity entry and setting in this "
+                "install is thrown away and replaced by the uploaded file. Nothing is merged. "
+                "This cannot be undone from inside the app — only by restoring the safety copy "
+                "taken just before the swap.</span></div>",
+                unsafe_allow_html=True,
+            )
+
+            def _imp_row(label, cur_v, inc_v):
+                return f"| {label} | {cur_v} | {inc_v} |"
+
+            _imp_rows = [
+                "| | 🗑️ Now (will be lost) | 📥 Uploaded (replaces it) |",
+                "|---|---|---|",
+                _imp_row("**Trades**", _cur["trades"] if _cur else "—", _inc["trades"]),
+                _imp_row("&nbsp;&nbsp;of which open", _cur["open"] if _cur else "—", _inc["open"]),
+                _imp_row("Lots", _cur["lots"] if _cur else "—", _inc["lots"]),
+                _imp_row("Tags", _cur["tags"] if _cur else "—", _inc["tags"]),
+                _imp_row("Accounts", _cur["accounts"] if _cur else "—", _inc["accounts"]),
+                _imp_row("Equity entries", _cur["equity"] if _cur else "—", _inc["equity"]),
+                _imp_row("Trading plans", _cur["plans"] if _cur else "—", _inc["plans"]),
+                _imp_row(
+                    "Entry dates",
+                    (f"{fmt_date(_cur['first_entry'])} → {fmt_date(_cur['last_entry'])}"
+                     if _cur and _cur["first_entry"] else "—"),
+                    (f"{fmt_date(_inc['first_entry'])} → {fmt_date(_inc['last_entry'])}"
+                     if _inc["first_entry"] else "—"),
+                ),
+            ]
+            st.markdown("\n".join(_imp_rows))
+            st.caption(f"Uploaded file: `{_imp_file.name}` · {len(_imp_file.getvalue())/1024:,.1f} KB")
+
+            _imp_n = _cur["trades"] if _cur else 0
+            _imp_ack = st.checkbox(
+                f"I understand this permanently replaces the {_imp_n} trade(s) "
+                "currently in this install.",
+                key="db_import_ack",
+            )
+            _impc1, _impc2 = st.columns([2, 3])
+            if _impc1.button("🔁  Overwrite my data", type="primary",
+                             disabled=not _imp_ack, width='stretch',
+                             key="db_import_go"):
+                try:
+                    _safety = replace_database(_imp_tmp)
+                except Exception as _e:
+                    st.error(f"Import failed — your data is unchanged. ({_e})")
+                else:
+                    # Every cached frame still holds rows from the file that was
+                    # just replaced, including ids that don't exist any more.
+                    st.cache_data.clear()
+                    _bust("_v_trades", "_v_settings", "_v_tags",
+                          "_v_accounts", "_v_equity", "_v_plans")
+                    st.session_state["_db_import_done"] = {
+                        "trades": _inc["trades"],
+                        "safety": _os.path.basename(_safety),
+                    }
+                    st.session_state["_db_import_nonce"] = _imp_nonce + 1
+                    st.session_state.pop("db_import_ack", None)
+                    st.rerun()
+            if not _imp_ack:
+                _impc2.caption("Tick the box above to enable the button.")
+
     # List existing backups
-    _backups = sorted(_backup_dir.glob("backup-*.db"), reverse=True)
+    _backups = sorted(
+        [*_backup_dir.glob("backup-*.db"), *_backup_dir.glob("before-import-*.db")],
+        key=lambda _p: _p.name, reverse=True)
     if _backups:
         st.markdown("**Existing backups:**")
         _restore_pending = st.session_state.get("_restore_pending_bp")

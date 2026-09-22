@@ -9,7 +9,11 @@ from pathlib import Path
 # Override with TRADELOG_DB env var to point at a different database
 # (used by launch_demo.bat to run against demo/tradelog_demo.db)
 DB_PATH = Path(os.environ.get("TRADELOG_DB", Path(__file__).parent / "tradelog.db"))
-BACKUP_DIR = Path(__file__).parent / "backups"
+# Backups belong beside the database they came from, not beside the source.
+# When TRADELOG_DB points elsewhere — demo mode, a second log, a test run — a
+# shared folder means that run's daily copy lands in the main install's slot
+# and overwrites the real backup for that date.
+BACKUP_DIR = DB_PATH.parent / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
 BACKUP_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
 
