@@ -8922,19 +8922,30 @@ if page == "📋  Trading Log":
                                                           format="%.4f", value=current_val)
                     _cur_trail_en = str(row.get("trail_type") or "fixed") != "fixed"
                     edit_trailing_en = es4.checkbox("Trailing", value=_cur_trail_en)
-                    if edit_trailing_en:
-                        _etr1, _etr2 = st.columns(2)
-                        _cur_trail_type = str(row.get("trail_type") or "$")
-                        if _cur_trail_type == "fixed":
-                            _cur_trail_type = "$"
-                        _trail_opts = ["$", "%", "ATR"]
-                        edit_trail_type   = _etr1.selectbox("Trail Unit", _trail_opts,
-                                                             index=_trail_opts.index(_cur_trail_type) if _cur_trail_type in _trail_opts else 0)
-                        _cur_trail_amount = float(row["trail_amount"]) if row.get("trail_amount") and not pd.isna(row["trail_amount"]) else None
-                        edit_trail_amount = _etr2.number_input("Trail Amount", min_value=0.0, step=0.01,
-                                                                format="%.2f", value=_cur_trail_amount)
-                    else:
-                        edit_trail_type, edit_trail_amount = "fixed", None
+                    # Unlike Add Trade, this block sits inside st.form, and a form
+                    # doesn't rerun when a checkbox is clicked — so fields hidden
+                    # behind that tick could never appear before the save that
+                    # needs them. Switching a trade to trailing left nowhere to
+                    # enter the distance. Keep them on screen either way; the tick
+                    # decides whether they're applied.
+                    _etr1, _etr2 = st.columns(2)
+                    _cur_trail_type = str(row.get("trail_type") or "$")
+                    if _cur_trail_type == "fixed":
+                        _cur_trail_type = "$"
+                    _trail_opts = ["$", "%", "ATR"]
+                    edit_trail_type = _etr1.selectbox(
+                        "Trail Unit", _trail_opts,
+                        index=_trail_opts.index(_cur_trail_type) if _cur_trail_type in _trail_opts else 0,
+                        help="Used only while **Trailing** is ticked.")
+                    _cur_trail_amount = float(row["trail_amount"]) if row.get("trail_amount") and not pd.isna(row["trail_amount"]) else None
+                    edit_trail_amount = _etr2.number_input(
+                        "Trail Amount", min_value=0.0, step=0.01, format="%.2f",
+                        value=_cur_trail_amount,
+                        help="How far the stop follows behind the high — in dollars, "
+                             "percent or ATRs, per Trail Unit. Required while "
+                             "**Trailing** is ticked.")
+                    if not edit_trailing_en:
+                        edit_trail_type = "fixed"
                     edit_expiration = edit_strike = edit_option_type = edit_multiplier = None
 
                 elif inst_type == "option":
@@ -8989,6 +9000,12 @@ if page == "📋  Trading Log":
                 if st.form_submit_button("Save Changes", width='stretch'):
                     if _exit_before_entry(edit_entry_date, edit_exit_date):
                         st.error(_exit_before_entry_msg(edit_entry_date, edit_exit_date))
+                    elif inst_type == "stock" and edit_trailing_en and not edit_trail_amount:
+                        st.error(
+                            "Enter a **Trail Amount** above zero, or untick **Trailing** — "
+                            "a trailing stop with no distance can't be worked out, and the "
+                            "trade would fall back to its fixed stop."
+                        )
                     else:
                         edit_tag_ids = [tag_name_to_id[n] for n in edit_tags]
                         if edit_plan_choice == "— None —":
