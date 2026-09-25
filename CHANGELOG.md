@@ -6,6 +6,11 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-09-24.1
+- Time-weighted return no longer spikes when money is withdrawn: withdrawals now count from the end of the period and deposits from the start, so draining an account can't shrink the base to almost nothing (it used to show +1,870% and then stick at -100%). Periods with under $1 invested count as flat
+- Manual Entry table on the Equity Curve page shows each entry's period return
+- Trading Log opens with Group by ticker on
+
 ## 2026-09-24
 - Reconcile open positions against your broker (Broker Sync → Reconcile Open Positions): pulls positions live from Schwab or IB, or from a positions CSV from any broker, treats the broker as correct, and lists the adds, closes and size fixes that make the log match
 - Reconcile also catches a buy and a sell on the same contract both left open (a same-day close imported as a new short, say) and turns the later one into the earlier one's exit; IB corporate-action lines like AC.ODD are matched to their stock

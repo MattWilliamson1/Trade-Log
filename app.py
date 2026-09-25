@@ -1631,6 +1631,38 @@ def smooth_line_xy(x_num, y, strength: float, subdivisions: int = 18):
 
 # ── Logic helpers ──────────────────────────────────────────────────────────────
 
+# Below this much capital at work a period's return is noise, not performance
+# (an account drained to $0.01, say), so it counts as flat.
+EQUITY_MIN_CAPITAL = 1.0
+
+
+def equity_period_returns(balance, contributions, withdrawals) -> np.ndarray:
+    """Return between consecutive equity entries with cash flows stripped out.
+
+    Deposits count as arriving at the *start* of the period (they were there
+    to be invested) and withdrawals as leaving at the *end* (the money was
+    invested right up until it went out):
+
+        r = (balance + withdrawals) / (prev_balance + contributions) - 1
+
+    The old formula took withdrawals out at the start too, so the base became
+    prev − withdrawal. Draining an account (67,827 then −67,495) left a base of
+    a few hundred dollars and printed +1,870%, and the next withdrawal pushed
+    it to −100%. That froze the whole curve at zero from then on. With this
+    formula a withdrawal can't shrink the base, and a period with next to no
+    capital at work counts as 0% instead of dividing by almost nothing. The
+    first entry is the baseline (0%).
+    """
+    bal = pd.Series(balance, dtype=float).reset_index(drop=True)
+    con = pd.Series(contributions, dtype=float).fillna(0.0).reset_index(drop=True)
+    wd  = pd.Series(withdrawals, dtype=float).fillna(0.0).reset_index(drop=True)
+    base = bal.shift(1) + con
+    ret = np.where(base >= EQUITY_MIN_CAPITAL, (bal + wd) / base.where(base != 0, np.nan) - 1, 0.0)
+    ret = np.nan_to_num(ret.astype(float), nan=0.0)
+    if len(ret):
+        ret[0] = 0.0
+    return ret
+
 def _is_open(row) -> bool:
     return pd.isna(row["exit_date"])
 
@@ -7330,7 +7362,8 @@ if page == "📋  Trading Log":
         for _tk in ("_positions_view", "_expand_legs"):
             _pk = _tk + "_persist"
             if _pk not in st.session_state:
-                st.session_state[_pk] = False
+                # Grouping by ticker is the default view; expanded legs are not.
+                st.session_state[_pk] = _tk == "_positions_view"
             if _tk not in st.session_state:
                 st.session_state[_tk] = st.session_state[_pk]
 
@@ -7339,10 +7372,10 @@ if page == "📋  Trading Log":
             "Group by ticker",
             key="_positions_view",
             help=(
-                "**On** — aggregates all open trades for the same ticker into one row "
+                "**On** (default) — aggregates all open trades for the same ticker into one row "
                 "showing total quantity, weighted-average cost, and consolidated P&L. "
                 "Click any row to drill down into individual tax lots and dividends.\n\n"
-                "**Off** (default) — shows every trade entry as its own row."
+                "**Off** — shows every trade entry as its own row."
             ),
         )
         _expand_legs = _grp_col2.toggle(
@@ -9918,11 +9951,8 @@ elif page == "📈  Equity Curve":
             _ec_df["withdrawals"]   = _ec_df["withdrawals"].fillna(0.0)
 
             # Cumulative TWR: chain daily sub-period returns, stripping out cash flows
-            _prev_bal = _ec_df["balance"].shift(1)
-            _prev_bal.iloc[0] = _ec_df["balance"].iloc[0]  # base day: 0% return
-            _denominator = _prev_bal + _ec_df["contributions"] - _ec_df["withdrawals"]
-            _period_ret  = np.where(_denominator != 0, _ec_df["balance"] / _denominator - 1, 0.0)
-            _period_ret[0] = 0.0  # first entry is the baseline
+            _period_ret = equity_period_returns(
+                _ec_df["balance"], _ec_df["contributions"], _ec_df["withdrawals"])
             _ec_df["twr_pct"] = (pd.Series(_period_ret + 1).cumprod() - 1) * 100
 
             # ── Controls row 1: benchmarks + view ────────────────────────────
@@ -10000,11 +10030,8 @@ elif page == "📈  Equity Curve":
                 # Re-base TWR so the first in-range day reads 0% — returns chain
                 # from the selected start, not from inception. This also re-bases
                 # every return stat below (total/CAGR/drawdown) to the window.
-                _wb_prev = _ec_plot_df["balance"].shift(1)
-                _wb_prev.iloc[0] = _ec_plot_df["balance"].iloc[0]  # base day: 0%
-                _wb_denom = _wb_prev + _ec_plot_df["contributions"] - _ec_plot_df["withdrawals"]
-                _wb_ret = np.where(_wb_denom != 0, _ec_plot_df["balance"] / _wb_denom - 1, 0.0)
-                _wb_ret[0] = 0.0
+                _wb_ret = equity_period_returns(
+                    _ec_plot_df["balance"], _ec_plot_df["contributions"], _ec_plot_df["withdrawals"])
                 _ec_plot_df["twr_pct"] = (pd.Series(_wb_ret + 1).cumprod() - 1) * 100
 
                 _show_twr = (_ec_view == "% Return (TWR)")
@@ -10131,9 +10158,7 @@ elif page == "📈  Equity Curve":
                 _max_dd       = float(-_dd_series.min() * 100.0)
 
                 # ── Daily sub-period returns for the filtered range ────────────
-                _ec_plot_prev  = _ec_plot_df["balance"].shift(1)
-                _ec_plot_denom = _ec_plot_prev + _ec_plot_df["contributions"] - _ec_plot_df["withdrawals"]
-                _ec_plot_pret  = np.where(_ec_plot_denom > 0, _ec_plot_df["balance"] / _ec_plot_denom - 1, 0.0)
+                _ec_plot_pret  = _wb_ret
                 _daily_ret_ser = pd.Series(
                     _ec_plot_pret[1:], index=_ec_plot_df["date"].iloc[1:]
                 )  # drop first (0% baseline)
@@ -10363,10 +10388,7 @@ elif page == "📈  Equity Curve":
                             st.rerun()
                 _tbl = _ec_plot_df[["date", "balance", "contributions", "withdrawals", "twr_pct"]].copy()
                 _tbl["Daily Change ($)"] = _tbl["balance"].diff().fillna(0.0)
-                _tbl["Daily Return (%)"] = (
-                    (_tbl["balance"] / (_tbl["balance"].shift(1)
-                     + _tbl["contributions"] - _tbl["withdrawals"]) - 1) * 100
-                ).fillna(0.0)
+                _tbl["Daily Return (%)"] = _wb_ret * 100
                 # Flag rows that look like missing contributions: >15% single-day move
                 # with no cash flow recorded — these are the primary cause of curve spikes.
                 _tbl["⚠️"] = np.where(
@@ -10457,9 +10479,26 @@ elif page == "📈  Equity Curve":
                         st.rerun()
 
             _ec_disp = pd.DataFrame(_eq_entries)[["date", "balance", "contributions", "withdrawals"]].copy()
-            _ec_disp.columns = ["Date", "Balance ($)", "Contributions ($)", "Withdrawals ($)"]
-            _ec_disp = _ec_disp.sort_values("Date", ascending=False).reset_index(drop=True)
-            st.dataframe(_ec_disp, width='stretch', hide_index=True)
+            _ec_disp = _ec_disp.sort_values("date").reset_index(drop=True)
+            # Return since the previous entry, cash flows stripped out — the same
+            # figure the Chart tab chains into its time-weighted return, so a
+            # suspicious jump can be traced to the entry that caused it.
+            _ec_disp["period_ret"] = equity_period_returns(
+                _ec_disp["balance"], _ec_disp["contributions"], _ec_disp["withdrawals"]) * 100
+            _ec_disp.columns = ["Date", "Balance ($)", "Contributions ($)", "Withdrawals ($)",
+                                "Period Return (%)"]
+            _ec_disp = _ec_disp.iloc[::-1].reset_index(drop=True)
+            st.dataframe(
+                _ec_disp, width='stretch', hide_index=True,
+                column_config={
+                    "Period Return (%)": st.column_config.NumberColumn(
+                        format="%+.2f%%",
+                        help="Return since the previous entry, not counting deposits or "
+                             "withdrawals. Deposits count from the start of the period, "
+                             "withdrawals from the end. The first entry is the 0% baseline.",
+                    ),
+                },
+            )
 
             st.markdown("**Delete an entry**")
             _del_opts = {f"{e['date']} — ${e['balance']:,.2f}": e["id"] for e in sorted(_eq_entries, key=lambda x: x["date"], reverse=True)}
@@ -10507,10 +10546,8 @@ elif page == "📈  Equity Curve":
                     _csv_df["withdrawals"]   = pd.to_numeric(_csv_df.get("withdrawals",   0), errors="coerce").fillna(0.0)
                     _csv_df = _csv_df.dropna(subset=["balance"]).sort_values("date").reset_index(drop=True)
                     # Spike detection: warn when a large balance jump has no cash flow recorded
-                    _csv_prev  = _csv_df["balance"].shift(1)
-                    _csv_denom = _csv_prev + _csv_df["contributions"] - _csv_df["withdrawals"]
-                    _csv_iret  = np.where(_csv_denom > 0, (_csv_df["balance"] / _csv_denom - 1) * 100, 0.0)
-                    _csv_df["_impl_ret"] = np.where(_csv_df.index == 0, 0.0, _csv_iret)
+                    _csv_df["_impl_ret"] = equity_period_returns(
+                        _csv_df["balance"], _csv_df["contributions"], _csv_df["withdrawals"]) * 100
                     _csv_spike = (
                         (_csv_df["_impl_ret"].abs() > 15)
                         & (_csv_df["contributions"] == 0)
