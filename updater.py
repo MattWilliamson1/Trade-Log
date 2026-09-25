@@ -15,10 +15,12 @@ SOURCE_FILES = [
     "schwab_client.py",
     "fidelity_client.py",
     "csv_smart.py",
+    "reconcile.py",
     "launch.py",
     "requirements.txt",
     "updater.py",
     "VERSION",
+    "CHANGELOG.md",
 ]
 
 # The Windows launcher ships from installer/launch.bat as the app's launch.bat.
@@ -71,6 +73,83 @@ def get_remote_version() -> "str | None":
             return r.read().decode().strip()
     except Exception:
         return None
+
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+# CHANGELOG.md holds one "## <version>" section per release, newest first, each
+# a bullet list of what changed. CI refuses a push whose VERSION has no section
+# (`python updater.py check-changelog`), so the list can't fall behind, and
+# the update prompt shows the sections between the installed and new versions.
+
+def version_key(v: str) -> tuple:
+    """Sort key for "YYYY-MM-DD" / "YYYY-MM-DD.N" versions (no suffix = .0)."""
+    import re
+    m = re.match(r"\s*(\d{4}-\d{2}-\d{2})(?:\.(\d+))?", v or "")
+    return (m.group(1), int(m.group(2) or 0)) if m else ("", 0)
+
+
+def parse_changelog(text: str) -> list:
+    """[(version, [bullet, ...])] in file order (newest first)."""
+    import re
+    out = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^##\s+v?(\S+)", line)
+        if m:
+            out.append((m.group(1), []))
+        elif out and re.match(r"^\s*[-*]\s+", line):
+            out[-1][1].append(re.sub(r"^\s*[-*]\s+", "", line).rstrip())
+    return out
+
+
+def get_local_changelog() -> str:
+    p = APP_DIR / "CHANGELOG.md"
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def get_remote_changelog() -> "str | None":
+    try:
+        with urllib.request.urlopen(f"{RAW_BASE}/CHANGELOG.md", timeout=8) as r:
+            return r.read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def changelog_entry(version: str, text: "str | None" = None) -> list:
+    """Bullets for one version ([] when it has no section)."""
+    text = get_local_changelog() if text is None else text
+    for v, items in parse_changelog(text):
+        if v == version:
+            return items
+    return []
+
+
+def changes_since(text: str, installed: str) -> list:
+    """Sections newer than the installed version, newest first."""
+    floor = version_key(installed)
+    return [(v, items) for v, items in parse_changelog(text) if version_key(v) > floor]
+
+
+def release_notes() -> str:
+    """Body for the GitHub release page: this version's changes + install steps."""
+    v = get_local_version()
+    lines = [f"## Latest build — v{v}", "", "### What's new"]
+    lines += [f"- {i}" for i in changelog_entry(v)] or ["- (no notes)"]
+    lines += [
+        "",
+        "### Windows",
+        "**Download the zip below**, extract it, and double-click",
+        "`INSTALL - Double-Click This First.bat`.",
+        "",
+        "### Mac",
+        "**Download the `.tar.gz` below**, double-click it to extract,",
+        "open the `Trade Log Mac` folder, and double-click `Trade Log.app`.",
+        "If macOS shows a security warning, right-click the app → Open → Open.",
+        "",
+        "Every earlier version's changes are in CHANGELOG.md in the repository.",
+        "",
+        "> This release is updated automatically every time an update is pushed.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _source_files_in(updater_src: bytes) -> list:
@@ -140,3 +219,21 @@ def download_updates() -> "tuple[bool, str | None]":
             return False, f"Files updated but pip install failed:\n{result.stderr}"
 
     return True, None
+
+
+if __name__ == "__main__":
+    # Release tooling, run from CI:
+    #   python updater.py check-changelog   fail unless VERSION has a CHANGELOG entry
+    #   python updater.py release-notes     print the GitHub release body
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "check-changelog":
+        v = get_local_version()
+        if not changelog_entry(v):
+            sys.exit(f"CHANGELOG.md has no '## {v}' section with at least one bullet. "
+                     "Add one before pushing a version bump.")
+        print(f"CHANGELOG.md covers {v}.")
+    elif cmd == "release-notes":
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.write(release_notes())
+    else:
+        sys.exit("usage: python updater.py check-changelog | release-notes")

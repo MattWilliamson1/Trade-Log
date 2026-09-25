@@ -259,10 +259,12 @@ SOURCE_FILES = [
     "schwab_client.py",
     "fidelity_client.py",
     "csv_smart.py",
+    "reconcile.py",
     "updater.py",
     "launch.py",
     "requirements.txt",
     "VERSION",
+    "CHANGELOG.md",
 ]
 
 

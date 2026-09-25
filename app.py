@@ -45,6 +45,11 @@ except Exception:
     # Optional, same rationale as the broker clients above — the Smart CSV tab
     # checks for None and falls back to the fixed-header importer.
     _csvs = None
+try:
+    import reconcile as _recon
+except Exception:
+    # Optional — Broker Sync → Reconcile Open Positions says so when it's absent.
+    _recon = None
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
@@ -2975,6 +2980,90 @@ def update_position(*a, **kw):
     _bust("_v_trades")
     return r
 
+
+def close_open_trade(trade_id: int, exit_date, exit_price_usd: float,
+                     fx_rate_exit: float = 1.0, add_note: str | None = None) -> None:
+    """Close an open trade outright, keeping its notes, stops and tags.
+
+    The one-at-a-time Close in Open Positions passes these through from the
+    row it already has; the bulk and spread closes and the broker
+    reconciliation have only an id, so this reads them back first.
+    ``exit_price_usd`` is USD like every stored price.
+    """
+    with get_connection() as conn:
+        r = conn.execute(
+            "SELECT notes, current_stop, stop_enabled, quantity FROM trades WHERE id=?", (trade_id,)
+        ).fetchone()
+        had_exits = conn.execute(
+            "SELECT 1 FROM trade_lots WHERE trade_id=? AND lot_type='exit' LIMIT 1", (trade_id,)
+        ).fetchone()
+    if not r:
+        raise ValueError(f"Trade {trade_id} not found")
+    if had_exits:
+        # Part of it was already sold. Closing the rest as one more exit piece
+        # lets partial_exit_trade restore the full size and average every exit
+        # price; writing exit_price directly would price the whole position at
+        # the last piece and count only what was still open.
+        partial_exit_trade(trade_id, float(r["quantity"] or 0), exit_price_usd, exit_date,
+                           fx_rate_exit=fx_rate_exit)
+        if add_note:
+            append_trade_note(trade_id, add_note)
+        return
+    notes = r["notes"] or ""
+    if add_note:
+        notes = f"{notes}\n{add_note}".strip()
+    update_trade(
+        trade_id, exit_date, float(exit_price_usd), notes or None,
+        r["current_stop"], bool(r["stop_enabled"]), get_trade_tag_ids(trade_id),
+        fx_rate_exit=fx_rate_exit,
+    )
+
+
+def append_trade_note(trade_id: int, note: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE trades SET notes = CASE WHEN COALESCE(notes, '') = '' THEN ? "
+            "ELSE notes || char(10) || ? END WHERE id=?",
+            (note, note, trade_id),
+        )
+    _cached_load_trades.clear()
+    _bust("_v_trades")
+
+
+def apply_offset_pair(open_id: int, close_id: int, qty: float, note: str) -> None:
+    """Turn a later opposite-side trade into the exit of an earlier one.
+
+    ``close_id`` was the fill that closed ``open_id`` but got logged as a new
+    position. ``qty`` of it becomes an exit piece on ``open_id`` at its own
+    price, date and FX rate, its share of commission moves across with it,
+    and what's used up is removed from ``close_id`` (the whole trade when
+    nothing is left) so the fill isn't counted twice.
+    """
+    with get_connection() as conn:
+        c = conn.execute(
+            "SELECT ticker, quantity, entry_price, entry_date, commission, fx_rate_entry "
+            "FROM trades WHERE id=?", (close_id,)
+        ).fetchone()
+        if not c:
+            raise ValueError(f"Trade {close_id} not found")
+        cq  = float(c["quantity"] or 0)
+        com = float(c["commission"] or 0)
+        moved = com * qty / cq if cq else 0.0
+        conn.execute("UPDATE trades SET commission = COALESCE(commission, 0) + ? WHERE id=?",
+                     (moved, open_id))
+        if cq - qty <= 1e-9:
+            conn.execute("DELETE FROM trades WHERE id=?", (close_id,))
+        else:
+            conn.execute("UPDATE trades SET quantity=?, commission=? WHERE id=?",
+                         (cq - qty, com - moved, close_id))
+            conn.execute("UPDATE trade_lots SET quantity=? WHERE trade_id=? AND lot_type='open'",
+                         (cq - qty, close_id))
+    fx = float(c["fx_rate_entry"] or 1.0)
+    partial_exit_trade(open_id, qty, float(c["entry_price"] or 0), c["entry_date"],
+                       fx_rate_exit=fx if fx != 1.0 else None)
+    append_trade_note(open_id, f"{note} — closed by trade #{close_id}, which was logged "
+                               f"as a separate opposite position of {fmt_qty(qty)}.")
+
 _raw_add_tag = add_tag
 def add_tag(*args, **kwargs):
     r = _raw_add_tag(*args, **kwargs)
@@ -3069,6 +3158,139 @@ def import_parsed_trades(trade_list: list[dict]) -> dict:
         except Exception as e:
             errors.append(f"{td.get('ticker','?')}: {e}")
     return {"imported": imported, "closed": closed, "dupes": dupes, "errors": errors}
+
+
+# ── IB "today's fills" import ─────────────────────────────────────────────────
+# The live IB session only sees today's fills, so a sell of shares bought last
+# week arrives with nothing to pair against and used to be logged as a brand
+# new short. Replaying the fills in time order against what the log already
+# holds fixes that: each fill first closes opposite-side open trades (oldest
+# first) and only what's left over opens or adds to a position.
+
+_IB_SEEN_KEY = "ib_imported_exec_ids"
+
+
+def _ib_seen_exec_ids() -> set:
+    import json as _json
+    try:
+        return set(_json.loads(get_setting(_IB_SEEN_KEY, "[]")) or [])
+    except ValueError:
+        return set()
+
+
+def _ib_mark_exec_ids(ids) -> None:
+    import json as _json
+    seen = list(_ib_seen_exec_ids() | {i for i in ids if i})
+    set_setting(_IB_SEEN_KEY, _json.dumps(seen[-5000:]))
+
+
+def _ib_already_logged(td: dict) -> bool:
+    """A record imported by the pre-replay importer: either the trade it made
+    is still there, or it has since been turned into an exit lot (e.g. by
+    Reconcile pairing a same-day close logged as a short)."""
+    if is_duplicate_trade(td.get("ticker", ""), td.get("entry_date"), td.get("quantity"),
+                          td.get("entry_price"), td.get("instrument_type", "stock"),
+                          td.get("expiration"), td.get("strike")):
+        return True
+    d = td.get("entry_date")
+    d = d.isoformat() if hasattr(d, "isoformat") else str(d or "")[:10]
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT t.ticker, t.instrument_type, t.expiration, t.strike, t.option_type
+               FROM trade_lots l JOIN trades t ON t.id = l.trade_id
+               WHERE l.lot_type = 'exit' AND l.date = ? AND t.ticker = ?
+                 AND ABS(l.quantity - ?) < 0.001 AND ABS(l.price - ?) < 0.0001""",
+            (d, str(td.get("ticker", "")).upper(), float(td.get("quantity") or 0),
+             float(td.get("entry_price") or 0)),
+        ).fetchall()
+    key = _recon.contract_key(td.get("instrument_type"), td.get("ticker"), td.get("expiration"),
+                              td.get("strike"), td.get("option_type"))
+    return any(_recon.contract_key(r["instrument_type"], r["ticker"], r["expiration"],
+                                   r["strike"], r["option_type"]) == key for r in rows)
+
+
+def replay_ib_fills(records: list[dict], apply: bool = False) -> dict:
+    """Plan (apply=False) or perform (apply=True) the import of today's fills.
+
+    Returns {"steps": [str], "dupes": int, "errors": [str]}. The plan is worked
+    out against the log as it stands, so the preview says exactly what Import
+    will do: which open trades get closed and what, if anything, is opened.
+    """
+    seen = _ib_seen_exec_ids()
+    steps, errors, dupes, new_seen = [], [], 0, []
+    with get_connection() as conn:
+        open_rows = [dict(r) for r in conn.execute(
+            """SELECT id, ticker, quantity, side, entry_date, instrument_type,
+                      expiration, strike, option_type
+               FROM trades WHERE exit_date IS NULL OR exit_date = ''
+               ORDER BY entry_date, id""").fetchall()]
+
+    for td in records:
+        fills = [f for f in td.get("_fills") or [] if not f.get("exec_id") or f["exec_id"] not in seen]
+        label = td.get("ticker", "?")
+        if td.get("instrument_type") == "option":
+            label += f" {td.get('strike')}{str(td.get('option_type') or '')[:1].upper()} {td.get('expiration')}"
+        if not fills or (len(fills) == len(td.get("_fills") or []) and _ib_already_logged(td)):
+            dupes += 1
+            new_seen += [f.get("exec_id") for f in td.get("_fills") or []]
+            continue
+        key = _recon.contract_key(td.get("instrument_type"), td.get("ticker"), td.get("expiration"),
+                                  td.get("strike"), td.get("option_type"))
+        # Open lots on this contract: [id, side, qty, entry_date]; id None for a
+        # position this import would open (plan mode only).
+        lots = [[r["id"], str(r["side"] or "long"), float(r["quantity"] or 0), r["entry_date"]]
+                for r in open_rows
+                if _recon.contract_key(r["instrument_type"], r["ticker"], r["expiration"],
+                                       r["strike"], r["option_type"]) == key]
+        opened: dict = {}   # side → lot opened by this import
+        try:
+            for f in sorted(fills, key=lambda f: f["time"]):
+                left, px, fd = float(f["quantity"]), float(f["price"]), _to_date_obj(f["date"])
+                for lot in lots:
+                    if left <= 1e-9:
+                        break
+                    if lot[1] == f["side"] or lot[2] <= 1e-9:
+                        continue
+                    take = min(left, lot[2])
+                    steps.append(f"{label}: close {fmt_qty(take)} of the {lot[1]} "
+                                 f"{'from ' + fmt_date(lot[3]) if lot[3] else 'opened above'}"
+                                 f"{' (#' + str(lot[0]) + ')' if lot[0] else ''} @ {px:g}")
+                    if apply:
+                        partial_exit_trade(lot[0], take, px, fd)
+                    lot[2] -= take
+                    left -= take
+                if left <= 1e-9:
+                    continue
+                if f["side"] in opened:
+                    lot = opened[f["side"]]
+                    steps.append(f"{label}: add {fmt_qty(left)} to the new {f['side']} @ {px:g}")
+                    if apply:
+                        update_position(lot[0], left, px, fd.isoformat())
+                    lot[2] += left
+                else:
+                    steps.append(f"{label}: open {f['side']} {fmt_qty(left)} @ {px:g}")
+                    tid = None
+                    if apply:
+                        tid = add_trade(**{**{k: td[k] for k in [
+                            "notes", "stop_enabled", "opening_stop", "tag_ids", "current_stop",
+                            "instrument_type", "expiration", "strike", "option_type",
+                            "multiplier", "leg_group", "leg_label",
+                        ] if k in td}, "entry_date": fd, "ticker": td["ticker"],
+                            "quantity": left, "entry_price": px, "exit_date": None,
+                            "exit_price": None, "side": f["side"]})
+                    lot = [tid, f["side"], left, None]
+                    opened[f["side"]] = lot
+                    lots.append(lot)
+            new_seen += [f.get("exec_id") for f in fills]
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    if apply:
+        _ib_mark_exec_ids(new_seen)
+    return {"steps": steps, "dupes": dupes, "errors": errors}
+
+
+def _to_date_obj(v):
+    return v if hasattr(v, "isoformat") else pd.Timestamp(str(v)[:10]).date()
 
 
 # Columns that are internal plumbing rather than something worth eyeballing in
@@ -5183,6 +5405,15 @@ with st.sidebar:
     # ── App updates ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.caption(f"v{_upd.get_local_version()}")
+    # getattr: an install mid-update can pair this app.py with an older updater.
+    _cl_sections = (getattr(_upd, "parse_changelog", lambda t: [])(
+        getattr(_upd, "get_local_changelog", lambda: "")()))
+    if _cl_sections:
+        with st.expander("📜  What's changed"):
+            for _clv, _cli in _cl_sections[:8]:
+                st.markdown(f"**v{_clv}**\n" + "\n".join(f"- {_i}" for _i in _cli))
+            if len(_cl_sections) > 8:
+                st.caption(f"{len(_cl_sections) - 8} older versions in CHANGELOG.md.")
     if st.button("Check for updates", width="stretch", key="sb_check_updates"):
         with st.spinner("Checking…"):
             _remote_ver = _upd.get_remote_version()
@@ -5195,6 +5426,11 @@ with st.sidebar:
         else:
             st.session_state["_upd_status"] = "available"
             st.session_state["_upd_remote_ver"] = _remote_ver
+            try:
+                st.session_state["_upd_changes"] = _upd.changes_since(
+                    _upd.get_remote_changelog() or "", _upd.get_local_version())
+            except Exception:
+                st.session_state["_upd_changes"] = []
 
     _upd_status = st.session_state.get("_upd_status")
     if _upd_status == "error":
@@ -5251,6 +5487,11 @@ with st.sidebar:
             "</div>",
             unsafe_allow_html=True,
         )
+        _upd_changes = st.session_state.get("_upd_changes") or []
+        if _upd_changes:
+            with st.expander("What's new in this update", expanded=True):
+                for _clv, _cli in _upd_changes:
+                    st.markdown(f"**v{_clv}**\n" + "\n".join(f"- {_i}" for _i in _cli))
         if st.button("⬇  INSTALL UPDATE", width="stretch", key="sb_do_update",
                      type="primary",
                      help="Download the new version now — Trade Log restarts to finish"):
@@ -6737,6 +6978,200 @@ if page == "📋  Trading Log":
                                 }
                                 st.session_state["_op_stay_open"] = True
                                 st.rerun()
+
+        # ── Close several at once / whole spreads ─────────────────────────────
+        # The Open Positions list above closes one trade per click, which for a
+        # four-leg condor means four prices, four dates and four Close clicks.
+        # Here any mix of positions and whole spreads is picked in one list,
+        # priced in one table, and closed with one click. A spread is the open
+        # legs sharing a leg_group; picking it picks every leg.
+        if len(_open_pos) > 1:
+            _mc_stay_open = bool(st.session_state.pop("_mc_stay_open", False))
+            with st.expander("🧺  Close Several Positions / Whole Spreads",
+                             expanded=_mc_stay_open):
+                _mc_df = _open_pos.copy()
+                _mc_df["_lg"] = _mc_df["leg_group"].fillna("").astype(str).str.strip()
+                _mc_lg_n = _mc_df[_mc_df["_lg"] != ""]["_lg"].value_counts()
+                _mc_spreads = [g for g, n in _mc_lg_n.items() if n >= 2]
+
+                def _mc_leg_text(r) -> str:
+                    _sgn = "−" if str(r.get("side") or "long").lower() == "short" else "+"
+                    if str(r.get("instrument_type") or "stock").lower() == "option":
+                        _k = r.get("strike")
+                        _ks = f"{float(_k):g}" if _k is not None and not pd.isna(_k) else "?"
+                        _cp = str(r.get("option_type") or "")[:1].upper()
+                        return f"{_sgn}{fmt_qty(r['quantity'])} {_ks}{_cp} {fmt_date(r.get('expiration') or None, date_fmt)}"
+                    return f"{_sgn}{fmt_qty(r['quantity'])} {r['ticker']}"
+
+                _mc_items: dict = {}   # option key → (label, [trade ids])
+                for _g in _mc_spreads:
+                    _legs = _mc_df[_mc_df["_lg"] == _g]
+                    _mc_items[f"spread:{_g}"] = (
+                        f"🧩 {_legs.iloc[0]['ticker']} spread ({len(_legs)} legs): "
+                        + ", ".join(_mc_leg_text(r) for _, r in _legs.iterrows()),
+                        [int(i) for i in _legs["id"]],
+                    )
+                for _, _r in _mc_df[~_mc_df["_lg"].isin(_mc_spreads)].iterrows():
+                    _inst = str(_r.get("instrument_type") or "stock").lower()
+                    _mc_items[f"trade:{int(_r['id'])}"] = (
+                        f"{_r['ticker']}{' · ' + _inst if _inst != 'stock' else ''}: "
+                        f"{_mc_leg_text(_r)} · {fmt_date(_r['entry_date'], date_fmt)} (ID {int(_r['id'])})",
+                        [int(_r["id"])],
+                    )
+
+                st.caption(
+                    "Pick positions and/or whole spreads, check the exit prices, and close "
+                    "them all in one go. Prices are per share (per contract unit for "
+                    "options), in each trade's own currency. Stocks pre-fill with the live "
+                    "price and expired options with 0 on their expiration date."
+                )
+                _mc_all = st.checkbox("Select everything", key="mc_select_all")
+                _mc_pick = st.multiselect(
+                    "Positions to close", list(_mc_items),
+                    default=list(_mc_items) if _mc_all else None,
+                    format_func=lambda k: _mc_items[k][0],
+                    key=f"mc_pick_{int(_mc_all)}",
+                    placeholder="Choose positions or spreads",
+                )
+                _mc_ids = [i for k in _mc_pick for i in _mc_items[k][1]]
+                if _mc_ids:
+                    _mc_date = st.date_input(
+                        "Exit date", value=_close_today, key="mc_exit_date",
+                        help="Used for every row except options already past expiration, "
+                             "which default to their expiration date. Each row can be "
+                             "changed in the table.",
+                    )
+                    _mc_sel = _mc_df[_mc_df["id"].isin(_mc_ids)].copy()
+                    _mc_sel["_order"] = _mc_sel["id"].map({v: i for i, v in enumerate(_mc_ids)})
+                    _mc_sel = _mc_sel.sort_values("_order")
+
+                    # Option quotes only come from IB; ask once for every leg.
+                    _mc_occ = {
+                        int(r["id"]): _get_live_ticker(r) for _, r in _mc_sel.iterrows()
+                        if str(r.get("instrument_type") or "stock").lower() == "option"
+                    }
+                    try:
+                        _mc_opt_live = get_live_data(tuple(sorted(set(_mc_occ.values())))) if _mc_occ else {}
+                    except Exception:
+                        _mc_opt_live = {}
+
+                    _mc_rows = []
+                    for _, r in _mc_sel.iterrows():
+                        _id   = int(r["id"])
+                        _inst = str(r.get("instrument_type") or "stock").lower()
+                        _ccy  = trade_currency(r)
+                        _fx_e = float(r.get("fx_rate_entry") or 1.0)
+                        _ep   = float(r["entry_price"] or 0)
+                        _exp  = str(r.get("expiration") or "")[:10]
+                        _px, _dt_row = None, _mc_date
+                        if _inst == "option" and _exp and _exp < _close_today.isoformat():
+                            _px, _dt_row = 0.0, pd.Timestamp(_exp).date()
+                        elif _inst == "option":
+                            _px = (_mc_opt_live.get(_mc_occ.get(_id), {}) or {}).get("price")
+                        elif _inst == "stock":
+                            _live = _get_single_live_price(str(r["ticker"]), str(r.get("exchange") or ""))
+                            _usd = (listing_to_usd(_live, _yf_symbol(str(r["ticker"]), str(r.get("exchange") or "")))
+                                    if _live is not None else None)
+                            if _usd is not None:
+                                _px = _usd if _ccy == "USD" else usd_to_native(_usd, get_fx_rate(_ccy))
+                        _mc_rows.append({
+                            "ID": _id,
+                            "Position": _mc_leg_text(r) if _inst == "option" else str(r["ticker"]),
+                            "Ticker": str(r["ticker"]),
+                            "Side": str(r.get("side") or "long"),
+                            "Qty": float(r["quantity"] or 0),
+                            "Entry": round(_ep if _ccy == "USD" else usd_to_native(_ep, _fx_e), 4),
+                            "Ccy": _ccy,
+                            "Exit Price": round(float(_px), 4) if _px is not None else None,
+                            "Exit Date": _dt_row,
+                        })
+                    _mc_base = pd.DataFrame(_mc_rows)
+                    # Keyed on the selection and shared date so a new pick builds a
+                    # fresh table with fresh pre-fills rather than keeping edits
+                    # typed against a different set of rows.
+                    _mc_edited = st.data_editor(
+                        _mc_base,
+                        key=f"mc_editor_{hash((tuple(_mc_ids), str(_mc_date)))}",
+                        hide_index=True, width="stretch",
+                        disabled=["ID", "Position", "Ticker", "Side", "Qty", "Entry", "Ccy"],
+                        column_config={
+                            "Exit Price": st.column_config.NumberColumn(min_value=0.0, format="%.4f",
+                                                                        required=True),
+                            "Exit Date":  st.column_config.DateColumn(required=True),
+                            "Qty":        st.column_config.NumberColumn(format="%g"),
+                        },
+                    )
+
+                    # P&L preview in USD, and a net price per spread so the total
+                    # can be checked against the fill the broker shows.
+                    _mc_by_id = {int(r["id"]): r for _, r in _mc_sel.iterrows()}
+                    _mc_total, _mc_missing, _mc_bad_dates = 0.0, [], []
+                    _mc_net: dict = {}
+                    for _, e in _mc_edited.iterrows():
+                        r = _mc_by_id[int(e["ID"])]
+                        if e["Exit Price"] is None or pd.isna(e["Exit Price"]):
+                            _mc_missing.append(e["Position"])
+                            continue
+                        _d = e["Exit Date"] if not pd.isna(e["Exit Date"]) else _mc_date
+                        if _exit_before_entry(r.get("entry_date"), _d):
+                            _mc_bad_dates.append(e["Position"])
+                        _ccy = e["Ccy"]
+                        _fx  = get_fx_rate_at_date(_ccy, str(_d)) if _ccy != "USD" else 1.0
+                        _raw = ((native_to_usd(float(e["Exit Price"]), _fx) - float(r["entry_price"] or 0))
+                                * float(r["quantity"] or 0) * float(r.get("multiplier") or 1.0))
+                        _mc_total += -_raw if e["Side"] == "short" else _raw
+                        _g = r["_lg"]
+                        if _g in _mc_spreads:
+                            _sgn = -1.0 if e["Side"] == "short" else 1.0
+                            _mc_net[_g] = _mc_net.get(_g, 0.0) + _sgn * float(e["Exit Price"]) * float(r["quantity"] or 0)
+
+                    for _g, _nv in _mc_net.items():
+                        _legs = _mc_df[_mc_df["_lg"] == _g]
+                        _units = spread_unit_count(list(_legs["quantity"])) or 1.0
+                        _per = _nv / _units
+                        st.caption(
+                            f"🧩 {_legs.iloc[0]['ticker']} spread — net exit "
+                            f"{'credit' if _per >= 0 else 'debit'} of {fmt_price(abs(_per))} per spread "
+                            f"({fmt_qty(_units)} spread{'s' if _units != 1 else ''})"
+                        )
+                    if not _mc_missing:
+                        _pcol = "#2ecc71" if _mc_total >= 0 else "#e74c3c"
+                        st.markdown(
+                            f"Realised P&L if closed: <b style='color:{_pcol}'>{fmt_price(_mc_total)}</b>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if st.button(f"Close {len(_mc_edited)} position{'s' if len(_mc_edited) != 1 else ''}",
+                                 type="primary", key="mc_close_btn"):
+                        if _mc_missing:
+                            st.warning("Enter an exit price for: " + ", ".join(_mc_missing))
+                        elif _mc_bad_dates:
+                            st.error("The exit date is before the entry date for: "
+                                     + ", ".join(_mc_bad_dates))
+                        else:
+                            _mc_errs, _mc_done = [], []
+                            for _, e in _mc_edited.iterrows():
+                                _d = e["Exit Date"] if not pd.isna(e["Exit Date"]) else _mc_date
+                                _d = pd.Timestamp(_d).date()
+                                _ccy = e["Ccy"]
+                                _fx  = get_fx_rate_at_date(_ccy, str(_d)) if _ccy != "USD" else 1.0
+                                try:
+                                    close_open_trade(int(e["ID"]), _d,
+                                                     native_to_usd(float(e["Exit Price"]), _fx),
+                                                     fx_rate_exit=_fx)
+                                    _mc_done.append(f"- {e['Position']} @ {float(e['Exit Price']):,.4f}"
+                                                    f"{' ' + _ccy if _ccy != 'USD' else ''}")
+                                except Exception as ex:
+                                    _mc_errs.append(f"- ⚠️ {e['Position']}: {ex}")
+                            st.session_state["_trade_closed"] = {
+                                "title": f"{len(_mc_done)} position{'s' if len(_mc_done) != 1 else ''} closed.",
+                                "lines": _mc_done + _mc_errs
+                                         + [f"- **Realised P&L:** {fmt_price(_mc_total)}"],
+                            }
+                            for _k in ("mc_select_all", "mc_pick_0", "mc_pick_1"):
+                                st.session_state.pop(_k, None)
+                            st.session_state["_mc_stay_open"] = True
+                            st.rerun()
 
         # ── Filter bar ────────────────────────────────────────────────────────
 
@@ -12404,8 +12839,20 @@ elif page == "🔗  Broker Sync":
                 _ib_picked = select_trades_to_import(
                     _preview, "ib_today_pick",
                     hide_cols=["notes", "stop_enabled", "opening_stop", "tag_ids",
-                               "current_stop", "side", "leg_label"],
+                               "current_stop", "side", "leg_label", "_fills"],
                 )
+                # What Import will actually do, worked out against the log: a sell
+                # of shares bought on an earlier day closes that trade rather
+                # than opening a short.
+                _ib_plan = replay_ib_fills(_ib_picked) if (_ib_picked and _recon) else None
+                if _ib_plan:
+                    with st.expander("What Import will do", expanded=True):
+                        for _stp in _ib_plan["steps"]:
+                            st.markdown(f"- {_stp}")
+                        if _ib_plan["dupes"]:
+                            st.caption(f"{_ib_plan['dupes']} already in the log — skipped.")
+                        if not _ib_plan["steps"] and not _ib_plan["dupes"]:
+                            st.caption("Nothing to do.")
                 _imp_c1, _imp_c2 = st.columns(2)
                 _ib_imp_label = (
                     f"✅  Import {len(_ib_picked)} Selected Trade(s)"
@@ -12414,6 +12861,15 @@ elif page == "🔗  Broker Sync":
                 )
                 if _imp_c1.button(_ib_imp_label, width='stretch', key="ib_import_all",
                                   disabled=not _ib_picked):
+                    if _recon is not None:
+                        _ib_res = replay_ib_fills(_ib_picked, apply=True)
+                        st.session_state.pop("_ib_preview", None)
+                        if _ib_res["errors"]:
+                            st.warning("\n".join(f"• {e}" for e in _ib_res["errors"]))
+                        if _ib_res["dupes"]:
+                            st.info(f"{_ib_res['dupes']} already in the log — skipped.")
+                        st.success(f"Applied {len(_ib_res['steps'])} change(s) from today's fills.")
+                        st.rerun()
                     _imported = 0
                     _ib_dupes = 0
                     for _td in _ib_picked:
@@ -13239,6 +13695,305 @@ elif page == "🔗  Broker Sync":
                 if st.button("🗑️  Clear", key="fidelity_clear"):
                     st.session_state.pop("_fidelity_result", None)
                     st.rerun()
+
+    # ── Reconcile Open Positions ───────────────────────────────────────────────
+    # The broker is the source of truth: whatever it says is held is what the
+    # log's open positions should add up to. Fetch its positions, net both sides
+    # per contract (reconcile.py), and offer the adds and closes that make the
+    # log agree. Nothing is written until the changes are reviewed and applied.
+    import datetime as _dt
+    st.divider()
+    st.markdown("#### ⚖️ Reconcile Open Positions")
+    st.caption(
+        "Compares what the log shows as open with what your broker actually holds, "
+        "and treats the broker as correct. Positions the log is missing get added, "
+        "positions the broker no longer holds get closed, and size differences are "
+        "evened up. Oldest trades are closed first. Review every change before applying."
+    )
+    _rc_msg = st.session_state.pop("_rc_applied", None)
+    if _rc_msg:
+        (st.warning if _rc_msg["errors"] else st.success)(
+            f"Applied {_rc_msg['done']} change(s)."
+            + ("\n\n" + "\n".join(f"• {e}" for e in _rc_msg["errors"]) if _rc_msg["errors"] else "")
+        )
+    if _recon is None:
+        st.warning("The reconciliation module (reconcile.py) is missing. Install the latest "
+                   "update to get it.")
+    else:
+        _RC_SCHWAB = "Schwab (live)"
+        _RC_IB     = "Interactive Brokers (TWS / Gateway)"
+        _RC_CSV    = "Positions file (any broker)"
+        _rc_srcs = []
+        if _cur_broker == "schwab" and _schwab_mod is not None:
+            _rc_srcs.append(_RC_SCHWAB)
+        if _cur_broker == "ib" and _ib_mod.is_available():
+            _rc_srcs.append(_RC_IB)
+        _rc_srcs.append(_RC_CSV)
+        _rc_src = st.radio("Get broker positions from", _rc_srcs, horizontal=True, key="rc_src")
+
+        if _rc_src == _RC_SCHWAB:
+            if st.button("📥  Fetch positions from Schwab", key="rc_fetch_schwab"):
+                _k, _s = settings.get("schwab_app_key", ""), settings.get("schwab_secret", "")
+                with st.spinner("Contacting Schwab…"):
+                    _h, _num, _err = _schwab_mod.resolve_account_hash(
+                        _k, _s, settings.get("schwab_account_number", ""))
+                    _pos, _err = (_schwab_mod.get_positions(_k, _s, _h) if not _err else ([], _err))
+                if _err:
+                    st.error(_err)
+                else:
+                    st.session_state["_rc_broker"] = {
+                        "id": f"schwab-{_dt.datetime.now():%H%M%S}", "label": f"Schwab ••••{_num[-4:]}",
+                        "schwab_acct": _num, "positions": _pos,
+                        "at": _dt.datetime.now().strftime("%H:%M:%S"),
+                    }
+                    st.rerun()
+            st.caption("Uses the Schwab account selected above.")
+        elif _rc_src == _RC_IB:
+            if st.button("📥  Fetch positions from IB", key="rc_fetch_ib"):
+                try:
+                    with st.spinner("Contacting TWS / Gateway…"):
+                        with _ib_mod.IBClient(settings.get("ib_host", "127.0.0.1"),
+                                              int(settings.get("ib_port", "7497") or 7497),
+                                              int(settings.get("ib_client_id", "1") or 1)) as _ibc:
+                            _pos = _ibc.get_positions()
+                    st.session_state["_rc_broker"] = {
+                        "id": f"ib-{_dt.datetime.now():%H%M%S}", "label": "Interactive Brokers",
+                        "positions": _pos, "at": _dt.datetime.now().strftime("%H:%M:%S"),
+                    }
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Couldn't reach TWS / Gateway: {_e}")
+        else:
+            st.caption(
+                "Export your positions from the broker's website as CSV (Fidelity: "
+                "Positions → Download; Schwab: Positions → Export) or make your own with "
+                "**Symbol**, **Quantity** and optionally **Average Cost** columns. Short "
+                "positions have a negative quantity. Options can be OCC symbols "
+                "(AAPL260918C00200000), Fidelity style (-AAPL260918C200) or Schwab style "
+                "(AAPL 09/18/2026 200.00 C)."
+            )
+            _rc_file = st.file_uploader("Positions CSV", type=["csv"], key="rc_csv")
+            if _rc_file is not None:
+                _rc_fid = f"csv-{_rc_file.name}-{_rc_file.size}"
+                if (st.session_state.get("_rc_broker") or {}).get("id") != _rc_fid:
+                    _pos, _err = _recon.parse_positions_csv(_rc_file.getvalue())
+                    if _err:
+                        st.error(_err)
+                    else:
+                        st.session_state["_rc_broker"] = {
+                            "id": _rc_fid, "label": _rc_file.name, "positions": _pos,
+                            "at": _dt.datetime.now().strftime("%H:%M:%S"),
+                        }
+
+        _rcb = st.session_state.get("_rc_broker")
+        if _rcb:
+            _rc_pos = _rcb["positions"]
+            st.caption(f"Broker positions: **{_rcb['label']}**, fetched {_rcb['at']} "
+                       f"({len(_rc_pos)} line{'s' if len(_rc_pos) != 1 else ''}).")
+            _rcc1, _rcc2 = st.columns(2)
+            _rc_baccts = sorted({p.get("account") for p in _rc_pos if p.get("account")})
+            if len(_rc_baccts) > 1:
+                _rc_bacct = _rcc1.selectbox("Broker account", ["All"] + _rc_baccts,
+                                            key=f"rc_bacct_{_rcb['id']}")
+                if _rc_bacct != "All":
+                    _rc_pos = [p for p in _rc_pos if p.get("account") == _rc_bacct]
+
+            # Default the log side to the account this broker account is named
+            # as (Schwab aliases), else the last one used, else everything.
+            _RC_ALL = "All accounts"
+            _rc_default = settings.get("reconcile_log_account", _RC_ALL)
+            if _rcb.get("schwab_acct"):
+                try:
+                    import json as _json
+                    _rc_default = (_json.loads(settings.get("schwab_account_aliases", "{}")) or {}
+                                   ).get(_rcb["schwab_acct"], _rc_default)
+                except ValueError:
+                    pass
+            _rc_lopts = [_RC_ALL] + all_accounts
+            _rc_lacct = _rcc2.selectbox(
+                "Compare with Trade Log account", _rc_lopts,
+                index=_rc_lopts.index(_rc_default) if _rc_default in _rc_lopts else 0,
+                key=f"rc_lacct_{_rcb['id']}",
+                help="Pick the log account that holds this broker account's trades, or "
+                     "positions from your other brokers will show as 'not held'.",
+            )
+            if _rc_lacct != settings.get("reconcile_log_account", _RC_ALL):
+                set_setting("reconcile_log_account", _rc_lacct)
+
+            _rc_trades = _cached_load_trades(st.session_state["_v_trades"])
+            _rc_open = _rc_trades[_rc_trades["exit_date"].isna()]
+            if _rc_lacct != _RC_ALL:
+                _rc_open = _rc_open[_rc_open["account_name"].fillna("Default") == _rc_lacct]
+            _rc_open_rows = _rc_open.astype(object).where(_rc_open.notna(), None).to_dict("records")
+            _rc_rows = _recon.reconcile(_recon.log_positions(_rc_open_rows),
+                                        _recon.broker_positions(_rc_pos))
+            _rc_diff = [r for r in _rc_rows if r["status"] != _recon.MATCH]
+
+            _rm1, _rm2, _rm3 = st.columns(3)
+            _rm1.metric("Contracts compared", len(_rc_rows))
+            _rm2.metric("Match", len(_rc_rows) - len(_rc_diff))
+            _rm3.metric("Differ", len(_rc_diff))
+
+            def _rc_q(v):
+                return fmt_qty(v) if abs(v) > _recon.QTY_TOL else "—"
+
+            with st.expander("All positions compared", expanded=not _rc_diff):
+                if _rc_rows:
+                    st.dataframe(pd.DataFrame([{
+                        "Status":     _recon.STATUS_LABEL[r["status"]],
+                        "Contract":   r["contract"],
+                        "Log qty":    _rc_q(r["log_qty"]),
+                        "Broker qty": _rc_q(r["broker_qty"]),
+                        "Log avg":    fmt_price(r["log_avg"]) if r["log_avg"] is not None else "—",
+                        "Broker avg": fmt_price(r["broker_avg"]) if r["broker_avg"] is not None else "—",
+                    } for r in _rc_rows]), hide_index=True, width="stretch")
+                else:
+                    st.caption("Nothing open on either side.")
+
+            if not _rc_diff:
+                st.success("✅ The log's open positions match the broker.")
+            else:
+                # Pre-fill prices: a close needs an exit price (expired options
+                # went out at 0 on expiry, stocks take the live quote), an add
+                # needs an entry price (whatever brings the log's average cost
+                # to the broker's).
+                _rc_today = _dt.date.today()
+                _rc_occ = {}
+                for r in _rc_diff:
+                    if r["close_qty"] and r["key"][0] == "option" and not _recon.option_expired(r["key"]):
+                        _rc_occ[r["key"]] = _get_live_ticker(r["trades"][0])
+                try:
+                    _rc_live = get_live_data(tuple(sorted(set(_rc_occ.values())))) if _rc_occ else {}
+                except Exception:
+                    _rc_live = {}
+
+                def _rc_side(q):
+                    return "short" if q < 0 else "long"
+
+                _rc_ed_rows = []
+                for i, r in enumerate(_rc_diff):
+                    _cp, _cd = None, _rc_today
+                    if r["close_qty"]:
+                        if _recon.option_expired(r["key"]):
+                            _cp, _cd = 0.0, _dt.date.fromisoformat(r["key"][2])
+                        elif r["key"][0] == "stock":
+                            _exch = str(r["trades"][0].get("exchange") or "")
+                            _lp = _get_single_live_price(r["key"][1], _exch)
+                            if _lp is not None:
+                                _cp = listing_to_usd(_lp, _yf_symbol(r["key"][1], _exch))
+                        else:
+                            _cp = (_rc_live.get(_rc_occ.get(r["key"]), {}) or {}).get("price")
+                    _ap = None
+                    if r["add_qty"]:
+                        _ap = (_recon.implied_add_price(r["log_qty"], r["log_avg"],
+                                                        r["broker_qty"], r["broker_avg"])
+                               if r["status"] == _recon.QTY else r["broker_avg"])
+                    _ntr = len(r["trades"])
+                    if r["status"] == _recon.OFFSET:
+                        _npair = len(r["offsets"])
+                        _act = (f"Close the earlier trade{'s' if _npair != 1 else ''} with the later "
+                                f"opposite one{'s' if _npair != 1 else ''} at "
+                                + ", ".join(f"{fmt_qty(o['qty'])} @ {fmt_price(o['price'])}"
+                                            for o in r["offsets"]))
+                    elif r["status"] == _recon.MISSING:
+                        _act = f"Add {_rc_side(r['add_qty'])} {fmt_qty(abs(r['add_qty']))}"
+                    elif r["status"] == _recon.EXTRA:
+                        _act = f"Close all {fmt_qty(r['close_qty'])} ({_ntr} trade{'s' if _ntr != 1 else ''})"
+                    elif r["status"] == _recon.FLIPPED:
+                        _act = (f"Close {_rc_side(r['log_qty'])} {fmt_qty(r['close_qty'])}, "
+                                f"add {_rc_side(r['add_qty'])} {fmt_qty(abs(r['add_qty']))}")
+                    elif r["close_qty"]:
+                        _act = f"Close {fmt_qty(r['close_qty'])} (oldest first)"
+                    else:
+                        _act = f"Add {fmt_qty(abs(r['add_qty']))} to trade ID {int(r['trades'][-1]['id'])}"
+                    _rc_ed_rows.append({
+                        "#": i, "Apply": True,
+                        "Status": _recon.STATUS_LABEL[r["status"]],
+                        "Contract": r["contract"],
+                        "Log": _rc_q(r["log_qty"]), "Broker": _rc_q(r["broker_qty"]),
+                        "Change": _act,
+                        "Exit Price": round(float(_cp), 4) if _cp is not None else None,
+                        "Entry Price": round(float(_ap), 4) if _ap is not None else None,
+                        "Date": _cd,
+                    })
+                st.markdown("##### Changes to make the log match")
+                st.caption(
+                    "Prices are USD per share (per contract unit for options). **Exit Price** "
+                    "is needed where something is closed, **Entry Price** where something is "
+                    "added. The broker doesn't report when a missing position was opened, so "
+                    "**Date** defaults to today — change it if you know better. 🔀 rows need "
+                    "neither: the later trade was the fill that closed the earlier one, so its "
+                    "own price and date become the exit. Untick a row to leave it alone."
+                )
+                # Keyed on what's being reconciled so a new fetch, another account
+                # or a changed log builds a fresh table instead of keeping edits
+                # typed against different rows.
+                _rc_sig = hash((_rcb["id"], _rc_lacct, tuple(
+                    (r["key"], r["log_qty"], r["broker_qty"]) for r in _rc_diff)))
+                _rc_ed = st.data_editor(
+                    pd.DataFrame(_rc_ed_rows), key=f"rc_editor_{_rc_sig}",
+                    hide_index=True, width="stretch",
+                    disabled=["#", "Status", "Contract", "Log", "Broker", "Change"],
+                    column_config={
+                        "#": None,
+                        "Apply": st.column_config.CheckboxColumn(width="small"),
+                        "Exit Price": st.column_config.NumberColumn(min_value=0.0, format="%.4f"),
+                        "Entry Price": st.column_config.NumberColumn(min_value=0.0, format="%.4f"),
+                        "Date": st.column_config.DateColumn(),
+                    },
+                )
+                _rc_sel = [(int(e["#"]), e) for _, e in _rc_ed.iterrows() if e["Apply"]]
+                if st.button(f"✅  Apply {len(_rc_sel)} change(s)", type="primary",
+                             key="rc_apply", disabled=not _rc_sel):
+                    _rc_problems = []
+                    for i, e in _rc_sel:
+                        r = _rc_diff[i]
+                        if r["close_qty"] and pd.isna(e["Exit Price"]):
+                            _rc_problems.append(f"{r['contract']}: needs an exit price")
+                        if r["add_qty"] and pd.isna(e["Entry Price"]):
+                            _rc_problems.append(f"{r['contract']}: needs an entry price")
+                    if _rc_problems:
+                        st.warning("\n".join(f"• {p}" for p in _rc_problems))
+                    else:
+                        _note = f"Reconciled to {_rcb['label']} on {_rc_today.isoformat()}"
+                        _done, _errs = 0, []
+                        for i, e in _rc_sel:
+                            r = _rc_diff[i]
+                            _d = pd.Timestamp(e["Date"]).date() if not pd.isna(e["Date"]) else _rc_today
+                            try:
+                                for _o in r.get("offsets") or []:
+                                    apply_offset_pair(_o["open_id"], _o["close_id"], _o["qty"], _note)
+                                if r["close_qty"]:
+                                    _xp = float(e["Exit Price"])
+                                    for _tid, _q, _held in _recon.plan_closes(r["trades"], r["close_qty"]):
+                                        _t = next(t for t in r["trades"] if int(t["id"]) == _tid)
+                                        _ccy = trade_currency(_t)
+                                        _fx = get_fx_rate_at_date(_ccy, str(_d)) if _ccy != "USD" else 1.0
+                                        if _q >= _held - _recon.QTY_TOL:
+                                            close_open_trade(_tid, _d, _xp, fx_rate_exit=_fx, add_note=_note)
+                                        else:
+                                            partial_exit_trade(_tid, _q, _xp, _d, fx_rate_exit=_fx)
+                                if r["add_qty"]:
+                                    _np = float(e["Entry Price"])
+                                    if r["status"] == _recon.QTY:
+                                        update_position(int(r["trades"][-1]["id"]), abs(r["add_qty"]),
+                                                        _np, _d.isoformat())
+                                    else:
+                                        _inst, _tkr, _exp, _k, _cpt = r["key"]
+                                        add_trade(
+                                            _d, _tkr, abs(r["add_qty"]), _np, None, None,
+                                            _note + " — added because the broker holds it.",
+                                            False, None, [],
+                                            instrument_type=_inst, expiration=_exp or None,
+                                            strike=_k, option_type=_cpt or None,
+                                            multiplier=r["multiplier"], side=_rc_side(r["add_qty"]),
+                                            account_name=_rc_lacct if _rc_lacct != _RC_ALL else "Default",
+                                        )
+                                _done += 1
+                            except Exception as _ex:
+                                _errs.append(f"{r['contract']}: {_ex}")
+                        st.session_state["_rc_applied"] = {"done": _done, "errors": _errs}
+                        st.rerun()
 
     # ── Find Duplicate Imports ─────────────────────────────────────────────────
     st.divider()

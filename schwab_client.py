@@ -341,6 +341,61 @@ def get_account_summary(app_key: str, secret: str,
         return {}, f"Could not read account balances: {e}"
 
 
+def get_positions(app_key: str, secret: str,
+                  account_hash: str) -> tuple[list[dict], str]:
+    """Return (positions, error) for one account, normalised for reconcile.py.
+
+    Each position: instrument_type, ticker, expiration, strike, option_type,
+    quantity (signed: short is negative), avg_price, multiplier, description.
+    Cash sweep / money-market lines are left out — they're not trades.
+    """
+    import reconcile as _rc
+    data, err = _api_get(f"/trader/v1/accounts/{account_hash}", app_key, secret,
+                         {"fields": "positions"})
+    if err:
+        return [], err
+    sa = data.get("securitiesAccount", {}) if isinstance(data, dict) else {}
+    out: list[dict] = []
+    for p in sa.get("positions", []) or []:
+        try:
+            inst = p.get("instrument", {}) or {}
+            atype = (inst.get("assetType") or "").upper()
+            if atype == "CASH_EQUIVALENT":
+                continue
+            qty = float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0)
+            if qty == 0:
+                continue
+            if atype == "OPTION":
+                parsed = _rc.parse_symbol(inst.get("symbol", ""))
+                if parsed["instrument_type"] != "option":   # unexpected symbol shape
+                    parsed = {
+                        "instrument_type": "option",
+                        "ticker": (inst.get("underlyingSymbol") or "").upper(),
+                        "expiration": None, "strike": None,
+                        "option_type": (inst.get("putCall") or "").lower() or None,
+                    }
+                mult = 100.0
+            else:
+                parsed = {"instrument_type": _SECURITY_ASSET_TYPES.get(atype, "stock"),
+                          "ticker": (inst.get("symbol") or "").upper(),
+                          "expiration": None, "strike": None, "option_type": None}
+                mult = 1.0
+            avg = p.get("averageLongPrice") if qty > 0 else p.get("averageShortPrice")
+            if avg is None:
+                avg = p.get("averagePrice")
+            parsed.update({
+                "quantity":    qty,
+                "avg_price":   float(avg) if avg is not None else None,
+                "multiplier":  mult,
+                "description": inst.get("description") or inst.get("symbol") or "",
+                "account":     "",
+            })
+            out.append(parsed)
+        except Exception:
+            continue
+    return out, ""
+
+
 def _iso_z(d, end_of_day: bool = False) -> str:
     """Format a date/ISO string as Schwab's required yyyy-MM-dd'T'HH:mm:ss.SSSZ."""
     s = str(d)[:10]

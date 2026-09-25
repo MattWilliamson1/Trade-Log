@@ -156,6 +156,50 @@ class IBClient:
                     pass
         return result
 
+    # ── Positions ──────────────────────────────────────────────────────────────
+
+    def get_positions(self) -> list[dict]:
+        """Every open position across the logged-in accounts, normalised for
+        reconcile.py (signed quantity, per-share/per-contract-unit avg price)."""
+        if not self._ib:
+            return []
+        out: list[dict] = []
+        for pos in self._ib.positions():
+            con = pos.contract
+            try:
+                if _is_bag_contract(con) or con.secType in ("CASH", "CMDTY"):
+                    continue
+                qty = float(pos.position)
+                if qty == 0:
+                    continue
+                itype = _contract_type(con)
+                mult = float(con.multiplier) if con.multiplier else (100.0 if itype == "option" else 1.0)
+                # IB's avgCost for derivatives already includes the multiplier.
+                avg = float(pos.avgCost) / (mult if itype in ("option", "future") else 1.0)
+                exp = con.lastTradeDateOrContractMonth or None
+                # A corporate action (odd-lot tender, rights, etc.) parks shares
+                # in a temporary contract on the CORPACT exchange named after
+                # the stock with a suffix — AC → "AC.ODD". They're still that
+                # stock as far as the log is concerned.
+                sym = con.symbol
+                if (con.exchange or "").upper() == "CORPACT" and "." in sym:
+                    sym = sym.split(".", 1)[0]
+                out.append({
+                    "account":         pos.account,
+                    "instrument_type": itype,
+                    "ticker":          sym,
+                    "expiration":      exp if itype in ("option", "future") else None,
+                    "strike":          float(con.strike) if itype == "option" else None,
+                    "option_type":     ("call" if con.right == "C" else "put") if itype == "option" else None,
+                    "quantity":        qty,
+                    "avg_price":       avg,
+                    "multiplier":      mult,
+                    "description":     con.localSymbol or con.symbol,
+                })
+            except Exception:
+                continue
+        return out
+
     # ── Trade executions ───────────────────────────────────────────────────────
 
     def get_executions(self, start_date: str) -> tuple[list[dict], list[str]]:
@@ -949,6 +993,15 @@ def parse_ib_executions_to_trades(executions: list[dict]) -> list[dict]:
             # No BOT fills to consume — treat the SLD fills as a short-open position
             sld_qty, sld_avg = _wagg(sld_fills)
             trades.append(_trade_base("short", sld_qty, sld_avg, sld_fills, len(sld_fills)))
+
+        # The raw fills ride along so the importer can replay them in order
+        # against what the log already holds: a sell here may be the close of
+        # a long opened on an earlier day, which this session can't see.
+        trades[-1]["_fills"] = [
+            {"time": f["time"], "date": f["date"], "side": f["side"],
+             "quantity": f["quantity"], "price": f["price"], "exec_id": f.get("exec_id")}
+            for f in fills
+        ]
 
     # ── Assign leg labels for multi-leg option groups ─────────────────────────
     grp_indices: dict[str, list[int]] = defaultdict(list)

@@ -54,3 +54,16 @@ Dates stored as ISO 8601 strings (`YYYY-MM-DD`). All price/quantity values store
 ## Adding schema changes
 
 Add new columns to the `MIGRATIONS` list in `db.py` — never alter `SCHEMA` for existing columns. The migration runner checks `PRAGMA table_info` before each `ALTER TABLE`, so it's safe to run repeatedly.
+
+## Releasing a version
+
+Users get updates when `VERSION` changes on `main` (the in-app updater compares it with GitHub). Every push that bumps `VERSION` must, **in the same commit**, add a section to the top of `CHANGELOG.md`:
+
+```
+## 2026-09-24.1
+- One bullet per user-visible change, written for the trader, not the code
+```
+
+CI (`python updater.py check-changelog`) fails the build when `VERSION` has no section with at least one bullet. The update prompt in the sidebar shows every section between the installed and the new version, and the GitHub release page shows the new version's bullets.
+
+A new module must go in `SOURCE_FILES` in `updater.py` and in both build scripts, or existing installs won't receive it.

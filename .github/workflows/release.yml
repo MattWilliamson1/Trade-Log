@@ -34,7 +34,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile app.py db.py ib_client.py
+        run: python -m py_compile app.py db.py ib_client.py schwab_client.py fidelity_client.py csv_smart.py reconcile.py updater.py
+
+      # Every version that ships must say what changed. The in-app update prompt
+      # and the release page both read this entry, so a bump without one fails.
+      - name: Changelog has an entry for VERSION
+        run: python updater.py check-changelog
 
       - name: Smoke-test library imports
         run: python -c "import streamlit, pandas, numpy, plotly, yfinance, openpyxl, PIL, ib_insync, nest_asyncio; print('All imports OK')"
@@ -121,6 +126,9 @@ jobs:
         id: ver
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
+      - name: Write release notes
+        run: python updater.py release-notes > release_notes.md
+
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -154,19 +162,7 @@ jobs:
         with:
           tag_name: latest
           name: "Trade Log — Latest (v${{ steps.ver.outputs.version }})"
-          body: |
-            ## Latest build — v${{ steps.ver.outputs.version }}
-
-            ### Windows
-            **Download the zip below**, extract it, and double-click
-            `INSTALL - Double-Click This First.bat`.
-
-            ### Mac
-            **Download the `.tar.gz` below**, double-click it to extract,
-            open the `Trade Log Mac` folder, and double-click `Trade Log.app`.
-            If macOS shows a security warning, right-click the app → Open → Open.
-
-            > This release is updated automatically every time an update is pushed.
+          body_path: release_notes.md
           files: |
             dist/windows/*.zip
             dist/mac/*.tar.gz
