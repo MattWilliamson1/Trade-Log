@@ -94,7 +94,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     name TEXT UNIQUE NOT NULL
 );
 
-INSERT OR IGNORE INTO accounts (name) VALUES ('Default');
+-- Not INSERT OR IGNORE: an ignored insert still advances the AUTOINCREMENT
+-- counter, so every startup would rewrite the file and look like an edit.
+INSERT INTO accounts (name) SELECT 'Default'
+ WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE name = 'Default');
 
 CREATE TABLE IF NOT EXISTS equity_entries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,

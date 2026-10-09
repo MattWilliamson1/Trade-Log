@@ -34,12 +34,15 @@ Two-file app: `db.py` handles all persistence, `app.py` is the entire UI.
 
 **`app.py`**
 - Single-file Streamlit app. Execution flows top-to-bottom on every user interaction (Streamlit's model).
-- Sidebar: tag management (add/delete tags used to categorize trades).
-- Main area: Add Trade form → trade table → Edit Trade expander → Delete Trade expander.
-- `euro_dates` toggle in sidebar controls date display format (MM/DD/YYYY vs DD/MM/YYYY) for the whole page via `fmt_date()`.
-- Trade table is read-only (`st.dataframe`); editing is done via the separate Edit Trade expander with a selectbox to pick a trade by ticker + date + ID.
+- Five pages (`_PAGES`): 📋 Journal, 📝 Plan, 📊 Performance, 🔗 Data, ⚙️ Settings. Every page but the Journal has sections (`_SUBPAGES`), picked from a segmented bar drawn once by `_render_subnav()`; the result is the global `_sub`. Page code is a series of independent `if page == …` / `if _sub == …` blocks — only the chosen section runs, which is why sections aren't `st.tabs` (tabs run every tab's code on each rerun).
+- Navigate in code with `_goto(page, sub)`: it queues the move (`_nav_pending`) and reruns, because the section bar is a widget whose state can't be written after it's drawn. `_LEGACY_PAGES` maps the nine pre-consolidation page names onto their new homes.
+- One block can feed several sections: the equity-curve block serves Performance → Equity Curve, Data → Balances and Data → File Import; the Broker Sync block is Data → Brokers + Data → Data Health.
+- Journal: top bar (ticker lookup · ➕ New Trade · 📥 Import) → filters → trade table → action bar → Spread Summaries. ➕ New Trade opens the add-trade form in an `st.dialog` (`_new_trade_dialog`, re-drawn each run while `_show_add_trade` is set).
+- The Journal action bar (`jr_action`: Edit, Add/Exit Lots, Dividend, Roll, Close/Stops, Spread, Tag, Chart, Delete) acts on the table selection, held in `_bulk_sel_ids` (in Group-by-ticker view: the trades under the selected position). Each tool keeps its own trade picker; `_jr_sync_pick()` points it at the selection once per new selection and must run before the picker (and its search box) is drawn.
+- Date display format (US / Euro / ISO) is a Settings → Display choice, applied everywhere through `fmt_date()`.
+- Trade table is read-only (`st.dataframe`); editing is done through the action bar's ✏️ Edit form.
 - Stop loss has two values: `opening_stop` (set at entry, never edited) and `current_stop` (editable, defaults to opening stop).
-- Ctrl+Enter form submission is implemented via injected JS (`components.html(height=0)`), which intercepts keydown events on the parent document.
+- Ctrl+Enter form submission is implemented via injected JS, which intercepts keydown events on the parent document and clicks the first visible submit button — inside an open dialog if there is one.
 
 ## Schema
 

@@ -34,7 +34,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile app.py db.py ib_client.py schwab_client.py fidelity_client.py csv_smart.py reconcile.py updater.py
+        run: python -m py_compile app.py db.py ib_client.py schwab_client.py fidelity_client.py csv_smart.py reconcile.py cloud_sync.py updater.py
 
       # Every version that ships must say what changed. The in-app update prompt
       # and the release page both read this entry, so a bump without one fails.

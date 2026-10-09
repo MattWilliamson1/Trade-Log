@@ -98,7 +98,7 @@ TRADING LOG:
   Click "Add Trade" and fill in the fields.
   Green fields are required. Others are recommended.
   You can also import trades from a CSV file
-  (see the sample tradeImport.csv in the folder).
+  (use "Download CSV template" on the Trade Log headers tab).
 
 ════════════════════════════════════════════════════════════
   NEED HELP?

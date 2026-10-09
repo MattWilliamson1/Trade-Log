@@ -260,6 +260,7 @@ SOURCE_FILES = [
     "fidelity_client.py",
     "csv_smart.py",
     "reconcile.py",
+    "cloud_sync.py",
     "updater.py",
     "launch.py",
     "requirements.txt",

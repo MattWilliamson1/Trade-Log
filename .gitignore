@@ -44,6 +44,9 @@ desktop.ini
 .env.local
 .streamlit/secrets.toml
 schwab_token.json
+gdrive_token.json
+cloud_sync.json
+cloud_sync.tmp
 
 # Trade Log launcher restart sentinel
 .restart_requested

@@ -6,6 +6,15 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-10-08
+- Five pages instead of nine: Journal, Plan, Performance, Data and Settings, each with its own sections picked from a bar at the top. New Trade opens in a pop-up, and an action bar under the trade table (Edit, Lots, Dividend, Roll, Close/Stops, Spread, Tag, Chart, Delete) works on the rows you select
+- Cloud Sync (Settings → Data & Sync): keep your trade log in a Dropbox, OneDrive, iCloud or Google Drive folder so it follows you between computers. It warns before overwriting changes made on both sides, and when the log is open on another computer
+- Schwab and Fidelity imports now show what happened after you click Import: trades imported, open trades closed, duplicates skipped, and why any trade wasn't imported. Before, the page reloaded and the result vanished, so it looked like nothing happened
+- A Schwab sale whose buy is before the fetch's From date now says so and tells you to fetch from an earlier date
+- Schwab trades are filed under the name you gave the account in Name these accounts, instead of Default
+- Schwab authorization: login codes pasted with extra spaces, line breaks or quotes, or as a bare code, now work. A failed attempt clears the box, since a code works only once, and the 'Authorization code is invalid, expired or revoked' error now explains the 30-second limit
+- Opening the app no longer marks the database as changed when nothing was edited
+
 ## 2026-09-24.1
 - Time-weighted return no longer spikes when money is withdrawn: withdrawals now count from the end of the period and deposits from the start, so draining an account can't shrink the base to almost nothing (it used to show +1,870% and then stick at -100%). Periods with under $1 invested count as flat
 - Manual Entry table on the Equity Curve page shows each entry's period return

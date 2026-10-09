@@ -12,14 +12,11 @@ A personal trading journal and portfolio tracker built with Python and Streamlit
 4. [Running the App](#running-the-app)
 5. [First-Time Setup](#first-time-setup)
 6. [Page-by-Page Guide](#page-by-page-guide)
-   - [Trading Log](#-trading-log)
-   - [Trading Plan](#-trading-plan)
-   - [Statistics](#-statistics)
-   - [Equity Curve](#-equity-curve)
-   - [Trading Tools](#-trading-tools)
-   - [Tags](#-tags)
-   - [Broker Sync — Interactive Brokers Setup](#-broker-sync)
-   - [Settings](#-settings)
+   - [Journal](#-journal)
+   - [Plan](#-plan) — Trading Plan, Calculators, Allocation Plan
+   - [Performance](#-performance) — Summary, Equity Curve, Breakdown, Benchmarks
+   - [Data](#-data) — Brokers (Interactive Brokers setup), File Import, Balances, Data Health
+   - [Settings](#-settings) — Display, Trading, Tags, Alerts, Data & Sync, Help
 7. [Email Alerts for Earnings — Step-by-Step](#email-alerts-for-earnings)
 8. [IB Flex Query Setup — Step-by-Step](#ib-flex-query-setup)
 9. [Troubleshooting](#troubleshooting)
@@ -97,8 +94,8 @@ The app opens automatically in your web browser at `http://localhost:8502`. Leav
 
 When you first open the app, do the following in order:
 
-1. **Set your account balance** → go to ⚙️ Settings → Account & Equity → enter your current account value → Save.
-2. **Choose Demo or Live Mode** → ⚙️ Settings → App Mode section. Start in **Demo Mode** until you are comfortable, then switch to Live.
+1. **Set your account balance** → go to ⚙️ Settings → 💼 Trading → Account & Equity → enter your current account value → Save.
+2. **Choose Demo or Live Mode** → ⚙️ Settings → ☁️ Data & Sync → App Mode section. Start in **Demo Mode** until you are comfortable, then switch to Live.
 3. **Configure email alerts (optional but recommended)** → see [Email Alerts for Earnings](#email-alerts-for-earnings) below.
 4. **Connect Interactive Brokers (optional)** → see [IB Flex Query Setup](#ib-flex-query-setup) below.
 
@@ -106,17 +103,23 @@ When you first open the app, do the following in order:
 
 ## Page-by-Page Guide
 
+The sidebar has five pages: **📋 Journal**, **📝 Plan**, **📊 Performance**, **🔗 Data** and **⚙️ Settings**. Every page except the Journal is split into sections, which you pick from the bar at the top of the page. The app remembers the last section you used on each page.
+
+Below the page buttons, the sidebar also has **📄 EXPORT FOR REVIEW**, **⚡ REFRESH LIVE PRICES**, the cloud-sync status, and a small **v&lt;version&gt; · Updates** popover with a **Check for updates** button. When an update is available, a large **INSTALL UPDATE** banner appears in the sidebar. The list of what changed in each version is in ⚙️ Settings → ❓ Help.
+
 ---
 
-### 📋 Trading Log
+### 📋 Journal
 
 This is the main page. It shows all your trades in a table and lets you add, edit, and delete them.
+
+The bar at the top of the page has three parts: **🔍 Ticker Lookup**, **➕ New Trade**, and **📥 Import** (which takes you to 🔗 Data → 📥 File Import).
 
 #### Ticker Lookup
 Type any stock symbol in the search box at the top to instantly see the company name and exchange. Useful for confirming you have the right symbol before logging a trade.
 
 #### Adding a Trade
-Click **➕ Add Trade** to expand the entry form.
+Click **➕ New Trade** to open the entry form in a pop-up window.
 
 1. **Instrument Type** — choose Stock, Option, or Future at the top. For options and futures you can add multiple legs at once using the "Legs" counter.
 2. **Ticker / Underlying** — type the symbol. A live price appears automatically so you can double-check before entering.
@@ -125,16 +128,18 @@ Click **➕ Add Trade** to expand the entry form.
 5. **Stop Loss** — enter a stop price. The "Opening Stop" is locked in at entry and never changes; the "Current Stop" can be updated as the trade develops.
 6. **Tags** — assign one or more tags to categorise the trade (e.g. "Earnings Play", "Swing", "Sector Rotation").
 7. **Notes / Chart Notes** — free-text fields. Notes appears in the table; Chart Notes is separate for your chart markups.
-8. Press **Ctrl+Enter** or click **Add Trade** to save.
+8. Press **Ctrl+Enter** or click **Save and Log Trade** to save.
 
 #### The Trade Table
-The table shows all your trades. You can customise which columns appear using the **Columns** multiselect above the table.
+The table shows all your trades.
 
-- **Column presets** — choose "Stocks" or "Options" for a sensible default set of columns.
 - **Filters** — filter by Status (Open / Closed), Instrument type, Ticker, Tags, Side, and Date range.
+- **⚙️ Columns** — the popover above the table controls which columns appear. Use the presets (**Stock**, **Options**, **Default**) for a sensible set of columns, reorder or hide columns in the column order list with ↑ / ↓ / ✕, and click **📌 Set current view as my default** to keep your layout.
+- **Group by ticker** — toggle this to combine open positions into one row per ticker. Selecting a position in this view makes the actions below the table apply to all of that position's trades.
 - **Sorting** — click any column header to sort.
+- **Selecting rows** — tick rows in the table to choose which trades the action bar works on. **☑ Select All** selects every visible row and **✕ Clear** clears the selection.
 - **Live Price** — click **⚡ REFRESH LIVE PRICES** in the sidebar to fetch current prices. Prices do not auto-refresh to avoid rate limits.
-- **Color coding** — rows or text can be colored green/red based on whether a position is in profit or loss. Configure this in ⚙️ Settings.
+- **Color coding** — rows or text can be colored green/red based on whether a position is in profit or loss. Configure this in ⚙️ Settings → 🎨 Display.
 
 **Key columns explained:**
 | Column | What it shows |
@@ -148,36 +153,44 @@ The table shows all your trades. You can customise which columns appear using th
 | Ann. Return % | Annualised % return based on days held |
 | Earnings | Next earnings date for the underlying (auto-fetched from Yahoo Finance) |
 
-#### Spread Summaries (Options)
-When you have option trades that share the same underlying and expiration, the app automatically groups them as a spread and shows a **Spread Summaries** section below the main table. This displays combined P&L, net delta, net theta, and DTE across all legs. Click a spread to expand the detail view.
+#### The Action Bar
+Under the table is a bar of actions. Select one or more rows in the table, then pick an action. Click the active action again to close it. Each tool also has its own trade picker, which jumps to the row you selected automatically, so you can switch to a different trade from inside the tool. **📥 Export CSV** beside the bar downloads the filtered trades as a CSV file.
+
+| Action | What it does |
+|---|---|
+| ✏️ Edit | The full edit form for the selected trade, including attachments |
+| 🔄 Add / Exit Lots | Add to a position, exit in pieces, and view tax lots |
+| 💵 Dividend | Record a dividend adjustment against a position |
+| 🔁 Roll | Roll an option position to a new strike or expiration |
+| 📌 Close / Stops | Close one or several open positions (including whole spreads) and update stops. When rows are selected, only those open positions are shown |
+| 🔗 Spread | Group the selected legs into a spread, or ungroup them |
+| 🏷️ Tag | Apply tags to the selected trades, or to all filtered trades if none are selected |
+| 📊 Chart | A price chart of the trade, with its chart notes |
+| 🗑️ Delete | Delete the selected trades, or all filtered trades if none are selected. You are asked to confirm first. This is permanent |
 
 #### Editing a Trade
-Scroll down to the **✏️ Edit Trade** expander. Select the trade you want to edit from the dropdown, make your changes, and click **Save Changes**.
+Select the trade in the table and choose **✏️ Edit** in the action bar. Make your changes and click **Save Changes**.
 
 - You can update the exit date/price to close a trade.
 - Earnings date can be manually overridden if the auto-fetched date is wrong.
 - For options, you can update the strike, expiration, multiplier, and underlying price at entry.
 
-#### Deleting a Trade
-Use the **🗑️ Delete Trade** expander. Select the trade and confirm deletion. This is permanent.
-
 #### Attachments
-Each trade has an attachments section in the Edit panel. Attach chart screenshots, trade plans, or any files you want to associate with the trade.
+Each trade has an attachments section in the ✏️ Edit panel. Attach chart screenshots, trade plans, or any files you want to associate with the trade.
+
+#### Spread Summaries (Options)
+When you have option trades that share the same underlying and expiration, the app automatically groups them as a spread and shows a **Spread Summaries** section below the main table. This displays combined P&L, net delta, net theta, and DTE across all legs. Click a spread to expand the detail view.
 
 #### Importing Trades
-Use the **📥 Import** tab to bulk-import trades from a CSV file or directly from Interactive Brokers via Flex Query. **📁 Import from CSV** has two tabs:
-
-**Trade Log headers** — the strict path. Your file needs the exact columns `Entry Date`, `Ticker`, `Q`, `Entry Price`, and optionally `Tags`, `Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`. See `tradeImport.csv` for an example.
-
-**✨ Any CSV · Beta** — drop in whatever you have. It decodes the file, works out the separator, skips any title block above the headers, and then matches your columns to Trade Log's fields two ways: by name (`Trade Date`, `Shares`, `Cost Per Share` and a few hundred other spellings) and by *content* — a column of parseable dates is a date column whatever its header says, and a column of BUY/SELL is an action column even when it's headed "Type". It also spots when your file has one row per **fill** rather than one per trade, and pairs buys against sells FIFO into round trips.
-
-It shows you the mapping it came up with, with a confidence mark against each field, and every field is a dropdown you can correct. Nothing is written until you press Import, and the preview lets you untick individual trades. Tick **Remember this mapping** and the next export with the same headers maps itself.
-
-It's beta: it guesses, and guesses can be wrong. Read the mapping before you import. If it can't find a required field it says so rather than importing something wrong, and the strict tab is always there as a fallback.
+Click **📥 Import** at the top of the Journal to go to 🔗 Data → 📥 File Import. See [File Import](#-file-import) below. To import directly from a broker, use 🔗 Data → 🔌 Brokers.
 
 ---
 
-### 📝 Trading Plan
+### 📝 Plan
+
+Sections: **📝 Trading Plan**, **🧮 Calculators**, **🗂️ Allocation Plan**.
+
+#### 📝 Trading Plan
 
 A structured template for planning a trade before you take it. Fill in:
 
@@ -187,30 +200,62 @@ A structured template for planning a trade before you take it. Fill in:
 - **Hold Time** — your expected holding period
 - **Entry Signal and Confirmation criteria**
 - **Entry Price, Profit Target, Stop Loss** — the app calculates your Risk/Reward ratio automatically
+- **Risk per trade (% of account)** — under *5 · Levels & Risk / Reward*. Shows the position size implied by the plan's entry and stop and the account balance from ⚙️ Settings → 💼 Trading
 - **Attachments** — attach chart images to the plan
 
 Saved plans are listed below the form. You can review, delete, or use them as a reference after you enter the trade.
 
+#### 🧮 Calculators
+
+A set of calculators that do not require any saved data.
+
+**Risk / Reward Calculator**
+Enter an entry, stop, and target price to see the risk, the reward, and the R:R ratio.
+
+**ATR Calculator**
+Calculates the Average True Range for any ticker over a chosen lookback period. The result auto-fills into the Stop Calculator if you use ATR-based stops.
+
+**Stop Calculator**
+Calculates a stop price from an entry price. Two modes:
+- **% Stop** — enter your stop percentage, get the stop price and dollar distance
+- **ATR Stop** — enter (or use the auto-filled) ATR and a multiplier (e.g. 1.5× ATR). The stop price auto-fills into the position size and share count calculators.
+
+**Position Size — Risk Based**
+Answers: *"Given my maximum acceptable loss, how many shares can I buy?"*
+- Enter account size, maximum loss ($ or % of account), entry price, and stop price
+- Returns: number of shares, dollar risk, position value, and % of account
+
+**Share Count — Allocation Based**
+Answers: *"If I allocate X% of my account, how many shares is that?"*
+- Enter account size, allocation amount ($ or % of portfolio), and entry price
+- Optionally enter a stop price to see the dollar risk and risk % that allocation implies
+
+#### 🗂️ Allocation Plan
+
+The Portfolio Allocation Plan, for planning how your account is split across positions.
+
 ---
 
-### 📊 Statistics
+### 📊 Performance
 
-A performance dashboard for your closed (and optionally open) trades.
+Sections: **📊 Summary**, **📈 Equity Curve**, **🧩 Breakdown**, **🏁 Benchmarks**.
 
-#### Filters
-At the top, filter by:
+#### Filters and Display Options
+The filters appear above 📊 Summary, 🧩 Breakdown and 🏁 Benchmarks, and apply to all three. Filter by:
 - **Instrument** — All, Stocks, Options, or Futures
 - **Ticker** — narrow to specific symbols
 - **Status** — Closed only (default), All, or Open only
 - **Tags** — filter to trades with specific tags
 - **Date range** — use the quick buttons (YTD, MTD, 30 Days, 7 Days, All Time) or set a custom range
 
-#### Display Options
+Display options:
 - **% Returns** — toggle to show all return metrics as percentages rather than dollar amounts
 - **Mean Method** — choose between simple Mean or 10% Trimmed Mean (trims outlier trades for a more representative average)
 - **Net of Commission** — toggle to subtract commissions from all P&L calculations
 
-#### What's Shown
+#### 📊 Summary
+
+A performance dashboard for your closed (and optionally open) trades: Total Return, Performance, Expected Value, charts, and Risk-Adjusted Returns.
 
 **Summary metrics:** Total trades, win rate, gross P&L, net P&L after commission, average win, average loss, profit factor (gross wins ÷ gross losses), Sharpe ratio, Sortino ratio, and max drawdown.
 
@@ -219,15 +264,11 @@ At the top, filter by:
 - Win/Loss distribution histogram
 - Cumulative P&L curve
 - Best and worst trades
-- Performance breakdown by tag
 
----
+#### 📈 Equity Curve
 
-### 📈 Equity Curve
+Tracks your account balance over time and plots it as a chart. Requires you to enter or import daily ending balances — see [💰 Balances](#-balances) and [📥 File Import](#-file-import) under 🔗 Data.
 
-Tracks your account balance over time and plots it as a chart. Requires you to enter or import daily ending balances.
-
-#### Chart Tab
 - **View toggle** — switch between **% Return (TWR)** (default) and **Balance ($)**
 - **TWR (Time-Weighted Return)** — the % return strips out the effect of deposits and withdrawals, showing your actual investment performance
 - **Benchmarks** — overlay SPY, QQQ, IWM, LQD, or JNK for comparison. In TWR mode, benchmarks are also shown as % return from the same start date
@@ -239,79 +280,36 @@ Tracks your account balance over time and plots it as a chart. Requires you to e
 - Net Contributions (total deposits minus withdrawals)
 - Max Drawdown (largest peak-to-trough drop in the TWR series)
 
-#### Manual Entry Tab
-Add a single day's balance manually. Enter the date, end-of-day balance, any contributions (deposits) that day, and any withdrawals. This is all you need for the basic equity curve.
+#### 🧩 Breakdown
 
-#### Import Tab
-Bulk-import balance history from a CSV file. Useful if you have historical data in a spreadsheet. Required columns: `date`, `balance`. Optional: `contributions`, `withdrawals`.
+Performance broken down by sector (chart) and by tag (**Tag Comparison**).
 
-#### IB Flex Import Tab
-Import your complete balance history directly from Interactive Brokers. This is the most accurate and convenient method. See [IB Flex Query Setup](#ib-flex-query-setup) for how to configure this. Once set up:
-1. Select the date range you want to import
-2. Click **📥 Fetch Balance History**
-3. Review the preview table
-4. Click **✅ Import** to save to the database
-5. The chart may take a moment to populate after importing
+#### 🏁 Benchmarks
+
+A rolling Sharpe / Sortino chart compared with SPY / QQQ, and the **Benchmark Comparison** table (SPY / QQQ / IWM / LQD / JNK).
 
 ---
 
-### 🛠️ Trading Tools
+### 🔗 Data
 
-A set of calculators that do not require any saved data.
+Sections: **🔌 Brokers**, **📥 File Import**, **💰 Balances**, **🩺 Data Health**.
 
-#### ATR Calculator
-Calculates the Average True Range for any ticker over a chosen lookback period. The result auto-fills into the Stop Calculator below if you use ATR-based stops.
+#### 🔌 Brokers
 
-#### Stop Calculator
-Calculates a stop price from an entry price. Two modes:
-- **% Stop** — enter your stop percentage, get the stop price and dollar distance
-- **ATR Stop** — enter (or use the auto-filled) ATR and a multiplier (e.g. 1.5× ATR). The stop price auto-fills into the Share Count calculators below.
+Connects the app to your broker for live prices, account balance sync, and trade import. Pick your broker at the top (Interactive Brokers, Schwab, or Fidelity). Schwab and Fidelity each have their own setup steps on the page.
 
-#### Share Count — Max Loss Based
-Answers: *"Given my maximum acceptable loss, how many shares can I buy?"*
-- Enter account size, maximum loss ($ or % of account), entry price, and stop price
-- Returns: number of shares, dollar risk, position value, and % of account
-
-#### Share Count — Allocation Based
-Answers: *"If I allocate X% of my account, how many shares is that?"*
-- Enter account size, allocation amount ($ or % of portfolio), and entry price
-- Optionally enter a stop price to see the dollar risk and risk % that allocation implies
-
-#### R-Multiple Calculator
-Converts P&L into R-multiples (units of initial risk). Enter your initial risk ($ per share) and the trade P&L to see how many R the trade returned. Useful for measuring trade quality independent of position size.
-
-#### Break-Even Calculator
-For options traders — enter the premium paid, strike price, and option type (call/put) to calculate the break-even price at expiration.
-
----
-
-### 🏷️ Tags
-
-Manage the tags used to categorise trades. Tags let you filter and group trades in the Trading Log and Statistics pages.
-
-- **Add a tag** — enter a name and optional description, click Add
-- **Delete a tag** — click the delete button next to any tag. This removes the tag from all trades that use it
-
-Examples of useful tags: `Earnings Play`, `Breakout`, `Mean Reversion`, `Swing`, `Options Income`, `High Conviction`, `Speculative`
-
----
-
-### 🔗 Broker Sync
-
-Connects the app to Interactive Brokers for live prices, account balance sync, and trade import.
-
-There are two independent connection methods. You do not need both — most users only need the Flex Query method.
+For Interactive Brokers there are two independent connection methods. You do not need both — most users only need the Flex Query method.
 
 | Method | What it does | Requires |
 |---|---|---|
 | **TWS / Gateway (Live)** | Real-time prices, live account balance | IB TWS or Gateway running on your computer |
 | **Flex Query (HTTP)** | Historical balance, deposits/withdrawals, trade history | Internet connection only — no TWS needed |
 
-#### TWS / Gateway Connection
+**TWS / Gateway Connection**
 
 This requires Interactive Brokers Trader Workstation (TWS) or IB Gateway to be running on your computer at the same time as Trade Log.
 
-**Settings:**
+Settings:
 - **Host**: `127.0.0.1` (leave this unless TWS is on a different computer)
 - **Port**: `7497` for paper trading via TWS, `7496` for live via TWS, `4002` for paper via Gateway, `4001` for live via Gateway
 - **Client ID**: `1` (leave as default unless you have multiple apps connecting)
@@ -323,31 +321,72 @@ Click **Test Connection** to verify TWS/Gateway is reachable.
 
 > **TWS API must be enabled.** In TWS: Edit → Global Configuration → API → Settings → tick "Enable ActiveX and Socket Clients", set Socket port to match the port above.
 
-#### Flex Query
+**Flex Query**
 
 The Flex Query method fetches data directly from IB's servers over the internet. No TWS required. See [IB Flex Query Setup](#ib-flex-query-setup) for the full setup guide.
 
 Once your token and query ID are saved here, use the **📥 Fetch via Flex Query** button to pull your latest data, or upload an XML file directly.
 
+#### 📥 File Import
+
+**Trades from CSV** has two tabs:
+
+**Trade Log headers** — the strict path. Your file needs the exact columns `Entry Date`, `Ticker`, `Q`, `Entry Price`, and optionally `Tags`, `Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`. Use **Download CSV template** on that tab for a ready-made file with example rows.
+
+**✨ Any CSV · Beta** — drop in whatever you have. It decodes the file, works out the separator, skips any title block above the headers, and then matches your columns to Trade Log's fields two ways: by name (`Trade Date`, `Shares`, `Cost Per Share` and a few hundred other spellings) and by *content* — a column of parseable dates is a date column whatever its header says, and a column of BUY/SELL is an action column even when it's headed "Type". It also spots when your file has one row per **fill** rather than one per trade, and pairs buys against sells FIFO into round trips.
+
+It shows you the mapping it came up with, with a confidence mark against each field, and every field is a dropdown you can correct. Nothing is written until you press Import, and the preview lets you untick individual trades. Tick **Remember this mapping** and the next export with the same headers maps itself.
+
+It's beta: it guesses, and guesses can be wrong. Read the mapping before you import. If it can't find a required field it says so rather than importing something wrong, and the strict tab is always there as a fallback.
+
+**Account Balances from CSV**
+Bulk-import balance history for the equity curve from a CSV file. Useful if you have historical data in a spreadsheet. Required columns: `date`, `balance`. Optional: `contributions`, `withdrawals`.
+
+**IB Activity Statement XML Import**
+Upload an IB Activity Statement XML file to import its daily balances.
+
+**Import Balance History from IB Flex**
+Import your complete balance history directly from Interactive Brokers. This is the most accurate and convenient method. It uses the same token and query ID saved in 🔌 Brokers → Flex Query — see [IB Flex Query Setup](#ib-flex-query-setup) for how to configure this. Once set up:
+1. Select the date range you want to import
+2. Click **📥 Fetch Balance History**
+3. Review the preview table
+4. Click **✅ Import** to save to the database
+5. The chart in 📊 Performance → 📈 Equity Curve may take a moment to populate after importing
+
+#### 💰 Balances
+Add a single day's balance manually. Enter the date, end-of-day balance, any contributions (deposits) that day, and any withdrawals, then click **Add / Update Entry**. This is all you need for the basic equity curve. Your saved entries are listed below the form.
+
+#### 🩺 Data Health
+Tools for checking that your log matches your broker:
+- **Reconcile Open Positions** — compare your open positions with your broker's and see the changes needed to make the log match
+- **Find Duplicate Imports** — find trades that look like the same fill imported more than once. Nothing is deleted until you review each group and confirm
+- **Consolidate Scaled Positions** — broker imports log one trade per fill, so scaling into or out of a position leaves several open rows on the same ticker. This merges each cluster into one trade with an average entry price and a full lot history
+
 ---
 
 ### ⚙️ Settings
 
-#### Display
+Sections: **🎨 Display**, **💼 Trading**, **🏷️ Tags**, **🔔 Alerts**, **☁️ Data & Sync**, **❓ Help**.
+
+#### 🎨 Display
+
+**Theme** — choose the app's color theme.
+
+**Display**
 - **Date format** — choose **MM/DD/YYYY (US)**, **DD/MM/YYYY (Euro)** or **YYYY/MM/DD** for every date in the app
 
-#### Row Color Coding
+**Row Color Coding**
 Optionally color-code trade rows based on status and P&L direction:
 - Choose **Text color** (only the text changes color) or **Row background** (the entire row is highlighted)
 - Pick your colors for Open-Profit, Open-Loss, Closed-Profit, and Closed-Loss
 
-#### Multi-Currency
+**Multi-Currency**
 If your account is in a non-USD currency (AUD, CAD, EUR, GBP), enable this to see P&L figures converted to your native currency alongside the USD figures. FX rates are fetched from Yahoo Finance.
 
-**Default currency** sets what the Add Trade form starts on, so an account that trades in GBP does not have to change the picker on every trade. It is only a default — the Currency picker on each trade still overrides it, and trades already logged keep the currency they were entered in. Prices are always stored in USD at that date's rate, so stats stay comparable across currencies. Stock trades only: options and futures are USD-only.
+**Default currency** sets what the New Trade form starts on, so an account that trades in GBP does not have to change the picker on every trade. It is only a default — the Currency picker on each trade still overrides it, and trades already logged keep the currency they were entered in. Prices are always stored in USD at that date's rate, so stats stay comparable across currencies. Stock trades only: options and futures are USD-only.
 
-#### Non-US tickers
-Pick the **Exchange** next to the Ticker box on the Add Trade form, then type the plain local ticker — Tesco on the London Stock Exchange is `TSCO`, not `TSCO.L`. Trade Log appends the Yahoo Finance suffix for you (`.L`, `.DE`, `.TO`, `.AX`, `.T`, `.HK` and the rest) and uses it for the live price, the company lookup, price charts and trailing stops. The exchange you pick stays selected until you change it, so a run of London trades only needs setting once.
+**Non-US tickers**
+Pick the **Exchange** next to the Ticker box on the New Trade form, then type the plain local ticker — Tesco on the London Stock Exchange is `TSCO`, not `TSCO.L`. Trade Log appends the Yahoo Finance suffix for you (`.L`, `.DE`, `.TO`, `.AX`, `.T`, `.HK` and the rest) and uses it for the live price, the company lookup, price charts and trailing stops. The exchange you pick stays selected until you change it, so a run of London trades only needs setting once.
 
 London lines are quoted by Yahoo in **pence**, not pounds. Trade Log divides those quotes by 100 so the live price lines up with the price you typed — a Shell quote of `3311.00` GBp shows as `£33.11`. The same applies to Johannesburg (cents) and Tel Aviv (agorot). The price readout next to the ticker is labelled with the listing's own currency rather than always showing `$`.
 
@@ -355,39 +394,67 @@ Live prices, unrealized P&L and portfolio value for a non-US holding are struck 
 
 To add a market that isn't in the dropdown, add its IB exchange code and Yahoo suffix to `_IB_EXCHANGE_TO_YF` and a label to `_EXCHANGE_OPTIONS` in `app.py` — everything else reads from those two.
 
-#### Account & Equity
+#### 💼 Trading
+
+**Account & Equity**
 - **Account Balance** — your current total account value. Used for "% of Account" calculations and risk metrics.
 - **Starting Equity** — used as the baseline for equity curve normalisation.
 - **Starting Date** — optionally pin the equity curve to a specific start date.
 
-#### Alert Thresholds
+**Alert Thresholds**
 - **% of Account thresholds** — the % of account at which a position turns yellow (warning) and red (danger) in the trade table
 - **Distance from Stop thresholds** — how close the current price has to be to the stop before the cell turns yellow or red. Set the unit (%, $, or ATR multiples)
 
-#### App Mode
-- **Demo Mode** — auto-sync and auto-connect features are disabled. All manual actions still work. Safe for testing.
-- **Live Mode** — enables auto-sync and auto-connect on startup.
-
-#### Commission Defaults
+**Commission Defaults**
 Default commission amounts pre-filled when adding trades:
 - Stocks: flat fee per trade (e.g. $0 for IB, $4.95 for others)
 - Options: per contract (e.g. $0.65)
 - Futures: per contract (e.g. $2.25)
 
-#### Email Alerts
-See the full guide below.
+**Accounts**
+Accounts let you track trades across multiple brokerage accounts. Add or delete accounts here. The 'Default' account cannot be deleted.
+
+#### 🏷️ Tags
+
+Manage the tags used to categorise trades. Tags let you filter and group trades on the Journal and Performance pages. There are two tabs, **Manage Tags** and **Bulk Tag Editor**.
+
+- **Add a tag** — enter a name and optional description, click Add
+- **Delete a tag** — click the delete button next to any tag. This removes the tag from all trades that use it
+- **Bulk Tag Editor** — change the tags on many trades at once
+
+To tag trades straight from the trade table, select them and use **🏷️ Tag** in the Journal's action bar.
+
+Examples of useful tags: `Earnings Play`, `Breakout`, `Mean Reversion`, `Swing`, `Options Income`, `High Conviction`, `Speculative`
+
+#### 🔔 Alerts
+
+**Email Alerts — Earnings Notifications.** See [Email Alerts for Earnings](#email-alerts-for-earnings) below for the full guide.
+
+#### ☁️ Data & Sync
+
+**App Mode**
+- **Demo Mode** — auto-sync and auto-connect features are disabled. All manual actions still work. Safe for testing.
+- **Live Mode** — enables auto-sync and auto-connect on startup.
+
+**Cloud Sync**, **Database**, and database import / backup tools are also in this section.
+
+#### ❓ Help
+
+- **🧭 Replay setup tutorial** — run the first-time walkthrough again
+- **📜 What's changed** — the changelog for each version
+- **📖 Glossary** — definitions of the platforms and terms used in the app
 
 ---
 
 ## Email Alerts for Earnings
 
-The app can email you automatically when any open position has an upcoming earnings date. This is configured in ⚙️ Settings → Email Alerts.
+The app can email you automatically when any open position has an upcoming earnings date. This is configured in ⚙️ Settings → 🔔 Alerts.
 
 ### How it works
 
 - Each night (or whenever triggered), the app checks all open positions for upcoming earnings
 - If an earnings date is within your threshold (default: 5 trading days), it sends you an email listing the affected positions
-- Earnings dates are fetched automatically from Yahoo Finance. You can also override the date manually in the Edit Trade panel.
+- Earnings dates are fetched automatically from Yahoo Finance. You can also override the date manually in the Journal's ✏️ Edit panel.
 
 ### Step 1 — Choose an email provider
 
@@ -407,7 +474,7 @@ The app uses SMTP to send emails. You need an outgoing mail server. The easiest 
 
 ### Step 3 — Enter the settings in Trade Log
 
-In Trade Log, go to ⚙️ Settings → Email Alerts section and fill in:
+In Trade Log, go to ⚙️ Settings → 🔔 Alerts → Email Alerts — Earnings Notifications and fill in:
 
 | Field | Value |
 |---|---|
@@ -524,7 +591,7 @@ The Flex Token is a password that allows Trade Log to fetch your reports. It is 
 
 ### Part 3 — Enter the Token and Query ID in Trade Log
 
-1. Open Trade Log and go to **🔗 Broker Sync**
+1. Open Trade Log and go to **🔗 Data → 🔌 Brokers** (with Interactive Brokers selected)
 2. Scroll down to the **Flex Query** section
 3. Enter your **Flex Token** in the "Flex Token" field
 4. Enter your **Query ID** in the "Query ID" field
@@ -534,17 +601,17 @@ The Flex Token is a password that allows Trade Log to fetch your reports. It is 
 
 ### Part 4 — Fetch your data
 
-**In Broker Sync:**
+**In 🔗 Data → 🔌 Brokers:**
 - Click **📥 Fetch via Flex Query** to pull your latest account data (balance, deposits, withdrawals, trade history)
 - This can take up to 2 minutes — IB generates the report on their server, so please be patient
 
 **For the equity curve specifically:**
-- Go to **📈 Equity Curve** → **🔗 IB Flex Import** tab
+- Go to **🔗 Data** → **📥 File Import** → **Import Balance History from IB Flex**
 - Select your date range
 - Click **📥 Fetch Balance History**
 - Review the preview table (you will see one row per trading day with ending balance)
 - Click **✅ Import** to save all entries to the database
-- Switch to the **📈 Chart** tab — the chart may take a moment to populate
+- Go to **📊 Performance** → **📈 Equity Curve** — the chart may take a moment to populate
 
 ---
 
@@ -554,7 +621,7 @@ The Flex Token is a password that allows Trade Log to fetch your reports. It is 
 Your Flex Query does not have the **Change in NAV** section enabled (or it does not include the **Ending Value** field). Edit the query in IB Account Management and enable that section as described in Step 4 above. Alternatively, enable **Equity Summary by Report Date** or **Net Asset Value** — the app supports all three.
 
 **"IB rejected the request" / Error 1020**
-Your token has expired or is incorrect. Go back to IB Account Management → Reports → Flex Queries → Manage Tokens and generate a new token. Update the token in Trade Log → Broker Sync.
+Your token has expired or is incorrect. Go back to IB Account Management → Reports → Flex Queries → Manage Tokens and generate a new token. Update the token in Trade Log → 🔗 Data → 🔌 Brokers.
 
 **The fetch takes very long or times out**
 IB's Flex Web Service sometimes takes 2–3 minutes to generate reports, especially for long date ranges. The app waits up to 2 minutes with automatic retries. If it times out, try uploading the XML directly — see below.
@@ -563,8 +630,8 @@ IB's Flex Web Service sometimes takes 2–3 minutes to generate reports, especia
 If the automatic fetch is not working, you can download the report manually:
 1. IB Account Management → Reports → Flex Queries → find your query → click **Run**
 2. IB generates the report and offers a download link. Download the `.xml` file.
-3. In Trade Log → Broker Sync → click **Or Upload XML Directly** and upload the file.
-4. For the equity curve specifically: Equity Curve → IB Flex Import tab → upload the same XML file.
+3. In Trade Log → 🔗 Data → 🔌 Brokers → use **Or Upload XML Directly** to upload the file.
+4. For the equity curve specifically: 🔗 Data → 📥 File Import → Import Balance History from IB Flex → upload the same XML file.
 
 ---
 
@@ -592,7 +659,7 @@ The first launch needs an internet connection — it downloads a private copy of
 
 ### Earnings dates are wrong or missing
 - Earnings dates are sourced from Yahoo Finance and may not always be accurate
-- You can override the date on any trade using the **Edit Trade** panel → Earnings Date field
+- You can override the date on any trade by selecting it in the Journal and using **✏️ Edit** → Earnings Date field
 - If Yahoo Finance shows no upcoming date, it may not have a confirmed date yet
 
 ### Test email failed — "Connection refused" or "Authentication failed"
@@ -607,7 +674,7 @@ The first launch needs an internet connection — it downloads a private copy of
 - To restore: close the app, delete or rename `tradelog.db`, copy a backup file from `backups/` and rename it to `tradelog.db`, then restart the app
 
 ### The app is slow
-- Large numbers of trades (1000+) can slow down the Statistics and Trading Log pages
+- Large numbers of trades (1000+) can slow down the Performance and Journal pages
 - Use the date range filter and instrument filters to narrow the data
 - Close other browser tabs and background applications
 

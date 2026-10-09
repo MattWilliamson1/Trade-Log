@@ -127,18 +127,18 @@ def extract_code(redirected_url: str) -> str | None:
     Accepts either the full ``https://127.0.0.1:8182/?code=...&session=...`` URL
     or a bare code pasted by the user.
     """
-    s = (redirected_url or "").strip()
+    # Copying from an address bar or chat can drag in whitespace, line breaks
+    # or surrounding quotes; any of them corrupts the code.
+    s = "".join((redirected_url or "").split()).strip("\"'<>")
     if not s:
         return None
-    if "code=" not in s:
-        # User may have pasted just the code itself.
-        return s if " " not in s else None
-    try:
-        qs = urllib.parse.urlparse(s).query
-        code = urllib.parse.parse_qs(qs).get("code", [None])[0]
-        return code
-    except Exception:
-        return None
+    if "code=" in s:
+        # Parse by hand: parse_qs turns '+' into a space, which corrupts codes.
+        s = s.split("code=", 1)[1].split("&", 1)[0].split("#", 1)[0]
+    # Schwab's codes end in '@', which arrives as '%40'. Unquote here, or
+    # requests encodes the '%' again and Schwab sees a different code.
+    code = urllib.parse.unquote(s)
+    return code or None
 
 
 def exchange_code(app_key: str, secret: str, callback: str,
@@ -233,7 +233,11 @@ def _token_error(resp) -> str:
     except Exception:
         msg = resp.text[:300]
     hint = ""
-    if resp.status_code in (400, 401):
+    if "authorization code" in str(msg).lower():
+        hint = ("\n\nSchwab's login codes expire about 30 seconds after you log in and "
+                "work only once. Click 🔐 Open Schwab login again, then paste the new "
+                "URL and click ✅ Complete Authorization straight away.")
+    elif resp.status_code in (400, 401):
         hint = ("\n\nCheck that your App Key and Secret are correct and that the "
                 "callback URL matches exactly what you registered at "
                 "developer.schwab.com (https://127.0.0.1:8182).")
