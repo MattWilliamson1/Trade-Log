@@ -201,6 +201,8 @@ MIGRATIONS = [
     ("trading_plans", "strike",       "REAL"),
     ("trading_plans", "delta_target", "REAL"),
     ("trading_plans", "notes",        "TEXT"),
+    # per-account balance, set manually under Settings → Trading → Accounts
+    ("accounts",      "balance",      "REAL DEFAULT 0"),
 ]
 
 INDEXES = [
@@ -245,6 +247,18 @@ def init_db():
                         raise
         for idx_sql in INDEXES:
             conn.execute(idx_sql)
+        # Trade-type labels were consolidated to Day Trade / Swing Trade / Investment
+        conn.execute("""
+            UPDATE trading_plans SET trade_type = CASE trade_type
+                WHEN 'Swing'            THEN 'Swing Trade'
+                WHEN 'Options Play'     THEN 'Swing Trade'
+                WHEN 'Momentum'         THEN 'Swing Trade'
+                WHEN 'Position'         THEN 'Investment'
+                WHEN 'Long-Term Invest' THEN 'Investment'
+            END
+            WHERE trade_type IN ('Swing', 'Options Play', 'Momentum',
+                                 'Position', 'Long-Term Invest')
+        """)
     # Startup backup: once per calendar day if DB is under size limit
     today_backup = BACKUP_DIR / f"backup-{date.today().isoformat()}.db"
     if not today_backup.exists():

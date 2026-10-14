@@ -1165,6 +1165,16 @@ def get_live_data(symbols: tuple) -> dict:
     return _yf_get_live_data(yf_symbols)
 
 
+def _request_live_price_fetch():
+    """Drop every cached quote and flag the Journal to fetch fresh prices once
+    on its next render. The Journal clears the flag after that one fetch."""
+    _yf_get_live_data.clear()
+    for _k in [k for k in st.session_state if k.startswith("_ib_live_")]:
+        del st.session_state[_k]
+    st.session_state.pop("_live_data_cache", None)
+    st.session_state["_live_prices_loaded"] = True
+
+
 # Every native currency the app supports, in one place. "symbol" prefixes the
 # "(Native)" columns; "pair" is the Yahoo ticker quoting USD per 1 unit (None for
 # USD itself). Adding a currency = adding one row here — the Settings dropdown,
@@ -2218,6 +2228,18 @@ def delete_account(name: str):
         conn.execute("DELETE FROM accounts WHERE name=? AND name != 'Default'", (name,))
 
 
+def load_account_balances() -> dict[str, float]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT name, COALESCE(balance, 0) FROM accounts").fetchall()
+    return {r[0]: float(r[1]) for r in rows}
+
+
+def set_account_balances(balances: dict[str, float]):
+    with get_connection() as conn:
+        conn.executemany("UPDATE accounts SET balance=? WHERE name=?",
+                         [(float(v), k) for k, v in balances.items()])
+
+
 def load_tags() -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute("SELECT id, name, description FROM tags ORDER BY name").fetchall()
@@ -2455,7 +2477,8 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
                  strike=None, option_type=None, multiplier=None, side=None,
                  commission=None, account_name=None,
                  trail_type=None, trail_amount=None, plan_id=_UNCHANGED,
-                 native_currency=None, fx_rate_entry=None, fx_rate_exit=_UNCHANGED):
+                 native_currency=None, fx_rate_entry=None, fx_rate_exit=_UNCHANGED,
+                 exchange=None):
     with get_connection() as conn:
         # Build the update dynamically — only overwrite fields that were passed
         sets = [
@@ -2522,6 +2545,9 @@ def update_trade(trade_id, exit_date, exit_price, notes, current_stop, stop_enab
         if fx_rate_entry is not None:
             sets.append("fx_rate_entry=?")
             vals.append(float(fx_rate_entry))
+        if exchange is not None:
+            sets.append("exchange=?")
+            vals.append(str(exchange).upper().strip())
         # Sentinel-guarded: clearing the exit date must be able to write NULL
         # back, which a plain `is not None` check could never express.
         if fx_rate_exit is not _UNCHANGED:
@@ -4847,11 +4873,51 @@ def _exit_before_entry_msg(entry_date, exit_date) -> str:
             f"({fmt_date(entry_date, date_fmt)}). Check the dates.")
 
 
+def _alloc_max_risk_per_trade() -> float | None:
+    """Max risk per trade from the saved Allocation Plan, or None if no plan is saved."""
+    try:
+        _tl = float(settings.get("alloc_total_loss", 0) or 0)
+        _rs = int(float(settings.get("alloc_resets", 0) or 0))
+        _ct = int(float(settings.get("alloc_conf_trades", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+    if _tl <= 0 or _rs <= 0 or _ct <= 0:
+        return None
+    return _tl / _rs / _ct
+
+
+def _planned_risk_lines(risk: float | None, why_none: str = "") -> tuple[list, bool]:
+    """Popup lines for a new trade's planned risk, and whether it breaks the plan.
+
+    Every "$" is escaped on the way out: st.markdown reads a second bare $ on a
+    line as the start of a LaTeX span.
+    """
+    if risk is None:
+        return ([f"- **Planned risk:** — {why_none}"] if why_none else []), False
+    _parts = [fmt_price(risk)]
+    if acct_bal and acct_bal > 0:
+        _parts.append(f"{risk / acct_bal * 100:.2f}% of account")
+    _lines = [f"- **Planned risk:** {'  ·  '.join(_parts)}"]
+    _max = _alloc_max_risk_per_trade()
+    _over = False
+    if _max:
+        _over = risk > _max + 1e-9
+        _verdict = f"⚠️ over by {fmt_price(risk - _max)}" if _over else "✅ within plan"
+        _lines.append(
+            f"- **Plan max per trade:** {fmt_price(_max)}  ·  {_verdict}"
+            f" ({risk / _max * 100:.0f}% of limit)"
+        )
+    return [_ln.replace("$", r"\$") for _ln in _lines], _over
+
+
 @st.dialog("✅  Trade Added")
 def _trade_added_dialog(summary: dict):
     st.markdown(f"**{summary.get('title', 'Trade added to your log.')}**")
     for _ln in summary.get("lines", []):
         st.markdown(_ln)
+    if summary.get("over_risk"):
+        st.warning("This trade risks more than your Allocation Plan allows per trade. "
+                   "Consider trimming the size or tightening the stop.", icon="⚠️")
     if st.button("OK", type="primary", width="stretch", key="_trade_added_ok"):
         st.rerun()
 
@@ -6105,20 +6171,22 @@ with st.sidebar:
     )
     if st.button("⚡  REFRESH LIVE PRICES", width='stretch', key="sb_fetch_live",
                  help="Clear the price cache and re-fetch all live quotes now"):
-        _yf_get_live_data.clear()
-        for _k in [k for k in st.session_state if k.startswith("_ib_live_")]:
-            del st.session_state[_k]
-        st.session_state.pop("_live_data_cache", None)
-        st.session_state["_live_prices_loaded"] = True
+        _request_live_price_fetch()
         st.rerun()
     st.markdown(
         "<div style='text-align:center;font-size:0.75rem;color:#888;margin-top:-6px'>"
-        "Prices do not auto-load — click above to fetch."
+        "Prices load once on opening the Journal — click above to refresh."
         "</div>",
         unsafe_allow_html=True,
     )
 
 page = st.session_state["nav_page"]
+
+# One fetch on entering the Journal (first load, or arriving from another page).
+# Reruns while staying on it reuse the cached prices.
+if page == P_JOURNAL and st.session_state.get("_last_page") != P_JOURNAL:
+    _request_live_price_fetch()
+st.session_state["_last_page"] = page
 
 _render_cloud_banners()
 
@@ -6822,9 +6890,16 @@ if page == P_JOURNAL:
                                     f"- **Exit:** {_conf_exit} on "
                                     f"{fmt_date(exit_date, date_fmt) if exit_date else '—'}"
                                 )
+                            if stop_enabled and opening_stop:
+                                _risk_usd = abs(native_to_usd(entry_price, _fx_entry)
+                                                - native_to_usd(opening_stop, _fx_entry)) * float(quantity)
+                                _risk_ln, _over = _planned_risk_lines(_risk_usd)
+                            else:
+                                _risk_ln, _over = _planned_risk_lines(None, "no stop loss set")
                             st.session_state["_trade_added"] = {
                                 "title": f"{t} added to your log.",
-                                "lines": _conf_lines,
+                                "lines": _conf_lines + _risk_ln,
+                                "over_risk": _over,
                             }
                             st.rerun()
                         except Exception as _err:
@@ -6839,6 +6914,8 @@ if page == P_JOURNAL:
                             sel_ids      = [tag_name_to_id[n] for n in sel_tag_names]
                             leg_group_id = str(uuid.uuid4())[:8] if n_legs > 1 else None
                             added        = 0
+                            _opt_premium = 0.0
+                            _opt_has_short = False
                             for i in range(n_legs):
                                 qty    = leg_qtys[i]
                                 strike = leg_strikes[i]
@@ -6848,6 +6925,10 @@ if page == P_JOURNAL:
                                 side     = "short" if leg_sides[i] == "Short" else "long"
                                 opt_char = "C" if leg_types[i] == "Call" else "P"
                                 leg_lbl  = f"{'Short' if side=='short' else 'Long'} {leg_types[i]} ${strike:.2f}"
+                                if side == "short":
+                                    _opt_has_short = True
+                                else:
+                                    _opt_premium += float(qty) * float(price) * float(opt_mult)
                                 add_trade(
                                     entry_date     = opt_entry_dt,
                                     ticker         = t,
@@ -6875,12 +6956,21 @@ if page == P_JOURNAL:
                                 )
                                 added += 1
                             if added:
+                                # A long-only position can't lose more than the premium
+                                # paid; anything with a short leg needs the full spread
+                                # maths, so it's left unrated.
+                                if _opt_has_short:
+                                    _risk_ln, _over = _planned_risk_lines(
+                                        None, "not calculated for positions with short legs")
+                                else:
+                                    _risk_ln, _over = _planned_risk_lines(_opt_premium)
                                 st.session_state["_trade_added"] = {
                                     "title": f"{t} option added to your log.",
                                     "lines": [
                                         f"- **Legs:** {added}",
                                         f"- **Entry date:** {fmt_date(opt_entry_dt, date_fmt)}",
-                                    ],
+                                    ] + _risk_ln,
+                                    "over_risk": _over,
                                 }
                                 st.rerun()
                             else:
@@ -8366,30 +8456,69 @@ if page == P_JOURNAL:
                         return None
                     return float(usd_to_native(v, fx) if _ed_ccy0 != "USD" else v)
 
+                # Currency sits outside the form so the cost-basis warning can react
+                # as soon as it changes — widgets inside st.form only report on Save.
+                # Keyed per trade: a constant key would carry this trade's choice
+                # onto the next one picked, and an unkeyed one would do the same
+                # between two trades that share a currency.
+                _ed_ccy_opts = list(NATIVE_CURRENCIES)
+                _edc1, _edc2 = st.columns([1, 4])
+                edit_ccy = _edc1.selectbox(
+                    "Currency",
+                    options=_ed_ccy_opts,
+                    index=_ed_ccy_opts.index(_ed_ccy0) if _ed_ccy0 in _ed_ccy_opts else 0,
+                    format_func=lambda c: f"{currency_symbol(c)}  {c}",
+                    key=f"edit_ccy_{trade_id}",
+                    help=("The currency the prices on this form are in. Changing it "
+                          "re-prices the trade at that currency's rate for these dates."),
+                )
+                if (edit_ccy or "USD") != _ed_ccy0:
+                    _ed_basis_msg = ""
+                    _ed_ep0 = row.get("entry_price")
+                    if _ed_ep0 is not None and not pd.isna(_ed_ep0) and _ed_entry_date0:
+                        _ed_units = (abs(float(row.get("quantity") or 0))
+                                     * abs(float(row.get("multiplier") or 1.0)))
+                        _ed_fx_new = (1.0 if edit_ccy == "USD"
+                                      else get_fx_rate_at_date(edit_ccy, str(_ed_entry_date0)))
+                        _ed_basis_old = float(_ed_ep0) * _ed_units
+                        _ed_basis_new = (native_to_usd(_ed_show(_ed_ep0, _ed_fx_e), _ed_fx_new)
+                                         * _ed_units)
+                        _ed_basis_msg = (f" Cost basis goes from **${_ed_basis_old:,.2f}** to "
+                                         f"**${_ed_basis_new:,.2f}**.")
+                    _edc2.warning(
+                        f"Changing the currency from {_ed_ccy0} to {edit_ccy} will adjust the "
+                        f"cost basis. The prices below keep their numbers but are read as "
+                        f"{edit_ccy} and converted to USD at the entry-date rate."
+                        + _ed_basis_msg + " Nothing changes until you save.",
+                        icon="⚠️",
+                    )
+
                 with st.form("edit_trade"):
                     st.markdown("**Core Fields**")
-                    ee1, ee2, ee3, ee4, ee5 = st.columns([1, 1, 1, 1, 0.75])
+                    ee1, ee2, eex, ee3, ee4 = st.columns(5)
                     edit_entry_date = ee1.date_input("Entry Date", value=_ed_entry_date0)
                     edit_ticker = ee2.text_input("Ticker", value=str(row["ticker"] or ""))
+                    # Imports write codes the Add form never offers (NASDAQ, NYSE,
+                    # CBOE…) — keep the trade's own code selectable so saving an
+                    # unrelated field doesn't silently reset it to US / Default.
+                    _ed_exch0 = str(row.get("exchange") or "").upper().strip()
+                    _ed_exch_opts = [code for code, _ in _EXCHANGE_OPTIONS]
+                    if _ed_exch0 not in _ed_exch_opts:
+                        _ed_exch_opts.append(_ed_exch0)
+                    edit_exchange = eex.selectbox(
+                        "Exchange",
+                        options=_ed_exch_opts,
+                        index=_ed_exch_opts.index(_ed_exch0),
+                        format_func=lambda c: _EXCHANGE_LABEL.get(c, c),
+                        # Unkeyed, like the rest of Core Fields (see Currency below).
+                        help=("Listing used for price lookups. Leave as US / Default "
+                              "for NYSE, NASDAQ and other US exchanges."),
+                    ) or ""
                     edit_qty    = ee3.number_input("Quantity", min_value=0.0, step=1.0, format="%.4f",
                                                    value=float(row["quantity"]) if row["quantity"] else None)
                     edit_entry_price = ee4.number_input(
                         "Entry Price", min_value=0.0, step=0.01, format="%.4f",
                         value=_ed_show(row["entry_price"], _ed_fx_e),
-                    )
-                    _ed_ccy_opts = list(NATIVE_CURRENCIES)
-                    edit_ccy = ee5.selectbox(
-                        "Currency",
-                        options=_ed_ccy_opts,
-                        index=_ed_ccy_opts.index(_ed_ccy0) if _ed_ccy0 in _ed_ccy_opts else 0,
-                        format_func=lambda c: f"{currency_symbol(c)}  {c}",
-                        # Deliberately unkeyed. A keyed widget's session_state wins over
-                        # `index` on every rerun, so switching to another trade would
-                        # keep showing the previous trade's currency — and then save the
-                        # new trade's prices under it. The other Core Fields inputs are
-                        # unkeyed for the same reason.
-                        help=("The currency the prices on this form are in. Changing it "
-                          "re-prices the trade at that currency's rate for these dates."),
                     )
                     ec1, ec2 = st.columns(2)
                     edit_exit_date = ec1.date_input(
@@ -8583,6 +8712,7 @@ if page == P_JOURNAL:
                                 native_currency=_ed_ccy_new,
                                 fx_rate_entry=_fx_e_new,
                                 fx_rate_exit=_fx_x_new,
+                                exchange=edit_exchange,
                                 expiration=edit_expiration,
                                 strike=edit_strike,
                                 option_type=edit_option_type,
@@ -8599,6 +8729,10 @@ if page == P_JOURNAL:
                                                  (edit_underlying_px or None, trade_id))
                             earn_str = edit_earnings.isoformat() if edit_earnings else ""
                             update_earnings_override(trade_id, earn_str)
+                            # A new listing is a new price symbol the cached quotes
+                            # don't have — fetch once so its live price shows.
+                            if edit_exchange != _ed_exch0:
+                                _request_live_price_fetch()
                             st.success("Trade updated.")
                             st.rerun()
 
@@ -10251,11 +10385,29 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
         )
 
         st.markdown("---")
+        # Load the saved plan once per session; after that the widgets own the
+        # values until Save writes them back.
+        if not st.session_state.get("_pa_loaded"):
+            st.session_state["_pa_loaded"] = True
+            try:
+                _pa_saved_tl = float(settings.get("alloc_total_loss", 0) or 0)
+                if _pa_saved_tl > 0:
+                    st.session_state["pa_total_loss"]  = _pa_saved_tl
+                    st.session_state["pa_resets"]      = int(float(settings.get("alloc_resets", 5) or 5))
+                    st.session_state["pa_conf_trades"] = int(float(settings.get("alloc_conf_trades", 20) or 20))
+            except (TypeError, ValueError):
+                pass
+        # Pass value= only when session state doesn't already hold one, or
+        # Streamlit warns about a widget set from both sides.
+        def _pa_default(key, val):
+            return {} if key in st.session_state else {"value": val}
+
         _pa1, _pa2, _pa3 = st.columns(3)
 
         _pa_total_loss = _pa1.number_input(
             "Total Loss Limit ($)",
-            min_value=0.0, step=1000.0, format="%.2f", value=None,
+            min_value=0.0, step=1000.0, format="%.2f",
+            **_pa_default("pa_total_loss", None),
             key="pa_total_loss",
             help=(
                 "The absolute maximum you are prepared to lose from your **active trading allocation** "
@@ -10266,7 +10418,8 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
         )
         _pa_resets = _pa2.number_input(
             "Total Resets",
-            min_value=1, max_value=100, step=1, value=5,
+            min_value=1, max_value=100, step=1,
+            **_pa_default("pa_resets", 5),
             key="pa_resets",
             help=(
                 "How many discrete attempts (Resets) you divide your Total Loss Limit into. "
@@ -10279,7 +10432,8 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
         )
         _pa_conf_trades = _pa3.number_input(
             "Trades for Statistical Confidence",
-            min_value=5, max_value=1000, step=5, value=20,
+            min_value=5, max_value=1000, step=5,
+            **_pa_default("pa_conf_trades", 20),
             key="pa_conf_trades",
             help=(
                 "How many trades you need before your win rate and average P&L reflect genuine skill "
@@ -10290,6 +10444,30 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
             "guaranteeing you can always complete a full confidence sample within one Reset."
             ),
         )
+
+        _pas1, _pas2 = st.columns(2)
+        if _pas1.button("💾  Save Allocation Plan", width="stretch", type="primary",
+                        disabled=not (_pa_total_loss and _pa_total_loss > 0),
+                        help="Saves these numbers so they load next time, and checks each "
+                             "new trade's planned risk against Max Risk per Trade."):
+            set_setting("alloc_total_loss",  str(float(_pa_total_loss)))
+            set_setting("alloc_resets",      str(int(_pa_resets)))
+            set_setting("alloc_conf_trades", str(int(_pa_conf_trades)))
+            st.toast("Allocation plan saved.", icon="💾")
+            st.rerun()
+        _pa_saved_max = _alloc_max_risk_per_trade()
+        if _pa_saved_max:
+            if _pas2.button("🗑️  Clear Saved Plan", width="stretch",
+                            help="Forget the saved plan and stop checking new trades against it."):
+                set_setting("alloc_total_loss", "0")
+                for _k in ("pa_total_loss", "pa_resets", "pa_conf_trades"):
+                    st.session_state.pop(_k, None)
+                st.toast("Saved allocation plan cleared.", icon="🗑️")
+                st.rerun()
+            st.caption(f"Saved plan: new trades are checked against a max risk of "
+                       f"**{fmt_price(_pa_saved_max)}** per trade.")
+        else:
+            st.caption("No plan saved yet. Save one to check each new trade's planned risk against it.")
 
         if _pa_total_loss and _pa_total_loss > 0 and _pa_resets and _pa_conf_trades:
             _per_reset     = _pa_total_loss / _pa_resets
@@ -11331,13 +11509,14 @@ if _sub == S_PLAN:
 
 
     # ── session defaults ──────────────────────────────────────────────────────
+    _TP_TRADE_TYPES = ["Day Trade", "Swing Trade", "Investment"]
     _tp_defaults = {
         "tp_ticker":        "",
         "tp_sentiment":     "Neutral",
         "tp_rationale":     "",
         "tp_fundamentals":  "",
         "tp_technicals":    "",
-        "tp_trade_type":    "Swing",
+        "tp_trade_type":    "Swing Trade",
         "tp_hold_time":     "",
         "tp_entry_signal":  "",
         "tp_confirm1":      "",
@@ -11515,10 +11694,9 @@ if _sub == S_PLAN:
 
     _tp_trade_type = _tp_s3b.selectbox(
         "Investment / Trade Type",
-        ["Day Trade", "Swing", "Position", "Long-Term Invest", "Options Play"],
-        index=["Day Trade", "Swing", "Position", "Long-Term Invest", "Options Play"].index(
-            st.session_state["tp_trade_type"]
-        ),
+        _TP_TRADE_TYPES,
+        index=_TP_TRADE_TYPES.index(st.session_state["tp_trade_type"])
+        if st.session_state["tp_trade_type"] in _TP_TRADE_TYPES else 1,
         key="tp_trade_type_widget",
     )
     st.session_state["tp_trade_type"] = _tp_trade_type
@@ -11868,7 +12046,7 @@ if _sub == S_PLAN:
                     st.session_state["tp_rationale"]     = _sp.get("rationale", "")
                     st.session_state["tp_fundamentals"]  = _sp.get("fundamentals", "")
                     st.session_state["tp_technicals"]    = _sp.get("technicals", "")
-                    st.session_state["tp_trade_type"]    = _sp.get("trade_type", "Swing")
+                    st.session_state["tp_trade_type"]    = _sp.get("trade_type", "Swing Trade")
                     st.session_state["tp_hold_time"]     = _sp.get("hold_time", "")
                     st.session_state["tp_entry_signal"]  = _sp.get("entry_signal", "")
                     st.session_state["tp_confirm1"]      = _sp.get("confirm1", "")
@@ -15266,6 +15444,31 @@ if page == P_SETTINGS and _sub != S_TAGS:
                 if _ac2.button("✕", key=f"del_acct_{_acct_name}", help="Delete account"):
                     delete_account(_acct_name)
                     st.rerun()
+
+        st.markdown("**Account Balances**")
+        _acct_bals = load_account_balances()
+        with st.form("account_balances_form"):
+            _new_bals = {}
+            for _acct_name in _accts_now:
+                # Unkeyed on purpose: a keyed widget would keep its old value
+                # after another save or a sync changes the stored balance.
+                _new_bals[_acct_name] = st.number_input(
+                    _acct_name, min_value=0.0, step=1000.0, format="%.2f",
+                    value=_acct_bals.get(_acct_name, 0.0))
+            st.caption(f"Total across accounts: **{fmt_price(sum(_new_bals.values()))}**")
+            _bal_save, _bal_use = st.columns(2)
+            _save_bals = _bal_save.form_submit_button("💾  Save Balances", width='stretch')
+            _use_total = _bal_use.form_submit_button(
+                "Save & use total as Account Balance", width='stretch',
+                help="Also sets Account Balance above (used for % of Account, Sharpe & Sortino) "
+                     "to the sum of these balances.")
+            if _save_bals or _use_total:
+                set_account_balances(_new_bals)
+                if _use_total:
+                    set_setting("account_balance", str(sum(_new_bals.values())))
+                    st.session_state["_live_balance_set"] = True
+                st.success("Account balances saved.")
+                st.rerun()
 
         st.markdown("**Add Account**")
         with st.form("add_account_form", clear_on_submit=True):
