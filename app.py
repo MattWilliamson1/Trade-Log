@@ -5179,12 +5179,8 @@ _CHT_LEG      = _TH["chart_legend"]
 _CHT_LEG_FONT = _TH["chart_legend_font"]
 app_mode   = settings.get("app_mode", "demo")   # "demo" | "live"
 is_demo    = app_mode != "live"
-# Demo: use saved setting (default 0). Live: 0 until a broker pull is done this session.
-if is_demo:
-    acct_bal = float(settings.get("account_balance", 0))
-else:
-    acct_bal = (float(settings.get("account_balance", 0))
-                if st.session_state.get("_live_balance_set") else 0.0)
+# Saved setting in both modes; a broker pull (manual or auto-sync below) overwrites it.
+acct_bal = float(settings.get("account_balance", 0) or 0)
 
 # Push IB config to session_state so get_live_data() can read it without DB calls
 if "_ib_cfg" not in st.session_state:
@@ -7825,20 +7821,46 @@ if page == P_JOURNAL:
                 _lk_ok  = is_open_mask & _lk_cs.notna() & _lk_ep.notna() & _lk_qty.notna()
                 display["Locked-in Profit"] = np.where(_lk_ok, _lk_val.apply(fmt_pnl), "—")
 
+            # Computed whether or not the column is shown: the total above the
+            # table needs it either way.
+            _or_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
+            _or_cs     = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
+            _or_ep     = pd.to_numeric(filtered["entry_price"],   errors="coerce")
+            _or_qty    = pd.to_numeric(filtered["quantity"],      errors="coerce")
+            _or_mul    = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
+            _or_locked = np.where(
+                _or_cs.notna() & _or_ep.notna() & _or_qty.notna(),
+                (_or_cs - _or_ep) * _or_qty * _or_mul,
+                0.0,
+            )
+            _or_risk = _or_pnl - pd.Series(_or_locked, index=filtered.index)
+            _or_ok   = is_open_mask & _or_pnl.notna()
             if "Open Risk" in vis:
-                _or_pnl    = pd.to_numeric(display["_pnl_num"], errors="coerce")
-                _or_cs     = pd.to_numeric(filtered["_eff_stop"],  errors="coerce")
-                _or_ep     = pd.to_numeric(filtered["entry_price"],   errors="coerce")
-                _or_qty    = pd.to_numeric(filtered["quantity"],      errors="coerce")
-                _or_mul    = pd.to_numeric(filtered["multiplier"],    errors="coerce").fillna(1.0)
-                _or_locked = np.where(
-                    _or_cs.notna() & _or_ep.notna() & _or_qty.notna(),
-                    (_or_cs - _or_ep) * _or_qty * _or_mul,
-                    0.0,
-                )
-                _or_risk = _or_pnl - pd.Series(_or_locked, index=filtered.index)
-                _or_ok   = is_open_mask & _or_pnl.notna()
                 display["Open Risk"] = np.where(_or_ok, _or_risk.apply(fmt_pnl), "—")
+
+            # ── Open Risk total ───────────────────────────────────────────────
+            _n_open_shown = int(np.sum(is_open_mask))
+            if _n_open_shown:
+                _or_total  = float(_or_risk[_or_ok].sum())
+                _or_priced = int(np.sum(_or_ok))
+                _or_bits   = [f"**Total Open Risk:** {fmt_pnl(_or_total)}"]
+                if acct_bal and acct_bal > 0:
+                    _or_bits.append(f"{_or_total / acct_bal * 100:.2f}% of account")
+                _or_note = f"{_n_open_shown} open trade{'s' if _n_open_shown != 1 else ''}"
+                if _or_priced < _n_open_shown:
+                    # Name the tickers: in Group by ticker a position with one
+                    # unpriced leg (an option beside its stock) still shows a P&L,
+                    # so a bare count looks wrong.
+                    _or_unpriced = filtered.loc[is_open_mask & ~_or_ok, "ticker"].value_counts()
+                    _or_names = ", ".join(
+                        f"{_t} ×{_n}" if _n > 1 else str(_t)
+                        for _t, _n in sorted(_or_unpriced.items())
+                    )
+                    _or_note += f" · not counted, no live price: {_or_names}"
+                _or_bits.append(_or_note)
+                # Escape "$": a second bare $ on one line starts a LaTeX span.
+                st.markdown("  ·  ".join(_or_bits).replace("$", r"\$"),
+                            help=COLUMN_HELP["Open Risk"] + " Summed over the open trades the filters above show.")
 
             if "Opening Risk" in vis:
                 def _opening_risk(row):
@@ -8231,7 +8253,10 @@ if page == P_JOURNAL:
                         _dd_col1, _dd_col2 = st.columns([3, 2])
 
                         # Build side sign map once — used by lots table, summary, and trade IDs table
-                        _dd_trades  = filtered[filtered["id"].isin(_sel_ids)]
+                        # _pre_agg_filtered, not filtered: collapsing spreads drops
+                        # their legs from filtered, so a spread-only position would
+                        # come back empty here.
+                        _dd_trades  = _pre_agg_filtered[_pre_agg_filtered["id"].isin(_sel_ids)]
                         _dd_signs   = _dd_trades["side"].map(lambda s: -1 if str(s).lower() == "short" else 1).fillna(1)
                         _trade_sign = dict(zip(_dd_trades["id"].astype(int), _dd_signs.values))
 
@@ -8296,7 +8321,7 @@ if page == P_JOURNAL:
                                 st.info("No dividends recorded for this position.")
 
                             st.markdown("**Individual Trade IDs**")
-                            _id_df = filtered[filtered["id"].isin(_sel_ids)][
+                            _id_df = _pre_agg_filtered[_pre_agg_filtered["id"].isin(_sel_ids)][
                                 ["id", "entry_date", "quantity", "entry_price", "account_name", "side"]
                             ].copy()
                             _id_df.columns = ["ID", "Entry Date", "Qty", "Entry Price", "Account", "side"]
