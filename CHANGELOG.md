@@ -6,6 +6,17 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-10-16
+- Performance no longer says "no balance set" in Connected to Broker mode when you've saved an Account Balance. Sharpe, Sortino, Calmar and % of Account now use it until a broker sync replaces it
+- Each account can hold its own balance (Settings → Trading → Accounts), with a total and a button to use it as your Account Balance
+- Allocation Plan can be saved and reloads automatically, and a saved plan's max risk per trade is checked against every new trade
+- The Trade Added pop-up shows planned risk ($ and % of account) for stocks with a stop and long-only options, and warns when it's over your plan
+- Journal shows a Total Open Risk line above the trade table, with its % of your account and any tickers left out for lack of a live price
+- Opening a position that holds only a spread now lists its lots and trade IDs instead of coming back empty
+- Journal fetches live prices when it opens instead of waiting for a click
+- Edit Trade can change a trade's currency and exchange
+- Trading-plan types are now Day Trade, Swing Trade and Investment (older labels are converted automatically)
+
 ## 2026-10-08
 - Five pages instead of nine: Journal, Plan, Performance, Data and Settings, each with its own sections picked from a bar at the top. New Trade opens in a pop-up, and an action bar under the trade table (Edit, Lots, Dividend, Roll, Close/Stops, Spread, Tag, Chart, Delete) works on the rows you select
 - Cloud Sync (Settings → Data & Sync): keep your trade log in a Dropbox, OneDrive, iCloud or Google Drive folder so it follows you between computers. It warns before overwriting changes made on both sides, and when the log is open on another computer
