@@ -50,14 +50,14 @@ Trade Log is a self-hosted trading journal. You log trades manually or import th
 
 ## Installation
 
-**If you received the installer package (Windows)**, just double-click `INSTALL - Double-Click This First.bat` and follow the prompts. Skip to [Running the App](#running-the-app).
+**If you received the installer package (Windows)**, EXTRACT the zip file FIRST. To minimize the chance of running into issues, please DON'T use a network drive. Then just double-click `INSTALL - Double-Click This First.bat` and follow the prompts. Skip to [Running the App](#running-the-app).
 
 **If you received the Mac package (`Trade Log Mac.tar.gz`):**
 
 1. Double-click the `.tar.gz` to extract it, then open the `Trade Log Mac` folder.
-2. Double-click `Trade Log.app`. The first launch installs everything it needs (~1–2 minutes) — no Python required.
-   - macOS security prompt: right-click `Trade Log.app` → **Open** → **Open** (on macOS Sequoia, allow it via System Settings → Privacy & Security → **Open Anyway**).
-3. Your browser opens Trade Log automatically. Click **Quit** in the dialog to stop the app.
+2. Trade Log.app looks like an application. It's a folder. Right click, choose "Show Package Contents." At this point, you will (likely) get blocked by a security function. If that happens, go to the system settings, navigate to the security section, find the section that allows you to override a recent security block, and open the folder again.
+3. Navigate to the Resources --> Mac_OS subfolder. Double click the Trade Log. You're likely to get blocked again for the same security reasons. Override again, just as before. Double click Launcher file and the log should start up.
+4. Your browser opens Trade Log automatically. Click **Quit** in the dialog to stop the app.
 
 > **If the app won't open** (e.g. you see *"Could not create a Python environment"*), double-click **`Open Trade Log (if the app won't open).command`** in the same folder instead. It runs the identical app from a Terminal window, which avoids a macOS launch-environment quirk that affects some setups. (First time: if macOS says it "cannot verify the developer," right-click the file → **Open** → **Open**.) See [The app won't open on Mac](#the-app-wont-open-on-mac) for details.
 
