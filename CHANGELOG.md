@@ -6,6 +6,12 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-10-22
+- Performance → Summary now shows the Highest Open P&L — the single best unrealized profit any trade in the filter ever showed (its best price between entry and exit vs entry) — and the Avg Highest Open P&L across all measured trades
+- The Tag Comparison table (Performance → Breakdown) adds Highest Open P&L and Avg Highest Open P&L columns, so you can see which tags tended to run furthest into profit before you closed
+- Giveback by Trade adds a Highest Open P&L column, showing each trade's peak paper profit beside what it gave back
+- Measured the same way as Giveback: closed stock trades with price history; open trades, options and non-US listings are left out
+
 ## 2026-10-16
 - Performance no longer says "no balance set" in Connected to Broker mode when you've saved an Account Balance. Sharpe, Sortino, Calmar and % of Account now use it until a broker sync replaces it
 - Each account can hold its own balance (Settings → Trading → Accounts), with a total and a button to use it as your Account Balance

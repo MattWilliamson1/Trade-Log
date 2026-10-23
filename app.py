@@ -3754,9 +3754,30 @@ def delete_attachment(attachment_id: int, filepath: str):
         conn.execute("DELETE FROM trade_attachments WHERE id=?", (attachment_id,))
 
 
-def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
+def _parse_csv_date(v, dayfirst: bool) -> pd.Timestamp:
+    """A date cell from a CSV. A spreadsheet re-saves ISO dates in the
+    computer's own format, so 03/04/2026 is read the way the user writes
+    dates — but ISO itself is unambiguous, and pandas with dayfirst=True would
+    read 2025-11-06 as 11 June, so it never gets the dayfirst hint."""
+    s = str(v).strip()
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}", s):
+        return pd.to_datetime(s[:10], format="%Y-%m-%d")
+    return pd.to_datetime(s, dayfirst=dayfirst)
+
+
+def import_trades_from_csv(df: pd.DataFrame,
+                           dayfirst: bool = False) -> tuple[int, int, list[str]]:
+    """Add the file's trades; a row whose ID is a trade in the log updates it.
+
+    Returns (added, updated, messages). The ID column is what makes an
+    exported file (export_trades_csv) round-trip: edit it in a spreadsheet,
+    import it back, and the trades change in place instead of being skipped
+    as duplicates or added a second time. Rows without an ID, or with one
+    the log doesn't have, are new trades as before.
+    """
     df.columns = [str(c).strip() for c in df.columns]
     col_map = {
+        "id":                "id",
         "entry date":        "entry_date",
         "ticker":            "ticker",
         "q":                 "quantity",
@@ -3831,7 +3852,7 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
         if v is None:
             return None
         try:
-            dt = pd.to_datetime(v).date()
+            dt = _parse_csv_date(v, dayfirst).date()
             # IB exports 0 for absent dates, which pandas parses as 1970-01-01
             if dt.year < 1990:
                 return None
@@ -3840,7 +3861,180 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
             return None
 
     tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
-    success, skipped_dupes, errors = 0, 0, []
+
+    def _tag_ids(tags_raw) -> list:
+        nonlocal tag_cache
+        ids = []
+        for tname in str(tags_raw or "").split(","):
+            tname = tname.strip()
+            if not tname:
+                continue
+            if tname.lower() not in tag_cache:
+                add_tag(tname, "")
+                tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
+            tid = tag_cache.get(tname.lower())
+            if tid and tid not in ids:
+                ids.append(tid)
+        return ids
+
+    _existing = {}
+    if "id" in col_lookup:
+        _existing = {int(r["id"]): r for r in load_trades().to_dict("records")}
+
+    def _update_from_row(row, cur: dict) -> bool:
+        """Write the row's changes onto trade `cur`; True when anything changed.
+
+        Only columns the file has are touched, so a trimmed-down sheet can't
+        blank out the rest. In a column it does have, an empty cell clears
+        exit, stops and notes (that's how a trade is reopened or a stop
+        removed) but leaves entry date, quantity, entry price, side and
+        account alone. Values are compared before writing so the round trip
+        through native currency can't nudge an unchanged price.
+        """
+        has = col_lookup.__contains__
+        ccy = str(_val(row, "currency") or "").upper().strip() if has("currency") else ""
+        ccy = ccy or trade_currency(cur)
+        if ccy not in NATIVE_CURRENCIES:
+            raise ValueError(f"currency {ccy} isn't supported")
+
+        def _iso(d):
+            return d.isoformat() if d else None
+
+        entry_date = _iso(_date(row, "entry_date")) or cur.get("entry_date")
+        exit_date  = (_iso(_date(row, "exit_date")) if has("exit_date")
+                      else cur.get("exit_date"))
+        if _exit_before_entry(entry_date, exit_date):
+            raise ValueError(f"exit date {exit_date} is before entry date {entry_date}")
+
+        def _cur_f(k):
+            v = cur.get(k)
+            return None if v is None or (isinstance(v, float) and pd.isna(v)) else float(v)
+
+        same_ccy = ccy == trade_currency(cur)
+        if ccy == "USD":
+            fx_e = 1.0
+        else:
+            fx_e = _float(row, "fx_rate_entry")
+            if fx_e is None and same_ccy and entry_date == cur.get("entry_date"):
+                fx_e = _cur_f("fx_rate_entry")
+            fx_e = fx_e or get_fx_rate_at_date(ccy, entry_date) or 1.0
+        if not exit_date:
+            fx_x = None
+        elif ccy == "USD":
+            fx_x = 1.0
+        else:
+            fx_x = _float(row, "fx_rate_exit")
+            if fx_x is None and same_ccy and exit_date == cur.get("exit_date"):
+                fx_x = _cur_f("fx_rate_exit")
+            fx_x = fx_x or get_fx_rate_at_date(ccy, exit_date)
+
+        new = {"native_currency": ccy, "fx_rate_entry": fx_e,
+               "ticker": str(_val(row, "ticker")).upper().strip(),
+               "entry_date": entry_date}
+        # USD trades are saved with an exit rate of 1.0 even while open; only
+        # write the exit rate when it can mean something.
+        if exit_date or ccy != "USD":
+            new["fx_rate_exit"] = fx_x
+        for k in ("quantity", "multiplier"):
+            if _float(row, k) is not None:
+                new[k] = _float(row, k)
+        if _float(row, "entry_price") is not None:
+            new["entry_price"] = native_to_usd(_float(row, "entry_price"), fx_e)
+        elif not same_ccy or fx_e != _cur_f("fx_rate_entry"):
+            # Rate changed but the cell is empty: keep the price in its own money.
+            new["entry_price"] = native_to_usd(
+                usd_to_native(_cur_f("entry_price"), _cur_f("fx_rate_entry") or 1.0), fx_e)
+        if has("exit_date") or has("exit_price"):
+            new["exit_date"] = exit_date
+            _xp = _float(row, "exit_price") if has("exit_price") else usd_to_native(
+                _cur_f("exit_price"), _cur_f("fx_rate_exit") or _cur_f("fx_rate_entry") or 1.0)
+            new["exit_price"] = native_to_usd(_xp, fx_x or fx_e) if exit_date else None
+        if has("opening_stop") or has("current_stop"):
+            o = (native_to_usd(_float(row, "opening_stop"), fx_e) if has("opening_stop")
+                 else _cur_f("opening_stop"))
+            c = (native_to_usd(_float(row, "current_stop"), fx_e) if has("current_stop")
+                 else _cur_f("current_stop"))
+            new["opening_stop"] = o
+            new["current_stop"] = c
+            # stop_enabled defaults to 1 on trades that never had a stop, so
+            # only touch it when the stops themselves change.
+            if (o, c) != (_cur_f("opening_stop"), _cur_f("current_stop")):
+                new["stop_enabled"] = 1 if (o is not None or c is not None) else 0
+        if has("commission"):
+            _com = native_to_usd(_float(row, "commission") or 0.0, fx_e)
+            if _com or _cur_f("commission"):
+                new["commission"] = _com
+        if has("notes"):
+            _n = _val(row, "notes")
+            new["notes"] = str(_n).strip() if _n else None
+        if has("exchange"):
+            new["exchange"] = str(_val(row, "exchange") or "").upper().strip()
+        if _val(row, "account_name"):
+            new["account_name"] = str(_val(row, "account_name")).strip()
+        if _val(row, "side"):
+            new["side"] = ("short" if str(_val(row, "side")).lower()
+                           in ("short", "s", "sell", "b/s-sell") else "long")
+        if has("expiration"):
+            _exp = _date(row, "expiration")
+            new["expiration"] = _iso(_exp)
+        if has("strike"):
+            new["strike"] = _float(row, "strike")
+        if _val(row, "option_type"):
+            _pc = str(_val(row, "option_type")).strip().lower()[:1]
+            # Stored as 'C'/'call' etc. depending on where the trade came
+            # from; only the letter matters, so keep the stored spelling.
+            if _pc != str(cur.get("option_type") or "").strip().lower()[:1]:
+                new["option_type"] = "call" if _pc == "c" else "put"
+        if has("expiration") and _iso_or_none(cur.get("expiration")) == new["expiration"]:
+            del new["expiration"]   # same date, stored as 20260717 rather than ISO
+        if has("instrument_type"):
+            _it = str(_val(row, "instrument_type") or "").lower()
+            # What the trade will hold once this row is applied.
+            _eff_exp    = new.get("expiration", _iso_or_none(cur.get("expiration")))
+            _eff_strike = new.get("strike", _cur_f("strike"))
+            if any(k in _it for k in ("fut", "future")):
+                new["instrument_type"] = "future"   # futures have an expiration too
+            elif _eff_exp or _eff_strike is not None:
+                new["instrument_type"] = "option"
+            elif any(k in _it for k in ("opt", "call", "put", "bag", "combo", "option")):
+                new["instrument_type"] = "option"
+            elif any(k in _it for k in ("fut", "future")):
+                new["instrument_type"] = "future"
+            elif _it:
+                new["instrument_type"] = "stock"
+
+        def _differs(a, b):
+            # None, NaN and "" are all "empty" — notes and exchange are stored
+            # either way depending on where the trade came from.
+            a = None if a is None or (isinstance(a, float) and pd.isna(a)) or a == "" else a
+            b = None if b is None or (isinstance(b, float) and pd.isna(b)) or b == "" else b
+            if a is None or b is None:
+                return (a is None) != (b is None)
+            if isinstance(a, (int, float)) and not isinstance(a, bool):
+                try:
+                    return abs(float(a) - float(b)) > 1e-6
+                except (TypeError, ValueError):
+                    return True
+            return str(a) != str(b)
+
+        sets = {k: v for k, v in new.items() if _differs(v, cur.get(k))}
+        tag_change = None
+        if has("tags_raw"):
+            want = _tag_ids(_val(row, "tags_raw"))
+            if set(want) != set(get_trade_tag_ids(int(cur["id"]))):
+                tag_change = want
+        if not sets and tag_change is None:
+            return False
+        with get_connection() as conn:
+            if sets:
+                conn.execute(f"UPDATE trades SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
+                             [*sets.values(), int(cur["id"])])
+            if tag_change is not None:
+                conn.execute("DELETE FROM trade_tags WHERE trade_id=?", (int(cur["id"]),))
+                _link_tags(conn, int(cur["id"]), tag_change)
+        return True
+
+    success, updated, unchanged, skipped_dupes, errors = 0, 0, 0, 0, []
     for i, row in df.iterrows():
         try:
             ticker = _val(row, "ticker")
@@ -3849,19 +4043,15 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
                 continue
             ticker = str(ticker).upper().strip()
 
-            tags_raw = _val(row, "tags_raw")
-            tag_ids  = []
-            if tags_raw:
-                for tname in str(tags_raw).split(","):
-                    tname = tname.strip()
-                    if not tname:
-                        continue
-                    if tname.lower() not in tag_cache:
-                        add_tag(tname, "")
-                        tag_cache = {t["name"].lower(): t["id"] for t in load_tags()}
-                    tid = tag_cache.get(tname.lower())
-                    if tid:
-                        tag_ids.append(tid)
+            _id = _float(row, "id")
+            if _id is not None and int(_id) in _existing:
+                if _update_from_row(row, _existing[int(_id)]):
+                    updated += 1
+                else:
+                    unchanged += 1
+                continue
+
+            tag_ids = _tag_ids(_val(row, "tags_raw"))
 
             opening_stop = _float(row, "opening_stop")
             current_stop = _float(row, "current_stop")
@@ -3871,7 +4061,7 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
             expiration  = _val(row, "expiration")
             if expiration:
                 try:
-                    expiration = pd.to_datetime(expiration).strftime("%Y-%m-%d")
+                    expiration = _parse_csv_date(expiration, dayfirst).strftime("%Y-%m-%d")
                 except Exception:
                     expiration = None
             strike      = _float(row, "strike")
@@ -3879,13 +4069,14 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
             # ── Options / futures detection ────────────────────────────────
             raw_itype  = _val(row, "instrument_type")
             itype_str  = str(raw_itype).lower() if raw_itype else ""
-            if expiration or strike is not None:
+            if any(k in itype_str for k in ("fut", "future")):
+                # Checked first: a future's expiration isn't an option's
+                instrument_type = "future"
+            elif expiration or strike is not None:
                 # Presence of option-specific fields overrides the type label
                 instrument_type = "option"
             elif any(k in itype_str for k in ("opt", "call", "put", "bag", "combo", "option")):
                 instrument_type = "option"
-            elif any(k in itype_str for k in ("fut", "future")):
-                instrument_type = "future"
             else:
                 instrument_type = "stock"
             raw_pc      = _val(row, "option_type")
@@ -3996,7 +4187,107 @@ def import_trades_from_csv(df: pd.DataFrame) -> tuple[int, list[str]]:
 
     if skipped_dupes:
         errors.insert(0, f"ℹ️  {skipped_dupes} row(s) skipped — already exist in the log")
-    return success, errors
+    if unchanged:
+        errors.insert(0, f"ℹ️  {unchanged} row(s) matched a trade by ID with nothing to change")
+    if updated:
+        _cached_load_trades.clear()
+        _bust("_v_trades")
+    return success, updated, errors
+
+
+# Same headers import_trades_from_csv reads, so an export can be edited in a
+# spreadsheet and imported straight back. ID first: it's what turns a row back
+# into an update of that trade.
+TRADE_CSV_COLUMNS = [
+    "ID", "Entry Date", "Ticker", "Q", "Entry Price", "Tags",
+    "Initial Stop Loss", "Current Stop", "Exit Date", "Exit Price",
+    "Side", "Currency", "FX Rate Entry", "FX Rate Exit", "Exchange",
+    "Commission", "Notes", "Account",
+    "Instrument Type", "Expiration", "Strike", "Option Type", "Multiplier",
+]
+
+
+def _iso_or_none(v):
+    """A stored date as YYYY-MM-DD — some option expirations are saved as
+    20260717, which a spreadsheet would read as a number."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+        return None
+    d = pd.to_datetime(str(v), errors="coerce")
+    return None if pd.isna(d) else d.strftime("%Y-%m-%d")
+
+
+def export_trades_csv(trade_ids=None) -> bytes:
+    """Trades in the import layout, as UTF-8 CSV bytes (BOM so Excel reads it).
+
+    Prices, stops and commission are written in each trade's own currency with
+    its FX rates alongside — the same way the import expects them — so a
+    non-USD trade comes back to the same stored USD values. `trade_ids` limits
+    the export (the Journal's filtered rows); None exports every trade.
+    """
+    t = load_trades()
+    if trade_ids is not None:
+        t = t[t["id"].isin([int(i) for i in trade_ids])]
+    t = t.sort_values(["entry_date", "id"], na_position="last")
+
+    def _num(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return round(float(v), 8)
+
+    rows = []
+    for r in t.to_dict("records"):
+        ccy  = trade_currency(r)
+        fx_e = float(r.get("fx_rate_entry") or 1.0) if ccy != "USD" else 1.0
+        _fxx = r.get("fx_rate_exit")
+        fx_x = (None if _fxx is None or pd.isna(_fxx) else float(_fxx)) if ccy != "USD" else 1.0
+        has_exit = bool(r.get("exit_date"))
+        itype = r.get("instrument_type") or "stock"
+        _pc = str(r.get("option_type") or "").strip().lower()[:1]
+        rows.append({
+            "ID":                int(r["id"]),
+            "Entry Date":        r.get("entry_date"),
+            "Ticker":            r.get("ticker"),
+            "Q":                 _num(r.get("quantity")),
+            "Entry Price":       _num(usd_to_native(r.get("entry_price"), fx_e)),
+            "Tags":              r.get("tags") or "",
+            "Initial Stop Loss": _num(usd_to_native(r.get("opening_stop"), fx_e)),
+            "Current Stop":      _num(usd_to_native(r.get("current_stop"), fx_e)),
+            "Exit Date":         r.get("exit_date") if has_exit else None,
+            "Exit Price":        (_num(usd_to_native(r.get("exit_price"), fx_x or fx_e))
+                                  if has_exit else None),
+            "Side":              r.get("side") or "long",
+            "Currency":          ccy,
+            "FX Rate Entry":     None if ccy == "USD" else _num(fx_e),
+            "FX Rate Exit":      None if ccy == "USD" or not has_exit else _num(fx_x),
+            "Exchange":          r.get("exchange") or "",
+            "Commission":        _num(usd_to_native(r.get("commission") or 0.0, fx_e)),
+            "Notes":             r.get("notes") or "",
+            "Account":           r.get("account_name") or "Default",
+            "Instrument Type":   itype,
+            # Futures have an expiration too; strike and C/P are options-only.
+            "Expiration":        _iso_or_none(r.get("expiration")),
+            "Strike":            _num(r.get("strike")) if itype == "option" else None,
+            "Option Type":       ({"c": "Call", "p": "Put"}.get(_pc, "")
+                                  if itype == "option" else ""),
+            "Multiplier":        _num(r.get("multiplier")) or 1.0,
+        })
+    return pd.DataFrame(rows, columns=TRADE_CSV_COLUMNS).to_csv(index=False).encode("utf-8-sig")
+
+
+def read_trades_csv(uploaded) -> pd.DataFrame:
+    """Read an uploaded trades CSV, whatever Excel saved it as.
+
+    Excel's plain "CSV" save is the Windows code page, not UTF-8, so a note
+    with an em dash or a £ would fail to decode as UTF-8.
+    """
+    import io
+    raw = uploaded.getvalue()
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(io.BytesIO(raw), encoding="latin-1", encoding_errors="replace")
 
 
 # ── Smart CSV import (BETA) ───────────────────────────────────────────────────
@@ -6193,39 +6484,24 @@ _render_cloud_banners()
 
 TOUR_STEPS = [
     {
-        "section": "broker",
-        "page": P_DATA, "sub": S_BROKERS,
-        "title": "Connect to Interactive Brokers (optional)",
-        "body": (
-            "If you use **Interactive Brokers**, you can connect Trade Log to TWS or "
-            "IB Gateway for live prices and automatic balance sync.\n\n"
-            "Expand **“🛟 How to connect — step by step”** below for plain-English "
-            "instructions. Set the **Host / Port / Client ID**, then click "
-            "**🔌 Test Connection**.\n\n"
-            "Don't use IBKR, or want to set this up later? Just hit **Skip this section** — "
-            "everything works fine entering trades manually."
-        ),
-    },
-    {
         "section": "settings",
         "page": P_SETTINGS, "sub": S_TRADING,
-        "title": "Set your account balance",
+        "title": "Set your account balance and commissions",
         "body": (
-            "In the **Account & Equity** form below, enter your current account "
-            "value, then **Save**.\n\n"
-            "This drives position sizing and the **% of Account** risk figures in your "
-            "trade table."
-        ),
-    },
-    {
-        "section": "settings",
-        "page": P_SETTINGS, "sub": S_TRADING,
-        "title": "Set your default commissions",
-        "body": (
-            "In **Commission Defaults**, enter your broker's typical fees for stocks "
-            "(flat per trade), options (per contract), and futures (per contract).\n\n"
-            "These pre-fill whenever you log a trade, so your P&L can be shown **net of "
-            "fees** automatically."
+            "**Account balance** — in **Account & Equity** below, enter what your "
+            "trading account is worth today (cash plus open positions), then click "
+            "**💾 Save Account & Equity**.\n\n"
+            "Trade Log measures your trades against this number: it's what the "
+            "**% of Account** column divides by (so a $500 risk on a $50,000 account "
+            "shows as 1%), what each new trade's **planned risk** is shown against when "
+            "you save it, and the base for drawdown %, Sharpe and Sortino on "
+            "**📊 Performance**. Update it as your "
+            "account grows — or connect a broker on **🔗 Data** and it syncs itself.\n\n"
+            "**Default commissions** — in **Commission Defaults**, enter your broker's "
+            "typical fees for stocks (flat per trade), options and futures (per "
+            "contract), then **💾 Save Commission Defaults**. These pre-fill every new "
+            "trade so your P&L is shown **net of fees**; you can still override them per "
+            "trade. Trade commission-free? Leave them at 0."
         ),
     },
     {
@@ -6241,7 +6517,7 @@ TOUR_STEPS = [
     {
         "section": "settings",
         "page": P_SETTINGS, "sub": S_DISPLAY,
-        "title": "Add any extra currencies",
+        "title": "Set your default currency",
         "body": (
             "Trading in a non-USD account? Open **Multi-Currency**, switch it on, and "
             "pick your **default currency** (AUD, CAD, EUR, GBP, NZD).\n\n"
@@ -6252,25 +6528,25 @@ TOUR_STEPS = [
     {
         "section": "tags",
         "page": P_SETTINGS, "sub": S_TAGS,
-        "title": "Create your first tag",
+        "title": "What tags are for",
         "body": (
-            "**Tags** let you slice and filter your trades later — by strategy, setup, "
-            "watchlist, conviction, anything you like.\n\n"
-            "Type a name in **Add New Tag** below (try something like *Breakout* or "
-            "*Swing*) and click **Add**. Go ahead and create one now — then hit "
-            "**Next →**."
+            "**Tags** are labels you attach to trades — your strategy, the setup, the "
+            "watchlist it came from, your conviction, a mistake you made… anything you "
+            "want to measure.\n\n"
+            "A trade can carry several tags. Later you can **filter the trade table** by "
+            "tag and compare tags side by side on **📊 Performance** — that's how you "
+            "find out which setups actually make you money and which ones don't."
         ),
     },
     {
-        "section": "equity",
-        "page": P_DATA, "sub": S_BALANCES,
-        "title": "Track your equity over time",
+        "section": "tags",
+        "page": P_SETTINGS, "sub": S_TAGS,
+        "title": "Create your first tag",
         "body": (
-            "Enter a **date** and your **end-of-day balance** below (plus any deposits "
-            "or withdrawals that day) and **Save**.\n\n"
-            "Add an entry regularly — or bulk-import from a CSV or Interactive Brokers "
-            "on **📥 File Import** — and Trade Log plots your equity curve and "
-            "time-weighted return on **📊 Performance → 📈 Equity Curve**."
+            "Type a name in **Add New Tag** below (try something like *Breakout* or "
+            "*Swing*) and click **Add**.\n\n"
+            "Go ahead and create one now — you'll be able to pick it on your first "
+            "trade in the next step."
         ),
     },
     {
@@ -6282,9 +6558,73 @@ TOUR_STEPS = [
             "Required fields are marked with a green **\\***: **Ticker**, **Quantity**, "
             "and **Entry Price** (plus the **Entry Date**). Everything else — exit "
             "price/date, stop loss, tags, notes — is optional and can be filled in "
-            "later.\n\n"
-            "Press **Ctrl+Enter** or click **Save and Log Trade** to save. That's it — you're "
-            "set up!"
+            "later. Try adding the tag you just created.\n\n"
+            "Press **Ctrl+Enter** or click **Save and Log Trade** to save."
+        ),
+    },
+    {
+        "section": "grid",
+        "page": P_JOURNAL,
+        "title": "The trade table",
+        "body": (
+            "Every trade lives in the table below — one row per trade. Hover the "
+            "**ⓘ** on a column header to see what that column means.\n\n"
+            "To **add or remove fields**, click **⚙️ Columns** above the table: tick "
+            "columns on or off in **Visible columns**, use **↑ / ↓** to reorder and "
+            "**✕** to remove one. Save the layout as your startup view, or hit "
+            "**↺ Restore default columns** to start over."
+        ),
+    },
+    {
+        "section": "plan",
+        "page": P_PLAN, "sub": S_PLAN,
+        "title": "Plan your trades before you take them",
+        "body": (
+            "The **📝 Trading Plan** page walks you through a trade idea before you enter "
+            "it: thesis, setup, entry criteria, and your **entry, target and stop** with "
+            "the reward-to-risk worked out for you. Click **💾 Log This Plan** to save it.\n\n"
+            "**It links back to the Journal:** when you take the trade, open **➕ New "
+            "Trade** and pick the plan in **🔗 Link a trade plan**. The plan's summary is "
+            "pulled into the trade's notes, and the link is kept so you can later check "
+            "whether you followed your plan."
+        ),
+    },
+    {
+        "section": "close",
+        "page": P_JOURNAL,
+        "title": "Close a trade or move a stop",
+        "body": (
+            "Below the table is the **Actions** bar. Pick **📌 Close / Stops** to see "
+            "every open position in one list.\n\n"
+            "- **Move a stop:** type the new stop and click **💾** — only the current "
+            "stop changes; your opening stop is kept so your original risk stays on "
+            "record.\n"
+            "- **Close a trade:** enter the **exit price** and **date**, then click "
+            "**Close**.\n\n"
+            "Selling only part of a position? Use **🔄 Add / Exit Lots** instead."
+        ),
+    },
+    {
+        "section": "analysis",
+        "page": P_PERF, "sub": S_SUMMARY,
+        "title": "Analyze your results",
+        "body": (
+            "**📊 Performance** turns your log into stats — win rate, average winner "
+            "and loser, expected value, risk-adjusted returns and more. Use the "
+            "**Filters** to narrow it to a date range, tag or ticker.\n\n"
+            "**Not sure what a number means?** Hover the **ⓘ** next to any metric for "
+            "its definition and how it's calculated."
+        ),
+    },
+    {
+        "section": "analysis",
+        "page": P_SETTINGS, "sub": S_HELP,
+        "title": "The glossary",
+        "body": (
+            "For every definition in one place, open **⚙️ Settings → ❓ Help** and "
+            "scroll to the **📖 Glossary**. You can also replay this tour from here "
+            "anytime.\n\n"
+            "That's it — you're set up! Click **Finish ✓** to start journaling."
         ),
     },
 ]
@@ -6364,12 +6704,14 @@ def _welcome_body():
         "Trade Log is your personal trading journal — it runs entirely on **your "
         "own computer** and your data never leaves your machine.\n\n"
         "This quick **setup tour** walks you through getting ready:\n\n"
-        "- 🔗 Connecting **Interactive Brokers** (optional)\n"
-        "- ⚙️ Setting your **account balance, date format, commissions & currency**\n"
-        "- 🏷️ Creating your first **tag**\n"
-        "- 📈 Logging your **equity**\n"
-        "- 📋 Logging your first **trade**\n\n"
-        "It takes about a minute, and you can **skip any part** at any time."
+        "- ⚙️ Setting your **account balance, commissions, date format & currency**\n"
+        "- 🏷️ What **tags** are, and creating your first one\n"
+        "- 📋 Logging your first **trade**\n"
+        "- 🗂️ The **trade table** and choosing its columns\n"
+        "- 📝 **Trading plans** and linking them to trades\n"
+        "- 📌 **Closing** a trade and **moving a stop**\n"
+        "- 📊 The **Performance** page and where to find definitions\n\n"
+        "It takes a few minutes, and you can **skip any part** at any time."
     )
     wc1, wc2 = st.columns(2)
     if wc1.button("🧭  Start setup tour", type="primary", width="stretch", key="_welcome_start"):
@@ -8434,9 +8776,16 @@ if page == P_JOURNAL:
             help="Select rows in the table, then pick what to do with them. "
                  "Click the active action again to close it.",
         )
-        _ab2.download_button("📥  Export CSV", data=filtered.to_csv(index=False),
-                             file_name="selected_trades.csv", mime="text/csv",
-                             width="stretch", help="Download the filtered trades as CSV")
+        # _pre_agg_filtered: Group by ticker and collapsed spreads roll trades
+        # into one row, and the file needs every trade with its own ID.
+        _ab2.download_button("📥  Export CSV",
+                             data=export_trades_csv(_pre_agg_filtered["id"].tolist()),
+                             file_name="trade_log_export.csv", mime="text/csv",
+                             width="stretch",
+                             help="Download the trades the filters show, in the same layout as "
+                                  "CSV import. Edit it in a spreadsheet and import it back on "
+                                  "🔗 Data → 📥 File Import (Trade Log headers): rows keep their "
+                                  "ID, so they update those trades instead of adding new ones.")
         if _sel_ids:
             st.caption(f"Acting on **{len(_sel_ids)} selected trade{'s' if len(_sel_ids) != 1 else ''}**"
                        + (f" · {_jr_one_row['ticker']} (ID {_jr_one_id})" if _jr_one_row is not None else ""))
@@ -10583,11 +10932,27 @@ if _sub == S_IMPORT:
                 "`Initial Stop Loss`, `Current Stop`, `Exit Date`, `Exit Price`  \n"
                 "Optional: `Side`, `Currency` (prices in that currency — converted at the "
                 "trade's dates, or use `FX Rate Entry` / `FX Rate Exit`), `Exchange`, "
-                "`Commission`, `Notes`, `Account`"
+                "`Commission`, `Notes`, `Account`, and for options `Instrument Type`, "
+                "`Expiration`, `Strike`, `Option Type`, `Multiplier`  \n"
+                "**To edit trades in a spreadsheet:** download your trades below, change them, "
+                "and upload the file here. Rows with an `ID` update that trade; only columns "
+                "in the file are changed, and an empty Exit, Stop or Notes cell clears it. "
+                "Rows with no `ID` are added as new trades. Deleting a row from the file "
+                "doesn't delete the trade."
+            )
+            _tpl_c, _exp_c = st.columns(2)
+            _exp_c.download_button(
+                "⬇  Download all my trades",
+                data=export_trades_csv(),
+                file_name="trade_log_export.csv",
+                mime="text/csv",
+                key="csv_export_all_dl",
+                width="stretch",
+                help="Every trade in the log, in this import layout with each trade's ID.",
             )
             # Built here rather than shipped as a file: the installers never
             # carried tradeImport.csv, so the template has to live in the app.
-            st.download_button(
+            _tpl_c.download_button(
                 "⬇  Download CSV template",
                 data=(
                     "Entry Date,Ticker,Q,Entry Price,Tags,Initial Stop Loss,Current Stop,"
@@ -10600,23 +10965,38 @@ if _sub == S_IMPORT:
                 file_name="trade_log_import_template.csv",
                 mime="text/csv",
                 key="csv_template_dl",
+                width="stretch",
             )
+            # The result is kept across the rerun that refreshes the trade
+            # table; shown inline it would vanish the moment it appeared.
+            _csv_res = st.session_state.pop("_csv_import_result", None)
+            if _csv_res:
+                n_ok, n_upd, errs = _csv_res
+                if n_ok or n_upd:
+                    st.success(" · ".join(filter(None, [
+                        f"Added {n_ok} trade(s)" if n_ok else "",
+                        f"updated {n_upd} trade(s)" if n_upd else ""])).capitalize() + ".")
+                if errs:
+                    _real = [e for e in errs if not e.startswith("ℹ️")]
+                    (st.warning if _real else st.info)(
+                        "Some rows had issues:" if _real else "Nothing else to do:")
+                    for e in errs:
+                        st.caption(e)
             csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
             if csv_file:
                 try:
-                    csv_df = pd.read_csv(csv_file)
+                    csv_df = read_trades_csv(csv_file)
                     st.dataframe(csv_df.head(5), width='stretch', hide_index=True)
-                    st.caption(f"{len(csv_df)} rows detected")
+                    _n_ids = (int(pd.to_numeric(csv_df["ID"], errors="coerce").notna().sum())
+                              if "ID" in csv_df.columns else 0)
+                    st.caption(f"{len(csv_df)} rows detected"
+                               + (f" · {_n_ids} with an ID (these update existing trades)"
+                                  if _n_ids else ""))
                     if st.button("Import Trades", type="primary"):
-                        n_ok, errs = import_trades_from_csv(csv_df)
-                        if n_ok:
-                            st.success(f"Imported {n_ok} trade(s).")
-                        if errs:
-                            st.warning("Some rows had issues:")
-                            for e in errs:
-                                st.caption(e)
-                        if n_ok:
-                            st.rerun()
+                        n_ok, n_upd, errs = import_trades_from_csv(
+                            csv_df, dayfirst=(date_fmt == "euro"))
+                        st.session_state["_csv_import_result"] = (n_ok, n_upd, errs)
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Could not read CSV: {e}")
 
@@ -12454,6 +12834,19 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                         pnl_avail["_gb"] = _gb_usd
                     pnl_avail["_gb"] = pd.to_numeric(pnl_avail["_gb"], errors="coerce")
                     pnl_avail["_gb_cap"] = (_gb_usd / _mop * 100).where(_mop > 0)
+                    # Highest open profit (peak unrealized) in the current P&L unit,
+                    # mirroring the giveback conversion so the metric follows the toggle.
+                    if _pnl_mode == "%":
+                        pnl_avail["_mop_d"] = [
+                            _pct_of_trade(r, m) if pd.notna(m) else None
+                            for (_, r), m in zip(pnl_avail.iterrows(), _mop)]
+                    elif _pnl_mode == "Acct. %":
+                        pnl_avail["_mop_d"] = _mop / acct_bal * 100 if acct_bal else np.nan
+                    elif _pnl_mode == "R":
+                        pnl_avail["_mop_d"] = _mop / pnl_avail["_risk"].astype(float)
+                    else:
+                        pnl_avail["_mop_d"] = _mop
+                    pnl_avail["_mop_d"] = pd.to_numeric(pnl_avail["_mop_d"], errors="coerce")
 
                 def _gb_summary(df):
                     """(avg, median, % of open profit given back, n measured) for a frame.
@@ -12472,6 +12865,22 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                             float(g.median()) if not g.empty else None,
                             gb_sum / mop_sum * 100 if mop_sum > 0 else None,
                             len(g))
+
+                def _mop_summary(df):
+                    """(highest, average, n measured) of max open profit for a frame,
+                    in the current P&L unit.
+
+                    Highest open P&L is the best unrealized profit each closed stock
+                    trade ever showed — its best price (highest daily high for a long,
+                    lowest daily low for a short) versus entry, on the full position.
+                    Returns the single biggest across the frame and the average over
+                    every trade that could be measured (same trades as giveback)."""
+                    if "_mop_d" not in df.columns:
+                        return None, None, 0
+                    m = df["_mop_d"].dropna()
+                    if m.empty:
+                        return None, None, 0
+                    return float(m.max()), float(m.mean()), len(m)
 
                 if _sub == S_SUMMARY:
                     # ── Total Return ──────────────────────────────────────────────
@@ -12575,6 +12984,26 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                     )
                     st.caption(f"Giveback measured on {_gb_n} of {len(pnl_avail)} trade(s). "
                                "Open trades, options and non-US listings are left out.")
+
+                    # ── Highest Open P&L (peak unrealized) ─────────────────────────
+                    st.markdown("##### Highest Open P&L")
+                    _mop_hi, _mop_avg, _mop_n = _mop_summary(pnl_avail)
+                    _mop_cols = st.columns(2)
+                    _mop_cols[0].metric(
+                        "Highest Open P&L", _mv(_mop_hi),
+                        help="The single best unrealized profit any trade in this filter "
+                         "ever showed — its best price (highest daily high for a long, "
+                         "lowest daily low for a short) between entry and exit, versus "
+                         "entry, on the full position.",
+                    )
+                    _mop_cols[1].metric(
+                        "Avg Highest Open P&L", _mv(_mop_avg),
+                        help="Average across trades of each trade's highest open P&L — how "
+                         "much a trade was typically worth at its best point before it "
+                         "was closed.",
+                    )
+                    st.caption(f"Peak open P&L measured on {_mop_n} of {len(pnl_avail)} "
+                               "trade(s). Open trades, options and non-US listings are left out.")
 
                     # Performance charts — two side-by-side bar charts
                     if _avg_winner_v is not None or _avg_loser_v is not None:
@@ -12979,12 +13408,15 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                             )
                             _t_total_raw  = float(_t_raw.sum())
                             _t_gb, _, _t_gb_cap, _ = _gb_summary(_t_df)
+                            _t_mop_hi, _t_mop_avg, _ = _mop_summary(_t_df)
                             _cmp_rows.append({
                                 "Tag":             _tname,
                                 "Trades":          _t_n,
                                 "Win Rate":        f"{_t_wr*100:.1f}%",
                                 "Avg Winner":      _mv(_t_aw),
                                 "Avg Loser":       _mv(_t_al),
+                                "Highest Open P&L":     _mv(_t_mop_hi),
+                                "Avg Highest Open P&L": _mv(_t_mop_avg),
                                 "Avg Giveback":    _mv(_t_gb),
                                 "Open Profit Given Back": (f"{_t_gb_cap:.1f}%"
                                                            if _t_gb_cap is not None else "N/A"),
@@ -13050,6 +13482,8 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                             "Tags":        _gbt["tags"].fillna("").values,
                             "Entry":       [fmt_price(v) for v in _gbt["entry_price"]],
                             "Best Price":  [fmt_price(v) for v in _gbt["_peak"]],
+                            "Highest Open P&L": [_mv(v) if pd.notna(v) else "—"
+                                                 for v in _gbt["_mop_d"]],
                             "Exit":        [fmt_price(v) for v in _gbt["exit_price"]],
                             "P&L":         [_mv(v) for v in (_gbt["_pnl_disp"] if "_pnl_disp" in _gbt.columns
                                                              else _gbt["_pnl"])],
