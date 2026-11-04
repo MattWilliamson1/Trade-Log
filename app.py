@@ -449,10 +449,27 @@ def fmt_date(date_str, fmt=DEFAULT_DATE_FORMAT) -> str:
     return d.strftime(DATE_FORMATS.get(fmt, DATE_FORMATS[DEFAULT_DATE_FORMAT])[0])
 
 
+def px_num(v) -> str:
+    """A price as text, without the currency sign: two decimals from $1 up,
+    and up to four under $1 so penny stocks don't all read as $0.00
+    ($0.3823, $0.0035; $0.38 stays $0.38). Anything below $0.0001 shows up to
+    eight decimals ($0.00005) rather than reading as 0."""
+    f = float(v)
+    a = abs(f)
+    if a >= 1 or a == 0:
+        return f"{f:,.2f}"
+    if a < 0.0001:
+        return f"{f:.8f}".rstrip("0")
+    t = f"{f:.4f}".rstrip("0")
+    if len(t.split(".")[1]) < 2:
+        t = f"{f:.2f}"
+    return t
+
+
 def fmt_price(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
-    return f"${v:,.2f}"
+    return f"${px_num(v)}"
 
 
 def fmt_pnl(val) -> str:
@@ -7060,9 +7077,9 @@ if page == P_JOURNAL:
                     # Label the quote with the listing's own currency — a bare
                     # "$" on an LSE line reads as dollars when it is pounds.
                     _at_ccy    = quote_units(_at_yf_sym)[1] or "USD"
-                    _at_px_txt = (f"{currency_symbol(_at_ccy)}{_at_price:,.2f}"
+                    _at_px_txt = (f"{currency_symbol(_at_ccy)}{px_num(_at_price)}"
                                   if _at_ccy in NATIVE_CURRENCIES
-                                  else f"{_at_price:,.2f} {_at_ccy}")
+                                  else f"{px_num(_at_price)} {_at_ccy}")
                     _tlk2.markdown(
                         f"<div style='padding-top:28px;font-size:1rem'>"
                         f"<b>{_at_ticker}</b>{_sym_label} &nbsp; <span style='color:#2ecc71;font-size:1.2rem;font-weight:700'>"
@@ -7126,7 +7143,7 @@ if page == P_JOURNAL:
                     entry_date  = c1.date_input("Entry Date *")
                     quantity    = c2.number_input("Quantity *", min_value=0.0, step=1.0, format="%.4f", value=None,
                                                   help="Fractional shares are supported (e.g. 2.5).")
-                    entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
+                    entry_price = c3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.4f", value=None)
                     add_ccy = c4.selectbox(
                         "Currency",
                         options=list(NATIVE_CURRENCIES),
@@ -7149,7 +7166,7 @@ if page == P_JOURNAL:
                     _trailing_en = st.session_state.get("add_trailing_en", False)
                     sc1, sc2 = st.columns([1, 2])
                     stop_enabled = sc1.checkbox("Enabled", value=True)
-                    opening_stop = sc2.number_input("Stop Loss", min_value=0.0, step=0.01, format="%.2f", value=None,
+                    opening_stop = sc2.number_input("Stop Loss", min_value=0.0, step=0.01, format="%.4f", value=None,
                                                     help="Where you'll get out if the trade goes against you. "
                                                          "Stored as the opening stop and copied to the current "
                                                          "stop, which you can move later.")
@@ -7163,7 +7180,7 @@ if page == P_JOURNAL:
                     sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
                 c5, c6 = st.columns(2)
                 exit_date  = c5.date_input("Exit Date", value=None)
-                exit_price = c6.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
+                exit_price = c6.number_input("Exit Price", min_value=0.0, step=0.01, format="%.4f", value=None)
                 notes = st.text_area("Notes", height=68, value=_add_plan_note_prefill,
                                      placeholder="Trade thesis, setup, how it played out…")
                 with st.expander("Advanced", expanded=False):
@@ -7216,7 +7233,7 @@ if page == P_JOURNAL:
                         leg_strikes.append(lc[2].number_input("Strike *", min_value=0.0, step=0.5, format="%.2f", value=None, key=f"leg_{i}_strike"))
                         leg_exps.append(_global_exp)
                         leg_types.append( lc[3].selectbox("C/P",     ["Call", "Put"], key=f"leg_{i}_type"))
-                        leg_prices.append(lc[4].number_input("Premium *", min_value=0.0, step=0.01, format="%.2f", value=None, key=f"leg_{i}_price"))
+                        leg_prices.append(lc[4].number_input("Premium *", min_value=0.0, step=0.01, format="%.4f", value=None, key=f"leg_{i}_price"))
                     else:
                         lc = st.columns([1, 1, 1, 2, 1, 1])
                         leg_sides.append(lc[0].selectbox("Side",       ["Long", "Short"], key=f"leg_{i}_side"))
@@ -7224,11 +7241,11 @@ if page == P_JOURNAL:
                         leg_strikes.append(lc[2].number_input("Strike *", min_value=0.0, step=0.5, format="%.2f", value=None, key=f"leg_{i}_strike"))
                         leg_exps.append(  lc[3].date_input("Expiration *", key=f"leg_{i}_exp"))
                         leg_types.append( lc[4].selectbox("C/P",       ["Call", "Put"],   key=f"leg_{i}_type"))
-                        leg_prices.append(lc[5].number_input("Premium *", min_value=0.0, step=0.01, format="%.2f", value=None, key=f"leg_{i}_price"))
+                        leg_prices.append(lc[5].number_input("Premium *", min_value=0.0, step=0.01, format="%.4f", value=None, key=f"leg_{i}_price"))
 
                 oe1, oe2 = st.columns(2)
                 opt_exit_dt    = oe1.date_input("Exit Date (all legs)", value=None)
-                opt_exit_price = oe2.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
+                opt_exit_price = oe2.number_input("Exit Price", min_value=0.0, step=0.01, format="%.4f", value=None)
                 sel_tag_names  = st.multiselect("Tags", options=list(tag_name_to_id.keys()), key="add_opt_tags")
                 notes = st.text_area("Notes", height=68, value=_add_plan_note_prefill,
                                      placeholder="Trade thesis, setup, how it played out…")
@@ -7239,7 +7256,7 @@ if page == P_JOURNAL:
                                                         format="%.2f", value=_options_commission, key="add_opt_comm",
                                                         help="Per-contract rate from Settings. Override as needed.")
                     opt_underlying_px = oa3.number_input("Underlying Price at Entry",
-                                                         min_value=0.0, step=0.01, format="%.2f", value=None,
+                                                         min_value=0.0, step=0.01, format="%.4f", value=None,
                                                          help="Price of the underlying stock/ETF at the time of entry.")
                 uploaded_files = []
 
@@ -7250,11 +7267,11 @@ if page == P_JOURNAL:
                 fut_mult     = fc1.number_input("Multiplier *", value=50.0, step=1.0, format="%.0f",
                                                help="Contract multiplier (ES=50, NQ=20, CL=1000…)")
                 quantity     = fc2.number_input("Contracts *", min_value=0.0, step=1.0, format="%.0f", value=None)
-                entry_price  = fc3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.2f", value=None)
+                entry_price  = fc3.number_input("Entry Price *", min_value=0.0, step=0.01, format="%.4f", value=None)
                 fe1, fe2     = st.columns(2)
                 entry_date   = fe1.date_input("Entry Date *")
                 exit_date    = fe2.date_input("Exit Date", value=None)
-                exit_price   = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.2f", value=None)
+                exit_price   = st.number_input("Exit Price", min_value=0.0, step=0.01, format="%.4f", value=None)
                 sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()), key="add_fut_tags")
                 notes = st.text_area("Notes", height=68, value=_add_plan_note_prefill,
                                      placeholder="Trade thesis, setup, how it played out…")
@@ -7330,8 +7347,8 @@ if page == P_JOURNAL:
                                 # a second bare $ as the start of a LaTeX span and
                                 # eats everything between the two.
                                 _conf_entry = (
-                                    f"{currency_symbol(_cur_nat)}{float(entry_price):,.2f}"
-                                    f"  →  {native_to_usd(entry_price, _fx_entry):,.2f} USD"
+                                    f"{currency_symbol(_cur_nat)}{px_num(entry_price)}"
+                                    f"  →  {px_num(native_to_usd(entry_price, _fx_entry))} USD"
                                     f"  (rate {_fx_entry:.4f})"
                                 )
                             _conf_lines = [
@@ -7344,8 +7361,8 @@ if page == P_JOURNAL:
                                     _conf_exit = fmt_price(exit_price) if exit_price else "—"
                                 elif exit_price:
                                     _conf_exit = (
-                                        f"{currency_symbol(_cur_nat)}{float(exit_price):,.2f}"
-                                        f"  →  {native_to_usd(exit_price, _fx_exit_eff):,.2f} USD"
+                                        f"{currency_symbol(_cur_nat)}{px_num(exit_price)}"
+                                        f"  →  {px_num(native_to_usd(exit_price, _fx_exit_eff))} USD"
                                         f"  (rate {_fx_exit_eff:.4f})"
                                     )
                                 else:
@@ -9127,7 +9144,7 @@ if page == P_JOURNAL:
                                                               value=float(row["multiplier"]) if row.get("multiplier") else 100.0)
                         _und_px = row.get("underlying_price_at_entry")
                         edit_underlying_px = st.number_input("Underlying Price at Entry", min_value=0.0,
-                                                             step=0.01, format="%.2f",
+                                                             step=0.01, format="%.4f",
                                                              value=float(_und_px) if _und_px and not pd.isna(_und_px) else None)
                         edit_stop_en = False
                         edit_current_stop = edit_opening_stop = None
@@ -9383,7 +9400,7 @@ if page == P_JOURNAL:
                         ep_qty   = st.number_input(f"Shares to Exit (max {fmt_qty(ep_max)})", min_value=0.0, max_value=ep_max, step=1.0, format="%.4f", value=None, key="ep_qty")
                         ep_price = st.number_input(
                             f"Exit Price ({currency_symbol(ep_ccy)} {ep_ccy})",
-                            min_value=0.0, step=0.01, format="%.2f", value=None, key="ep_price",
+                            min_value=0.0, step=0.01, format="%.4f", value=None, key="ep_price",
                             help=("This trade was entered in " + ep_ccy + ". Type the exit in the "
                           "same currency — it is converted at the exit date's rate.")
                                   if ep_ccy != "USD" else None,
@@ -9408,7 +9425,7 @@ if page == P_JOURNAL:
                                 )
                                 _bust("_v_trades")
                                 _ep_shown = (fmt_price(ep_price) if ep_ccy == "USD"
-                                             else f"{currency_symbol(ep_ccy)}{float(ep_price):,.2f}")
+                                             else f"{currency_symbol(ep_ccy)}{px_num(ep_price)}")
                                 if _remaining > 0:
                                     st.success(f"Exited {fmt_qty(ep_qty)} @ {_ep_shown} · "
                                        f"{fmt_qty(_remaining)} still open")
@@ -10299,10 +10316,10 @@ if page == P_JOURNAL:
                                 marker=dict(symbol="diamond", size=11, color="#3498db",
                                             line=dict(color="#ffffff", width=1)),
                                 name="Entry price", showlegend=False,
-                                hovertemplate=f"Entry ${_entry_px:,.2f}<extra></extra>",
+                                hovertemplate=f"Entry ${px_num(_entry_px)}<extra></extra>",
                             )
                             fig.add_annotation(x=entry_s, y=_entry_px, xref="x", yref="y",
-                                               text=f"Entry ${_entry_px:,.2f}", showarrow=False,
+                                               text=f"Entry ${px_num(_entry_px)}", showarrow=False,
                                                xanchor="right", xshift=-6,
                                                font=dict(size=10, color="#3498db"),
                                                bgcolor="rgba(0,0,0,0.35)")
@@ -10317,10 +10334,10 @@ if page == P_JOURNAL:
                                 marker=dict(symbol="diamond", size=11, color="#e67e22",
                                             line=dict(color="#ffffff", width=1)),
                                 name="Exit price", showlegend=False,
-                                hovertemplate=f"Exit ${_exit_px:,.2f}<extra></extra>",
+                                hovertemplate=f"Exit ${px_num(_exit_px)}<extra></extra>",
                             )
                             fig.add_annotation(x=exit_s, y=_exit_px, xref="x", yref="y",
-                                               text=f"Exit ${_exit_px:,.2f}", showarrow=False,
+                                               text=f"Exit ${px_num(_exit_px)}", showarrow=False,
                                                xanchor="left", xshift=6,
                                                font=dict(size=10, color="#e67e22"),
                                                bgcolor="rgba(0,0,0,0.35)")
@@ -10678,9 +10695,9 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
         with st.container():
             st.subheader("Risk / Reward Calculator")
             rr1, rr2, rr3 = st.columns(3)
-            rr_entry  = rr1.number_input("Entry ($)",  min_value=0.0, step=0.01, format="%.2f", value=None)
-            rr_stop   = rr2.number_input("Stop ($)",   min_value=0.0, step=0.01, format="%.2f", value=None)
-            rr_target = rr3.number_input("Target ($)", min_value=0.0, step=0.01, format="%.2f", value=None)
+            rr_entry  = rr1.number_input("Entry ($)",  min_value=0.0, step=0.01, format="%.4f", value=None)
+            rr_stop   = rr2.number_input("Stop ($)",   min_value=0.0, step=0.01, format="%.4f", value=None)
+            rr_target = rr3.number_input("Target ($)", min_value=0.0, step=0.01, format="%.4f", value=None)
             if rr_entry and rr_stop and rr_target and rr_entry != rr_stop:
                 risk_pts     = abs(rr_entry - rr_stop)
                 reward_pts   = abs(rr_target - rr_entry)
@@ -10764,7 +10781,7 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
                 sc_mode  = st.radio("Mode", ["% Stop", "ATR Stop"], horizontal=True, key="sc_mode")
                 sc_side  = st.radio("Side", ["Long", "Short"],      horizontal=True, key="sc_side")
                 sc_entry = st.number_input("Entry Price ($)", min_value=0.0, step=0.01,
-                                           format="%.2f", value=None, key="sc_entry")
+                                           format="%.4f", value=None, key="sc_entry")
                 if sc_mode == "% Stop":
                     sc_pct = st.number_input("Stop %", min_value=0.0, max_value=100.0,
                                              step=0.1, format="%.2f", value=2.0, key="sc_pct")
@@ -10815,10 +10832,10 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
                                               step=0.1, format="%.2f", value=1.0, key="ml_loss_p")
                     ml_loss = (ml_acct * ml_pct / 100) if ml_acct and ml_pct else None
                 ml_entry = st.number_input("Entry Price ($)", min_value=0.0, step=0.01,
-                                           format="%.2f", value=None, key="ml_entry")
+                                           format="%.4f", value=None, key="ml_entry")
                 _saved_stop = st.session_state.get("_tool_stop_px")
                 ml_stop  = st.number_input("Stop Price ($)", min_value=0.0, step=0.01,
-                                           format="%.2f",
+                                           format="%.4f",
                                            value=float(_saved_stop) if _saved_stop else None,
                                            help="Auto-filled from Stop Calculator",
                                            key="ml_stop")
@@ -10848,9 +10865,9 @@ if page == P_PLAN and _sub in (S_CALC, S_ALLOC):
                                                step=0.5, format="%.2f", value=5.0, key="ab_alloc_p")
                     ab_alloc = (ab_acct * ab_pct / 100) if ab_acct and ab_pct else None
                 ab_entry = st.number_input("Entry Price ($)", min_value=0.0, step=0.01,
-                                           format="%.2f", value=None, key="ab_entry")
+                                           format="%.4f", value=None, key="ab_entry")
                 ab_stop  = st.number_input("Stop Price (optional, $)", min_value=0.0, step=0.01,
-                                           format="%.2f", value=None, key="ab_stop")
+                                           format="%.4f", value=None, key="ab_stop")
                 if ab_alloc and ab_entry and ab_entry > 0:
                     _shares  = ab_alloc / ab_entry
                     am1, am2 = st.columns(2)
@@ -12155,7 +12172,7 @@ if _sub == S_PLAN:
             _tp_colour = "#2ecc71" if _tp_chg >= 0 else "#e74c3c"
             _tp_c3.markdown(
                 f"**Live Price**<br>"
-                f"<span style='font-size:1.6rem;font-weight:700;color:{_tp_colour}'>${_tp_price:,.2f}</span>"
+                f"<span style='font-size:1.6rem;font-weight:700;color:{_tp_colour}'>${px_num(_tp_price)}</span>"
                 f"&nbsp;<span style='color:{_tp_colour};font-size:0.95rem'>{_tp_arrow} {_tp_chg:+.2f} ({_tp_chg_pct:+.2f}%)</span>"
                 f"<br><span style='font-size:0.72rem;color:#888'>auto-refresh 60s</span>",
                 unsafe_allow_html=True,

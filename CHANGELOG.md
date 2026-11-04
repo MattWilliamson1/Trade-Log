@@ -6,6 +6,10 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-04.3
+- Penny stocks: prices under $1 now show up to four decimals ($0.3823, $0.0035) instead of being rounded to two, in the trade table, positions, pop-ups and chart labels. Prices of $1 and up still show two decimals
+- Entry, exit, stop, premium and target boxes on New Trade, the exit forms and the risk calculators now accept four decimals, so sub-penny prices can be typed in
+
 ## 2026-11-04.2
 - Fixed IB connections failing with a blank "Connection failed:" message. Every IB feature (auto-connect, live prices, balance sync, stop sync, Test Connection) uses the same Client ID, and TWS refuses a second connection on an ID that's already connected, so overlapping requests timed out. The app now runs one IB request at a time
 - IB connects in read-only mode, which is quicker and skips TWS's order sync on connect (a common cause of timeouts on accounts with lots of history)
