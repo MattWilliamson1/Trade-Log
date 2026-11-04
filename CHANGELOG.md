@@ -6,6 +6,12 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-04
+- IB Flex fetches and XML uploads now save your day-by-day account balance to the Equity Curve automatically. Before, only the separate Data → File Import button did, so routine trade imports left the curve stuck at the last time you pressed it
+- Importing balance history from IB Flex now covers the whole report by default instead of only the last 30 days
+- The sidebar lists the active page's sections so you can jump straight to one
+- Performance adds a P&L vs Risk chart: each trade's P&L against what it risked at entry, with +2R/+1R/−1R guide lines (trades with no stop use your fixed 1R)
+
 ## 2026-10-22
 - Performance → Summary now shows the Highest Open P&L — the single best unrealized profit any trade in the filter ever showed (its best price between entry and exit vs entry) — and the Avg Highest Open P&L across all measured trades
 - The Tag Comparison table (Performance → Breakdown) adds Highest Open P&L and Avg Highest Open P&L columns, so you can see which tags tended to run furthest into profit before you closed

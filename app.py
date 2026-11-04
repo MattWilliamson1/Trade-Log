@@ -2267,6 +2267,41 @@ def upsert_equity_entry(date: str, balance: float, contributions: float = 0.0, w
         )
 
 
+def save_flex_daily_nav(flex_result: dict) -> int:
+    """Write a Flex report's day-by-day NAV into the equity curve.
+
+    Every Flex fetch/upload carries `daily_nav` (one row per reporting day from
+    ChangeInNAV), but only the dedicated Data → File Import button used to save
+    it — so routine trade imports left the curve frozen at the last time that
+    button was pressed. Calling this from every Flex load keeps the curve current.
+    Upserts by date, so re-running is harmless; a signature in session state
+    skips the write when the same report is seen again on a rerun.
+    Returns the number of rows written (0 when skipped or empty).
+    """
+    _nav = (flex_result or {}).get("daily_nav") or []
+    if not _nav:
+        return 0
+    _sig = (len(_nav), _nav[0]["date"], _nav[-1]["date"], _nav[-1]["balance"])
+    if st.session_state.get("_flex_nav_saved_sig") == _sig:
+        return 0
+    with get_connection() as conn:
+        conn.executemany(
+            """INSERT INTO equity_entries (date, balance, contributions, withdrawals)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                   balance=excluded.balance,
+                   contributions=excluded.contributions,
+                   withdrawals=excluded.withdrawals""",
+            [(r["date"], float(r["balance"]),
+              float(r.get("contributions", 0.0) or 0.0),
+              float(r.get("withdrawals", 0.0) or 0.0)) for r in _nav],
+        )
+    st.session_state["_flex_nav_saved_sig"] = _sig
+    _cached_load_equity_entries.clear()
+    _bust("_v_equity")
+    return len(_nav)
+
+
 def delete_equity_entry(entry_id: int):
     with get_connection() as conn:
         conn.execute("DELETE FROM equity_entries WHERE id = ?", (entry_id,))
@@ -6251,18 +6286,54 @@ def _trigger_supervised_restart():
 with st.sidebar:
     st.title("Trade Log")
 
-    # ── Mode badge ─────────────────────────────────────────────────────────
-    if is_demo:
-        st.markdown('<div class="mode-badge-demo">📴  Offline</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="mode-badge-live">🟢  Connected to Broker</div>', unsafe_allow_html=True)
+    # Nav styling: left-aligned page buttons, with indented smaller submenu
+    # buttons tucked under the active page.
+    st.markdown("""
+        <style>
+        [data-testid='stSidebar'] [class*='st-key-nav_'] button {
+            justify-content: flex-start !important;
+            text-align: left !important;
+            padding-left: 0.85rem !important;
+        }
+        /* Streamlit wraps the label in an inner flex div that re-centers it —
+           force that wrapper left too, for both page and section buttons. */
+        [data-testid='stSidebar'] [class*='st-key-nav_'] button > div,
+        [data-testid='stSidebar'] [class*='st-key-subnav_'] button > div {
+            justify-content: flex-start !important;
+            width: 100% !important;
+        }
+        [data-testid='stSidebar'] [class*='st-key-subnav_'] button {
+            font-size: 0.82rem !important;
+            min-height: 0 !important;
+            padding: 0.2rem 0.5rem 0.2rem 2.0rem !important;
+            justify-content: flex-start !important;
+            text-align: left !important;
+            border: none !important;
+            font-weight: 500 !important;
+            opacity: 0.9;
+        }
+        [data-testid='stSidebar'] [class*='st-key-subnav_'] button:hover { opacity: 1; }
+        [data-testid='stSidebar'] [class*='st-key-subnav_'] { margin: -0.3rem 0 !important; }
+        </style>
+    """, unsafe_allow_html=True)
 
-    for _p in _PAGES:
+    for _pi, _p in enumerate(_PAGES):
         _active = st.session_state["nav_page"] == _p
-        if st.button(_p, width='stretch', key=f"nav_{_p}",
+        if st.button(_p, width='stretch', key=f"nav_{_pi}",
                      type="primary" if _active else "secondary"):
             st.session_state["nav_page"] = _p
             st.rerun()
+
+        # Little submenu: when a page with sections is active, list its sections
+        # so you can jump straight to one from the sidebar. _goto queues the
+        # section safely before the main-area section bar is drawn this run.
+        _subs = _SUBPAGES.get(_p)
+        if _active and _subs:
+            _cur_sub = st.session_state.get(_sub_key(_p))
+            for _si, _s in enumerate(_subs):
+                if st.button(_s, width='stretch', key=f"subnav_{_pi}_{_si}",
+                             type="primary" if _s == _cur_sub else "secondary"):
+                    _goto(_p, _s)
 
     # ── Export for Review (big, prominent) ──────────────────────────────────────
     st.markdown("---")
@@ -11765,6 +11836,15 @@ if _sub in (S_EQUITY, S_IMPORT, S_BALANCES):
             "Each day becomes one equity-curve entry."
         )
 
+        def _ecfx_span_range(_nav_rows):
+            """Set the From/To date inputs to span all NAV rows just loaded, so the
+            full day-by-day history is previewed and imported instead of only the
+            last 30 days. No-op when there are no dated rows."""
+            _ds = [r["date"] for r in (_nav_rows or []) if r.get("date")]
+            if _ds:
+                st.session_state["ecfx_from"] = pd.to_datetime(min(_ds)).date()
+                st.session_state["ecfx_to"]   = pd.to_datetime(max(_ds)).date()
+
         _ec_flex_tok = settings.get("flex_token", "").strip()
         _ec_flex_qid = settings.get("flex_query_id", "").strip()
         _ec_flex_configured = bool(_ec_flex_tok) and bool(_ec_flex_qid)
@@ -11834,6 +11914,10 @@ if _sub in (S_EQUITY, S_IMPORT, S_BALANCES):
                 _ecfx_txns_found = _ecfx_report.get("cash_transactions", [])
                 if _ecfx_nav_found:
                     st.session_state["_ecfx_nav"] = _ecfx_nav_found
+                    # Default the preview/import window to span everything we just
+                    # fetched, so a full-year pull isn't silently clipped to the
+                    # last 30 days. The presets above still let you narrow it.
+                    _ecfx_span_range(_ecfx_nav_found)
                     st.rerun()
                 else:
                     st.warning(
@@ -11853,15 +11937,21 @@ if _sub in (S_EQUITY, S_IMPORT, S_BALANCES):
             "Upload Flex XML", type=["xml"], key="ecfx_xml_upload",
             label_visibility="collapsed",
         )
-        if _ecfx_xml is not None:
+        if _ecfx_xml is not None and st.session_state.get("_ecfx_xml_name") != _ecfx_xml.name:
+            # Parse once per uploaded file (re-parsing a multi-MB XML on every
+            # rerun is wasteful and would fight the rerun below).
             _ecfx_parsed = _ib_mod._parse_flex_xml(
                 _ecfx_xml.read().decode("utf-8", errors="replace")
             )
             if _ecfx_parsed.get("error"):
                 st.error(f"XML error: {_ecfx_parsed['error']}")
             else:
-                st.session_state["_ecfx_nav"] = _ecfx_parsed.get("daily_nav", [])
-                st.success(f"Loaded {len(st.session_state['_ecfx_nav'])} daily NAV entries from file.")
+                _ecfx_nav_up = _ecfx_parsed.get("daily_nav", [])
+                st.session_state["_ecfx_nav"] = _ecfx_nav_up
+                st.session_state["_ecfx_xml_name"] = _ecfx_xml.name
+                # Span the whole uploaded file by default, same as the fetch path.
+                _ecfx_span_range(_ecfx_nav_up)
+                st.rerun()
 
         # ── Preview & import ──────────────────────────────────────────────────
         _ecfx_nav_all = st.session_state.get("_ecfx_nav", [])
@@ -11896,10 +11986,12 @@ if _sub in (S_EQUITY, S_IMPORT, S_BALANCES):
                     _cached_load_equity_entries.clear()
                     _bust("_v_equity")
                     st.session_state.pop("_ecfx_nav", None)
+                    st.session_state.pop("_ecfx_xml_name", None)
                     st.success(f"Imported {len(_ecfx_nav)} equity entries. The chart may take a moment to populate.")
                     st.rerun()
                 if _ecfx_clr_col.button("✕  Clear", width='stretch', key="ecfx_clear_btn"):
                     st.session_state.pop("_ecfx_nav", None)
+                    st.session_state.pop("_ecfx_xml_name", None)
                     st.rerun()
             else:
                 st.info("No NAV entries fall within the selected date range.")
@@ -13118,6 +13210,91 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                         )
                         st.plotly_chart(_fig_sc, width='stretch', theme=None)
 
+                    # ── P&L vs Risk ────────────────────────────────────────────────
+                    # Each trade's realised/open P&L against the dollars it put at risk
+                    # at entry (|entry − opening stop| × qty × mult). Trades with no
+                    # opening stop recorded — every broker import — fall back to the
+                    # fixed 1R so they still place on the chart. The diagonals mark
+                    # whole-R reward:risk ratios: a point sitting on +1R made exactly
+                    # what it risked, +2R twice as much, −1R gave back a full unit.
+                    if not pnl_avail.empty:
+                        _rvr_risk = pnl_avail["_risk_stop"].astype(float).fillna(_r_unit)
+                        _rvr = pd.DataFrame({
+                            "risk":    _rvr_risk.values,
+                            "pnl":     pnl_avail["_pnl"].astype(float).values,
+                            "ticker":  pnl_avail["ticker"].values,
+                            "by_stop": pnl_avail["_risk_stop"].notna().values,
+                        })
+                        _rvr = _rvr[(_rvr["risk"] > 0) & _rvr["pnl"].notna()]
+                        if not _rvr.empty:
+                            _rvr["r_mult"] = _rvr["pnl"] / _rvr["risk"]
+                            _rmax = float(_rvr["risk"].max())
+                            _rvr_colors = ["#2ecc71" if v >= 0 else "#e74c3c"
+                                           for v in _rvr["pnl"]]
+                            _rvr_sizes  = [max(8, min(40, abs(float(v)) ** 0.45))
+                                           for v in _rvr["pnl"]]
+                            _rvr_hover  = [
+                                f"{t}<br>Risk ${r:,.0f}<br>P&L ${p:,.0f}<br>{m:+,.2f}R"
+                                + ("" if s else "  (assumed 1R)")
+                                for t, r, p, m, s in zip(
+                                    _rvr["ticker"], _rvr["risk"], _rvr["pnl"],
+                                    _rvr["r_mult"], _rvr["by_stop"])
+                            ]
+                            _fig_rvr = go.Figure()
+                            # Whole-R reward:risk diagonals across the risk range
+                            for _mult, _dash, _col, _lbl in [
+                                ( 2, "dot",  "#27ae60", "+2R"),
+                                ( 1, "dash", "#2ecc71", "+1R"),
+                                (-1, "dash", "#e74c3c", "−1R"),
+                            ]:
+                                _fig_rvr.add_scatter(
+                                    x=[0, _rmax], y=[0, _mult * _rmax],
+                                    mode="lines",
+                                    line=dict(color=_col, width=1, dash=_dash),
+                                    name=_lbl, hoverinfo="skip",
+                                )
+                            _fig_rvr.add_hline(y=0, line=dict(color="#888", dash="dot", width=1))
+                            _fig_rvr.add_scatter(
+                                x=_rvr["risk"], y=_rvr["pnl"],
+                                mode="markers",
+                                marker=dict(color=_rvr_colors, size=_rvr_sizes,
+                                            line=dict(width=0.5, color="#0d1117")),
+                                text=_rvr_hover, hoverinfo="text",
+                                name="Trade",
+                            )
+                            _fig_rvr.update_layout(
+                                title="P&L vs Risk",
+                                xaxis_title="Risk at entry ($)", yaxis_title="P&L ($)",
+                                height=320, showlegend=True,
+                                legend=dict(bgcolor=_CHT_LEG,
+                                            font=dict(size=11, color=_CHT_LEG_FONT)),
+                                margin=dict(t=36, b=10, l=10, r=10),
+                                paper_bgcolor=_CHT_BG, plot_bgcolor=_CHT_BG,
+                                font=dict(color=_CHT_FONT),
+                                xaxis=dict(gridcolor=_CHT_GRID, tickprefix="$",
+                                           tickformat=",.0f", rangemode="tozero"),
+                                yaxis=dict(gridcolor=_CHT_GRID, tickprefix="$",
+                                           tickformat=",.0f"),
+                                hovermode="closest",
+                            )
+                            st.plotly_chart(_fig_rvr, width='stretch', theme=None)
+                            _n_stop    = int(_rvr["by_stop"].sum())
+                            _n_assumed = len(_rvr) - _n_stop
+                            if _n_assumed and _n_stop:
+                                st.caption(
+                                    f"Risk is |entry − opening stop| × qty for {_n_stop} "
+                                    f"trade(s); the other {_n_assumed} have no stop recorded "
+                                    f"and use the fixed 1R = {fmt_price(_r_unit)}. Diagonals "
+                                    f"are whole-R reward:risk ratios.")
+                            elif _n_assumed:
+                                st.caption(
+                                    f"No opening stops recorded, so every trade uses the "
+                                    f"fixed 1R = {fmt_price(_r_unit)} as its risk — set it in "
+                                    f"R mode above. Diagonals are whole-R reward:risk ratios.")
+                            else:
+                                st.caption("Risk is |entry − opening stop| × qty at entry. "
+                                           "Diagonals are whole-R reward:risk ratios.")
+
                     st.divider()
 
                     # ── Risk-Adjusted Returns ─────────────────────────────────────
@@ -13988,7 +14165,9 @@ if _sub in (S_BROKERS, S_HEALTH):
                                 "download the report from IB's portal and upload it directly.")
                         else:
                             st.session_state["_flex_result"] = _flex_result
-                            st.success("Flex report fetched successfully.")
+                            _nav_n = save_flex_daily_nav(_flex_result)
+                            st.success("Flex report fetched successfully."
+                                       + (f" Equity curve updated with {_nav_n} daily balance(s)." if _nav_n else ""))
 
             # Manual XML upload — reliable fallback when the live API is uncooperative
             st.markdown("##### Or Upload XML Directly")
@@ -14006,6 +14185,7 @@ if _sub in (S_BROKERS, S_HEALTH):
                     st.error(f"XML parse error: {_upload_result['error']}")
                 else:
                     st.session_state["_flex_result"] = _upload_result
+                    save_flex_daily_nav(_upload_result)
 
             # Display Flex results outside the form so buttons inside work
             _flex_data = st.session_state.get("_flex_result")
@@ -14255,6 +14435,7 @@ if _sub in (S_BROKERS, S_HEALTH):
                             st.error(f"XML error: {_xml_imp_result['error']}")
                         else:
                             st.session_state["_flex_result"] = _xml_imp_result
+                            save_flex_daily_nav(_xml_imp_result)
                             st.success("File loaded. Set a date range below and import.")
                             st.rerun()
 
@@ -14312,6 +14493,7 @@ if _sub in (S_BROKERS, S_HEALTH):
                                 )
                             else:
                                 st.session_state["_flex_result"] = _new_flex
+                                save_flex_daily_nav(_new_flex)
                                 st.success("History fetched. Review below and click Import.")
                                 st.rerun()
                 else:
@@ -15758,6 +15940,50 @@ if page == P_SETTINGS and _sub != S_TAGS:
         st.markdown("#### Email Alerts — Earnings Notifications")
         st.caption("Configure SMTP to receive email alerts when open positions have upcoming earnings.")
 
+        with st.expander("📖  New here? How to set up email alerts (SMTP)", expanded=False):
+            st.markdown("""
+**What is SMTP?** It's the standard your email provider uses to *send* mail. Trade Log
+uses your own email account to send alerts to yourself — nothing is routed through a
+third-party server, and your password stays on this machine.
+
+**You'll fill in five things in the form below:**
+
+| Field | What to enter |
+|---|---|
+| **SMTP Host** | Your provider's outgoing mail server (see the table below) |
+| **Port** | Almost always **587** (TLS). Leave it unless your provider says otherwise. |
+| **SMTP Username** | Your full email address |
+| **SMTP Password** | An **App Password**, *not* your normal login password (see step 2) |
+| **Send Alerts To** | Where alerts should land — usually your own email address |
+
+**Step 1 — Find your provider's SMTP host:**
+
+| Provider | SMTP Host | Port |
+|---|---|---|
+| Gmail | `smtp.gmail.com` | 587 |
+| Outlook / Office 365 | `smtp.office365.com` | 587 |
+| Yahoo Mail | `smtp.mail.yahoo.com` | 587 |
+| iCloud Mail | `smtp.mail.me.com` | 587 |
+
+If your provider isn't listed, search *"[provider name] SMTP settings"* — you're looking
+for the **outgoing server** and **port 587**.
+
+**Step 2 — Create an App Password (important!):**
+
+Most providers block apps from signing in with your normal password. Instead you create a
+one-off "App Password" dedicated to Trade Log:
+
+- **Gmail:** Turn on 2-Step Verification, then go to
+  *myaccount.google.com → Security → App passwords*, create one, and paste the
+  16-character code into the **SMTP Password** field.
+- **Outlook / Yahoo / iCloud:** Enable two-factor authentication, then look for
+  *App passwords* (or *App-specific password*) in your account security settings.
+
+**Step 3 — Fill in the form, click 💾 Save Email Settings, then hit 📧 Send Test Email.**
+If the test lands in your inbox, you're done. If it fails, double-check the host, that the
+port is 587, and that you used an App Password rather than your login password.
+""")
+
         s_smtp_host  = settings.get("smtp_host",            "")
         s_smtp_port  = settings.get("smtp_port",            "587")
         s_smtp_user  = settings.get("smtp_user",            "")
@@ -15767,7 +15993,7 @@ if page == P_SETTINGS and _sub != S_TAGS:
 
         with st.form("email_settings_form"):
             em1, em2 = st.columns([3, 1])
-            new_smtp_host = em1.text_input("SMTP Host",     value=s_smtp_host, placeholder="smtp.gmail.com")
+            new_smtp_host = em1.text_input("SMTP Host",     value=s_smtp_host, placeholder="example: smtp.gmail.com")
             new_smtp_port = em2.number_input("Port",        value=int(s_smtp_port or 587),
                                              min_value=1, max_value=65535, step=1, format="%d")
             new_smtp_user = st.text_input("SMTP Username",  value=s_smtp_user, placeholder="you@example.com")
