@@ -75,6 +75,33 @@ def contract_key(instrument_type, ticker, expiration=None, strike=None,
     return (inst, tkr, "", None, "")
 
 
+# Currency codes and pairs ("NZD", "EUR.USD") are cash balances or FX
+# conversions, never positions to journal. Older IB imports logged a
+# conversion as a "stock" named after the currency, so the log can hold some.
+# Bare tickers treated as currencies: every currency IB trades or holds cash in.
+# SAR (Saudi riyal) is left out on purpose because it's also a US stock
+# (Saratoga Investment), so it only counts as a currency inside a pair.
+CURRENCY_CODES = {
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "HKD", "SGD",
+    "NOK", "SEK", "DKK", "MXN", "CNH", "CNY", "ZAR", "ILS", "PLN", "CZK",
+    "HUF", "TRY", "KRW", "INR", "RUB", "AED", "BRL", "TWD", "THB", "IDR",
+    "MYR", "PHP", "KWD", "BHD", "QAR", "RON", "BGN", "ISK", "CLP", "COP",
+    "PEN", "ARS", "EGP", "NGN", "KZT", "VND", "PKR", "HRK", "UAH",
+}
+# A pair ("USD.SAR") is unambiguous, so it may use any of these as well.
+_PAIR_EXTRA_CODES = {"SAR", "OMR", "JOD", "MAD", "TND", "KES", "GHS", "LKR",
+                     "BDT", "XAU", "XAG"}
+
+
+def is_currency_ticker(ticker) -> bool:
+    t = str(ticker or "").strip().upper()
+    if t in CURRENCY_CODES:
+        return True
+    a, dot, b = t.partition(".")
+    codes = CURRENCY_CODES | _PAIR_EXTRA_CODES
+    return bool(dot) and a in codes and b in codes
+
+
 def describe_key(key: tuple) -> str:
     inst, tkr, exp, strike, right = key
     if inst == "option":
@@ -242,6 +269,8 @@ def broker_positions(positions: list[dict]) -> dict[tuple, dict]:
         qty = float(b.get("quantity") or 0)
         if abs(qty) < QTY_TOL:
             continue
+        if _norm_instrument(b.get("instrument_type")) == "stock" and is_currency_ticker(b.get("ticker")):
+            continue  # cash balance in a foreign currency, not a position
         key = contract_key(b.get("instrument_type"), b.get("ticker"), b.get("expiration"),
                            b.get("strike"), b.get("option_type"))
         p = out.setdefault(key, {"qty": 0.0, "cost": 0.0, "priced": 0.0,
@@ -258,9 +287,9 @@ def broker_positions(positions: list[dict]) -> dict[tuple, dict]:
 
 # ── Reconciliation ─────────────────────────────────────────────────────────────
 
-MATCH, QTY, MISSING, EXTRA, FLIPPED, OFFSET = (
+MATCH, QTY, MISSING, EXTRA, FLIPPED, OFFSET, CURRENCY = (
     "match", "qty_mismatch", "missing_in_log", "not_at_broker", "side_mismatch",
-    "offsetting")
+    "offsetting", "currency")
 
 STATUS_LABEL = {
     MATCH:   "✅ Matches",
@@ -269,6 +298,7 @@ STATUS_LABEL = {
     EXTRA:   "➖ Not held at broker",
     FLIPPED: "🔁 Long/short differs",
     OFFSET:  "🔀 Buy and sell both open",
+    CURRENCY: "💱 Currency, not a position",
 }
 
 
@@ -323,6 +353,11 @@ def reconcile(log: dict[tuple, dict], broker: dict[tuple, dict]) -> list[dict]:
     Each row: key, contract, status, log_qty, broker_qty, log_avg, broker_avg,
     trades (log rows, oldest first), close_qty (to take off the log, >= 0) and
     add_qty (to put on, signed), multiplier.
+
+    A CURRENCY row is a log "position" in a currency (NZD, EUR.USD) the broker
+    doesn't hold as a stock: an FX conversion imported as a trade. Its fix is
+    to delete those trades (``remove_ids``), not close them, since closing
+    would book a made-up P&L on a cash movement.
     """
     rows = []
     for key in sorted(set(log) | set(broker), key=lambda k: (k[1], k[0], k[2], k[3] or 0, k[4])):
@@ -338,7 +373,10 @@ def reconcile(log: dict[tuple, dict], broker: dict[tuple, dict]) -> list[dict]:
             "trades": lp["trades"] if lp else [],
             "close_qty": 0.0, "add_qty": 0.0,
         }
-        if lp and len({_is_short(t) for t in lp["trades"]}) > 1:
+        if lp and not bp and key[0] == "stock" and is_currency_ticker(key[1]):
+            row["status"] = CURRENCY
+            row["remove_ids"] = [int(t["id"]) for t in lp["trades"]]
+        elif lp and len({_is_short(t) for t in lp["trades"]}) > 1:
             # Tidy the log's own contradiction first; any difference from the
             # broker that's left shows up on the next pass.
             row["status"], row["offsets"] = OFFSET, plan_offsets(lp["trades"])

@@ -167,7 +167,7 @@ class IBClient:
         for pos in self._ib.positions():
             con = pos.contract
             try:
-                if _is_bag_contract(con) or con.secType in ("CASH", "CMDTY"):
+                if _is_bag_contract(con) or _is_currency_contract(con):
                     continue
                 qty = float(pos.position)
                 if qty == 0:
@@ -200,6 +200,53 @@ class IBClient:
                 continue
         return out
 
+    # ── Open stop orders ───────────────────────────────────────────────────────
+
+    def get_open_stop_orders(self) -> list[dict]:
+        """Every working stop-type order (STP, STP LMT, TRAIL, TRAIL LIMIT) across
+        all clients — including ones placed by hand in TWS — normalised to
+        {ticker, instrument_type, expiration, strike, option_type, action,
+        quantity, stop_price, order_type, account}.
+
+        stop_price is the price that triggers the order: auxPrice for plain
+        stops, and trailStopPrice (the current, already-trailed trigger) for
+        trailing stops — a TRAIL order's auxPrice is the trailing *amount*, not
+        a price, so it's never used as the stop. Orders without a usable
+        trigger price are skipped.
+        """
+        if not self._ib:
+            return []
+        out: list[dict] = []
+        for tr in self._ib.reqAllOpenOrders():
+            try:
+                order, con = tr.order, tr.contract
+                otype = (order.orderType or "").upper()
+                if otype not in _STOP_ORDER_TYPES or _is_bag_contract(con):
+                    continue
+                if tr.orderStatus.status in ("Cancelled", "ApiCancelled", "Filled", "Inactive"):
+                    continue
+                raw = order.trailStopPrice if otype.startswith("TRAIL") else order.auxPrice
+                price = _valid_price(raw)
+                if price is None:
+                    continue
+                itype = _contract_type(con)
+                out.append({
+                    "ticker":          con.symbol,
+                    "instrument_type": itype,
+                    "expiration":      _yyyymmdd_to_iso(con.lastTradeDateOrContractMonth or "")
+                                       if itype in ("option", "future") else None,
+                    "strike":          float(con.strike) if itype == "option" else None,
+                    "option_type":     ("call" if con.right == "C" else "put") if itype == "option" else None,
+                    "action":          (order.action or "").upper(),
+                    "quantity":        float(order.totalQuantity or 0),
+                    "stop_price":      price,
+                    "order_type":      otype,
+                    "account":         order.account or "",
+                })
+            except Exception:
+                continue
+        return out
+
     # ── Trade executions ───────────────────────────────────────────────────────
 
     def get_executions(self, start_date: str) -> tuple[list[dict], list[str]]:
@@ -225,6 +272,8 @@ class IBClient:
             try:
                 if _is_bag_contract(con):
                     continue  # combo aggregate — individual legs are included separately
+                if _is_currency_contract(con):
+                    continue  # FX conversion (e.g. NZD.USD) — cash, not a position
                 itype = _contract_type(con)
                 rows.append({
                     "time":          str(ex.time),
@@ -660,6 +709,10 @@ def parse_flex_trades(root_or_xml) -> list[dict]:
             if asset_cat == "BAG":
                 # Combo/spread aggregate row — individual legs are included separately
                 continue
+            if asset_cat in _NON_POSITION_ASSET_CATS:
+                # Currency conversions (EUR.USD, USD.CAD…) — cash moving between
+                # currencies, not a trade to journal
+                continue
             if asset_cat == "FUT":
                 _instrument_type = "future"
             elif asset_cat == "FOP" or put_call:
@@ -882,6 +935,91 @@ def _contract_type(con) -> str:
 
 def _is_bag_contract(con) -> bool:
     return getattr(con, "secType", "") == "BAG"
+
+
+# IB asset classes that are cash, not positions: CASH is a currency pair
+# (an FX conversion such as NZD.USD), CMDTY is spot metal held as a balance.
+_NON_POSITION_ASSET_CATS = {"CASH", "CMDTY"}
+
+
+def _is_currency_contract(con) -> bool:
+    return (getattr(con, "secType", "") or "").upper() in _NON_POSITION_ASSET_CATS
+
+
+_STOP_ORDER_TYPES = {"STP", "STP LMT", "TRAIL", "TRAIL LIMIT"}
+
+
+def _valid_price(v) -> float | None:
+    """IB marks unset doubles with sys.float_info.max; treat that, NaN, and
+    non-positive values as 'no price'."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0 or f >= 1e300:
+        return None
+    return f
+
+
+def match_stops_to_trades(stop_orders: list[dict], open_trades: list[dict]) -> list[dict]:
+    """Pair working broker stop orders with the log's open trades.
+
+    A stop protects a trade when it's on the same contract (ticker, and for
+    options expiration/strike/right) and on the closing side: SELL for a long,
+    BUY for a short. When several stops sit on one contract/side (scaled
+    exits), the one that would trigger first wins — the highest for a long,
+    the lowest for a short. Every open lot of that contract gets that stop.
+
+    Returns one dict per open trade that has a matching stop:
+    {trade_id, ticker, side, stop_price, order_type, old_current_stop,
+     old_opening_stop, set_opening, changed}.
+    """
+    def _key(d, side):
+        it = d.get("instrument_type") or "stock"
+        if it == "option":
+            strike = d.get("strike")
+            return ((d.get("ticker") or "").upper(), it, str(d.get("expiration") or "")[:10],
+                    round(float(strike), 4) if strike is not None else None,
+                    (d.get("option_type") or "").lower(), side)
+        return ((d.get("ticker") or "").upper(), it, side)
+
+    best: dict = {}
+    for so in stop_orders:
+        protects = "long" if so.get("action") == "SELL" else "short" if so.get("action") == "BUY" else None
+        if not protects:
+            continue
+        k = _key(so, protects)
+        cur = best.get(k)
+        if (cur is None
+                or (protects == "long"  and so["stop_price"] > cur["stop_price"])
+                or (protects == "short" and so["stop_price"] < cur["stop_price"])):
+            best[k] = so
+
+    out: list[dict] = []
+    for t in open_trades:
+        side = (t.get("side") or "long").lower()
+        so = best.get(_key(t, side))
+        if so is None:
+            continue
+        old_cur = t.get("current_stop")
+        old_open = t.get("opening_stop")
+        old_cur = None if old_cur is None or old_cur != old_cur else float(old_cur)
+        old_open = None if old_open is None or old_open != old_open else float(old_open)
+        price = round(float(so["stop_price"]), 4)
+        set_opening = old_open is None
+        out.append({
+            "trade_id":         int(t["id"]),
+            "ticker":           t.get("ticker"),
+            "side":             side,
+            "stop_price":       price,
+            "order_type":       so.get("order_type"),
+            "old_current_stop": old_cur,
+            "old_opening_stop": old_open,
+            "set_opening":      set_opening,
+            "changed":          set_opening or old_cur is None or abs(old_cur - price) > 1e-6
+                                or not t.get("stop_enabled"),
+        })
+    return out
 
 
 def test_connection(host: str, port: int, client_id: int = 1) -> tuple[bool, str]:

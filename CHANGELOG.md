@@ -6,6 +6,12 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-04.1
+- Stop Loss Sync (Settings → Brokers → IB): pulls your working stop, stop-limit and trailing-stop orders from TWS/Gateway and saves each as the Current Stop of the open trade it protects. Trades with no stop also get it as their Opening Stop; a stop you already recorded at entry is kept
+- New toggle to run the stop sync automatically once per session when the app opens (needs TWS or Gateway running)
+- IB imports no longer bring in currency conversions (NZD.USD, EUR.USD, USD.CAD…) as positions, from either Today's Fills or Flex
+- Reconcile Open Positions spots currency "positions" already in the log and offers to delete them, and ignores foreign-currency cash balances in broker positions files
+
 ## 2026-11-04
 - IB Flex fetches and XML uploads now save your day-by-day account balance to the Equity Curve automatically. Before, only the separate Data → File Import button did, so routine trade imports left the curve stuck at the last time you pressed it
 - Importing balance history from IB Flex now covers the whole report by default instead of only the last 30 days

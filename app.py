@@ -105,6 +105,7 @@ DEFAULT_SETTINGS = {
     "ib_client_id":         "1",
     "ib_use_live_prices":   "0",
     "ib_auto_sync_balance": "0",
+    "ib_auto_sync_stops":   "0",
     "ib_auto_connect":      "0",
     # Charles Schwab
     "schwab_app_key":           "",
@@ -2300,6 +2301,47 @@ def save_flex_daily_nav(flex_result: dict) -> int:
     _cached_load_equity_entries.clear()
     _bust("_v_equity")
     return len(_nav)
+
+
+def sync_ib_stops(host: str, port: int, cid: int) -> dict:
+    """Pull working stop orders from TWS/Gateway and write them onto the open
+    trades they protect: current_stop = the order's trigger price, stops
+    switched on, and opening_stop filled in only when the trade has none (so a
+    stop you recorded at entry is never overwritten). A trailing stop's trigger
+    is saved as a plain stop price -- it's refreshed on every sync -- rather than
+    re-deriving it from trail settings the log can't see.
+
+    Returns {orders, matches, updated, unmatched_orders}; raises on connection
+    errors so callers can show them.
+    """
+    with _ib_mod.IBClient(host, port, cid) as _ib:
+        _orders = _ib.get_open_stop_orders()
+    with get_connection() as conn:
+        _cur = conn.execute(
+            """SELECT id, ticker, side, instrument_type, expiration, strike,
+                      option_type, current_stop, opening_stop, stop_enabled
+                 FROM trades WHERE exit_date IS NULL""")
+        _cols = [c[0] for c in _cur.description]
+        _open = [dict(zip(_cols, r)) for r in _cur.fetchall()]
+    _matches = _ib_mod.match_stops_to_trades(_orders, _open)
+    _changed = [m for m in _matches if m["changed"]]
+    if _changed:
+        with get_connection() as conn:
+            conn.executemany(
+                """UPDATE trades SET current_stop=?, stop_enabled=1,
+                          opening_stop=COALESCE(opening_stop, ?)
+                    WHERE id=?""",
+                [(m["stop_price"], m["stop_price"], m["trade_id"]) for m in _changed],
+            )
+        _cached_load_trades.clear()
+        _bust("_v_trades")
+    _matched_tk = {(m["ticker"] or "").upper() for m in _matches}
+    return {
+        "orders":           _orders,
+        "matches":          _matches,
+        "updated":          len(_changed),
+        "unmatched_orders": [o for o in _orders if (o["ticker"] or "").upper() not in _matched_tk],
+    }
 
 
 def delete_equity_entry(entry_id: int):
@@ -5550,6 +5592,19 @@ if (not is_demo
         st.session_state["_ib_auto_synced"] = True
     except Exception:
         st.session_state["_ib_auto_synced"] = True  # don't retry on error
+
+# Auto-sync stop losses from working TWS stop orders once per browser session
+if (not is_demo
+        and settings.get("broker", "ib") == "ib"
+        and settings.get("ib_auto_sync_stops") == "1"
+        and _ib_mod.is_available()
+        and not st.session_state.get("_ib_stops_synced")):
+    st.session_state["_ib_stops_synced"] = True  # once per session, even on error
+    try:
+        _ib_cfg_st = st.session_state["_ib_cfg"]
+        sync_ib_stops(_ib_cfg_st["host"], _ib_cfg_st["port"], _ib_cfg_st["cid"])
+    except Exception:
+        pass
 
 
 # ── Global CSS / JS ────────────────────────────────────────────────────────────
@@ -14071,6 +14126,7 @@ if _sub in (S_BROKERS, S_HEALTH):
             bs_ib_cid         = int(settings.get("ib_client_id",     "1")    or 1)
             bs_ib_live        = settings.get("ib_use_live_prices",   "0") == "1"
             bs_ib_sync        = settings.get("ib_auto_sync_balance", "0") == "1"
+            bs_ib_sync_stops  = settings.get("ib_auto_sync_stops",   "0") == "1"
             bs_ib_autoconnect = settings.get("ib_auto_connect",      "0") == "1"
 
             with st.form("ib_conn_form"):
@@ -14091,6 +14147,12 @@ if _sub in (S_BROKERS, S_HEALTH):
                                          value=bs_ib_live)
                 new_ib_sync = st.toggle("Auto-sync account balance from IB on page load",
                                          value=bs_ib_sync)
+                new_ib_sync_stops = st.toggle(
+                    "Auto-sync stop losses from TWS stop orders on page load",
+                    value=bs_ib_sync_stops,
+                    help="Reads your working stop / trailing-stop orders once per session "
+                         "and saves each one as the Current Stop of the open trade it protects.",
+                )
                 ib_form_cols = st.columns([1, 1])
                 _save_ib = ib_form_cols[0].form_submit_button("💾  Save IB Settings", width='stretch')
                 _test_ib = ib_form_cols[1].form_submit_button("🔌  Test Connection",  width='stretch')
@@ -14101,12 +14163,14 @@ if _sub in (S_BROKERS, S_HEALTH):
                     set_setting("ib_client_id",         str(int(new_ib_cid)))
                     set_setting("ib_use_live_prices",   "1" if new_ib_live else "0")
                     set_setting("ib_auto_sync_balance", "1" if new_ib_sync else "0")
+                    set_setting("ib_auto_sync_stops",   "1" if new_ib_sync_stops else "0")
                     set_setting("ib_auto_connect",      "1" if new_ib_autoconnect else "0")
                     st.session_state["_ib_cfg"] = {
                         "host": new_ib_host, "port": int(new_ib_port),
                         "cid": int(new_ib_cid), "use_live": new_ib_live,
                     }
                     st.session_state.pop("_ib_auto_synced",       None)
+                    st.session_state.pop("_ib_stops_synced",      None)
                     st.session_state.pop("_ib_auto_connect_done", None)  # re-run auto-connect on next load
                     st.success("IB settings saved.")
                     st.rerun()
@@ -14253,6 +14317,56 @@ if _sub in (S_BROKERS, S_HEALTH):
                             st.warning("Could not retrieve NetLiquidation from IB.")
                     except Exception as _e:
                         st.error(f"IB error: {_e}")
+
+            st.divider()
+
+            # ── Stop Loss Sync (live API) ─────────────────────────────────────────────
+            st.markdown("#### Stop Loss Sync")
+            st.caption(
+                "Reads your working stop, stop-limit and trailing-stop orders from TWS/Gateway "
+                "and saves each as the **Current Stop** of the open trade it protects (a SELL stop "
+                "for a long, a BUY stop for a short). A trade with no stop yet also gets it as its "
+                "**Opening Stop**; an opening stop you already recorded is kept. Closed trades "
+                "aren't touched, since TWS no longer lists their orders."
+            )
+            if st.button("🛑  Pull Stop Losses from TWS", width='content', key="ib_sync_stops_btn"):
+                if not _ib_mod.is_available():
+                    st.error("ib_insync is not installed.")
+                else:
+                    try:
+                        st.session_state["_ib_stop_sync_result"] = sync_ib_stops(
+                            bs_ib_host, bs_ib_port, bs_ib_cid)
+                    except Exception as _e:
+                        st.error(f"IB error: {_e}")
+            _ss_res = st.session_state.get("_ib_stop_sync_result")
+            if _ss_res:
+                _ss_m = _ss_res["matches"]
+                if not _ss_res["orders"]:
+                    st.info("No working stop orders found in TWS.")
+                else:
+                    st.success(
+                        f"{len(_ss_res['orders'])} stop order(s) found · "
+                        f"{len(_ss_m)} open trade(s) matched · {_ss_res['updated']} updated."
+                    )
+                if _ss_m:
+                    st.dataframe(pd.DataFrame([{
+                        "Trade ID":       m["trade_id"],
+                        "Ticker":         m["ticker"],
+                        "Side":           m["side"],
+                        "Order":          m["order_type"],
+                        "Stop":           m["stop_price"],
+                        "Previous Stop":  m["old_current_stop"],
+                        "Opening Stop":   (m["stop_price"] if m["set_opening"]
+                                           else m["old_opening_stop"]),
+                    } for m in _ss_m]), width='stretch', hide_index=True)
+                if _ss_res["unmatched_orders"]:
+                    st.caption(
+                        "No open trade in the log for: "
+                        + ", ".join(sorted({f"{o['ticker']} ({o['action']} {o['order_type']} "
+                                            f"@ {o['stop_price']:g})"
+                                            for o in _ss_res["unmatched_orders"]}))
+                        + ". Import those positions first, then sync again."
+                    )
 
             st.divider()
 
@@ -15357,7 +15471,10 @@ if _sub in (S_BROKERS, S_HEALTH):
                                                             r["broker_qty"], r["broker_avg"])
                                    if r["status"] == _recon.QTY else r["broker_avg"])
                         _ntr = len(r["trades"])
-                        if r["status"] == _recon.OFFSET:
+                        if r["status"] == _recon.CURRENCY:
+                            _act = (f"Delete {_ntr} currency trade{'s' if _ntr != 1 else ''} "
+                                    f"(IDs {', '.join(str(x) for x in r['remove_ids'])})")
+                        elif r["status"] == _recon.OFFSET:
                             _npair = len(r["offsets"])
                             _act = (f"Close the earlier trade{'s' if _npair != 1 else ''} with the later "
                                 f"opposite one{'s' if _npair != 1 else ''} at "
@@ -15391,7 +15508,8 @@ if _sub in (S_BROKERS, S_HEALTH):
                     "added. The broker doesn't report when a missing position was opened, so "
                     "**Date** defaults to today — change it if you know better. 🔀 rows need "
                     "neither: the later trade was the fill that closed the earlier one, so its "
-                    "own price and date become the exit. Untick a row to leave it alone."
+                    "own price and date become the exit. 💱 rows are currency conversions "
+                    "imported as trades; applying deletes them. Untick a row to leave it alone."
                     )
                     # Keyed on what's being reconciled so a new fetch, another account
                     # or a changed log builds a fresh table instead of keeping edits
@@ -15429,6 +15547,8 @@ if _sub in (S_BROKERS, S_HEALTH):
                                 r = _rc_diff[i]
                                 _d = pd.Timestamp(e["Date"]).date() if not pd.isna(e["Date"]) else _rc_today
                                 try:
+                                    if r.get("remove_ids"):
+                                        bulk_delete_trades(r["remove_ids"])
                                     for _o in r.get("offsets") or []:
                                         apply_offset_pair(_o["open_id"], _o["close_id"], _o["qty"], _note)
                                     if r["close_qty"]:
