@@ -18,6 +18,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+try:
+    import app_log as _log  # optional: Settings → Log; never required to run
+except Exception:
+    _log = None
+
+
+def _alog(level: str, message: str, detail: str = "") -> None:
+    if _log is not None:
+        _log.log(level, "IB", message, detail)
+
+
 _IMPORTS_DIR = Path(__file__).parent / "imports"
 _IMPORTS_DIR.mkdir(exist_ok=True)
 
@@ -113,8 +124,11 @@ class IBClient:
         except BaseException as exc:
             self._ib = None
             _session_lock.release()
-            raise ConnectionError(
-                describe_connect_error(exc, self.host, self.port, self.client_id)) from exc
+            _msg = describe_connect_error(exc, self.host, self.port, self.client_id)
+            _alog("WARNING", f"Connection to {self.host}:{self.port} (Client ID "
+                  f"{self.client_id}) failed: {_msg}",
+                  f"{type(exc).__name__}: {exc!r}")
+            raise ConnectionError(_msg) from exc
         return self
 
     def __exit__(self, *_):
@@ -450,6 +464,22 @@ _FLEX_EMPTY = lambda err=None: {
 
 
 def fetch_flex_report(token: str, query_id: str) -> dict:
+    """Fetch a Flex report (see _fetch_flex_report_impl) and record the outcome
+    on Settings → Log."""
+    res = _fetch_flex_report_impl(token, query_id)
+    if _log is not None:
+        if res.get("error"):
+            _log.log("ERROR", "Flex", f"Flex fetch failed (query {query_id})",
+                     str(res["error"]), dedupe=False)
+        else:
+            _log.info("Flex", f"Flex report fetched (query {query_id}): "
+                      f"{len(res.get('trades') or [])} trade(s), "
+                      f"{len(res.get('daily_nav') or [])} daily balance(s), "
+                      f"{len(res.get('cash_transactions') or [])} cash transaction(s)")
+    return res
+
+
+def _fetch_flex_report_impl(token: str, query_id: str) -> dict:
     """
     Fetch an IB Flex Query report and return structured data.
 
@@ -1093,6 +1123,7 @@ def test_connection(host: str, port: int, client_id: int = 1) -> tuple[bool, str
         return False, "ib_insync is not installed. Run: pip install ib_insync nest_asyncio"
     try:
         with IBClient(host, port, client_id):
+            _alog("INFO", f"Test connection to {host}:{port} (Client ID {client_id}) succeeded")
             return True, "Connected to IB Gateway / TWS successfully."
     except Exception as e:
         return False, f"Connection failed: {e}" if str(e) else (

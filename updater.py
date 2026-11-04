@@ -17,6 +17,7 @@ SOURCE_FILES = [
     "csv_smart.py",
     "reconcile.py",
     "cloud_sync.py",
+    "app_log.py",
     "launch.py",
     "requirements.txt",
     "updater.py",

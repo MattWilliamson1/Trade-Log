@@ -56,6 +56,57 @@ try:
 except Exception:
     # Optional — Broker Sync → Reconcile Open Positions says so when it's absent.
     _recon = None
+try:
+    import app_log as _alog
+except Exception:
+    # Optional — Settings → Log says so when it's absent.
+    _alog = None
+
+
+def applog(level: str, category: str, message: str, detail: str = "") -> None:
+    """Record an event on Settings → Log. Never raises."""
+    if _alog is not None:
+        try:
+            _alog.log(level, category, message, detail, dedupe=(level.upper() != "INFO"))
+        except Exception:
+            pass
+
+
+def _guess_log_category(text: str) -> str:
+    t = text.lower()
+    for words, cat in ((("flex",), "Flex"), (("schwab",), "Schwab"), (("fidelity",), "Fidelity"),
+                       (("ib ", "ib:", "tws", "gateway", "ib_insync"), "IB"),
+                       (("cloud", "upload", "sync"), "Sync"), (("email",), "Email"),
+                       (("csv", "xml", "import", "file"), "Import"), (("update",), "Update"),
+                       (("trade",), "Trades")):
+        if any(w in t for w in words):
+            return cat
+    return "App"
+
+
+if _alog is not None and not getattr(_alog, "_app_started", False):
+    _alog._app_started = True  # once per process; this file reruns constantly
+    try:
+        applog("INFO", "App", f"Trade Log v{_upd.get_local_version()} started")
+    except Exception:
+        pass
+
+# Every red error box the app shows is also written to the log, so a student
+# can send the log instead of a screenshot. Wrapped once per process (Streamlit
+# re-executes this file on every rerun; the marker stops double-wrapping).
+if _alog is not None and not getattr(st.error, "_tradelog_wrapped", False):
+    _st_error_orig = st.error
+
+    def _st_error_logged(body, *args, **kwargs):
+        try:
+            _txt = str(body)
+            applog("ERROR", _guess_log_category(_txt), _txt)
+        except Exception:
+            pass
+        return _st_error_orig(body, *args, **kwargs)
+
+    _st_error_logged._tradelog_wrapped = True
+    st.error = _st_error_logged
 
 ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
@@ -1176,8 +1227,8 @@ def get_live_data(symbols: tuple) -> dict:
                     ib_result.update(_yf_get_live_data(missing_yf))
                 st.session_state[_ck] = {"ts": _time.time(), "data": ib_result}
                 return ib_result
-        except Exception:
-            pass
+        except Exception as _lp_e:
+            applog("WARNING", "IB", f"Live prices from IB failed; using Yahoo Finance instead. {_lp_e}")
     # Yahoo Finance path: strip OCC option symbols it cannot price
     yf_symbols = tuple(s for s in symbols if not _is_occ_symbol(s))
     return _yf_get_live_data(yf_symbols)
@@ -2315,6 +2366,8 @@ def save_flex_daily_nav(flex_result: dict) -> int:
               float(r.get("withdrawals", 0.0) or 0.0)) for r in _nav],
         )
     st.session_state["_flex_nav_saved_sig"] = _sig
+    applog("INFO", "Flex", f"Equity curve updated with {len(_nav)} daily balance(s) "
+           f"({_nav[0]['date']} to {_nav[-1]['date']})")
     _cached_load_equity_entries.clear()
     _bust("_v_equity")
     return len(_nav)
@@ -2353,6 +2406,10 @@ def sync_ib_stops(host: str, port: int, cid: int) -> dict:
         _cached_load_trades.clear()
         _bust("_v_trades")
     _matched_tk = {(m["ticker"] or "").upper() for m in _matches}
+    applog("INFO", "IB", f"Stop sync: {len(_orders)} stop order(s) in TWS, "
+           f"{len(_matches)} open trade(s) matched, {len(_changed)} updated",
+           "\n".join(f"#{m['trade_id']} {m['ticker']} {m['side']} -> {m['stop_price']} "
+                     f"({m['order_type']}), was {m['old_current_stop']}" for m in _changed))
     return {
         "orders":           _orders,
         "matches":          _matches,
@@ -3587,6 +3644,15 @@ def park_import_result(key: str, counts: dict) -> None:
     """Keep an import's counts for the next run. Anything drawn before
     st.rerun() is wiped, so the summary is drawn by show_import_result instead."""
     st.session_state[key] = counts
+    try:
+        _src = key.strip("_").replace("_import_result", "").replace("_", " ").title() or "Import"
+        _errs = counts.get("errors") or []
+        applog("WARNING" if _errs else "INFO", "Import",
+               f"{_src} import: {counts.get('imported', 0)} new, {counts.get('closed', 0)} closed, "
+               f"{counts.get('dupes', 0)} duplicate(s) skipped, {len(_errs)} not imported",
+               "\n".join(str(e) for e in _errs))
+    except Exception:
+        pass
 
 
 def show_import_result(key: str) -> None:
@@ -5607,7 +5673,8 @@ if (not is_demo
             acct_bal = _auto_acct["net_liquidation"]
             st.session_state["_live_balance_set"] = True
         st.session_state["_ib_auto_synced"] = True
-    except Exception:
+    except Exception as _as_e:
+        applog("WARNING", "IB", f"Auto-sync of account balance failed: {_as_e}")
         st.session_state["_ib_auto_synced"] = True  # don't retry on error
 
 # Auto-sync stop losses from working TWS stop orders once per browser session
@@ -5620,8 +5687,8 @@ if (not is_demo
     try:
         _ib_cfg_st = st.session_state["_ib_cfg"]
         sync_ib_stops(_ib_cfg_st["host"], _ib_cfg_st["port"], _ib_cfg_st["cid"])
-    except Exception:
-        pass
+    except Exception as _ss_e:
+        applog("WARNING", "IB", f"Auto-sync of stop losses failed: {_ss_e}")
 
 
 # ── Global CSS / JS ────────────────────────────────────────────────────────────
@@ -6183,13 +6250,13 @@ P_JOURNAL, P_PLAN, P_PERF, P_DATA, P_SETTINGS = _PAGES
 S_PLAN,    S_CALC,     S_ALLOC                    = "📝 Trading Plan", "🧮 Calculators", "🗂️ Allocation Plan"
 S_SUMMARY, S_EQUITY,   S_BREAKDOWN, S_BENCH       = "📊 Summary", "📈 Equity Curve", "🧩 Breakdown", "🏁 Benchmarks"
 S_BROKERS, S_IMPORT,   S_BALANCES,  S_HEALTH      = "🔌 Brokers", "📥 File Import", "💰 Balances", "🩺 Data Health"
-S_DISPLAY, S_TRADING,  S_TAGS, S_ALERTS, S_SYNC, S_HELP = (
-    "🎨 Display", "💼 Trading", "🏷️ Tags", "🔔 Alerts", "☁️ Data & Sync", "❓ Help")
+S_DISPLAY, S_TRADING,  S_TAGS, S_ALERTS, S_SYNC, S_LOG, S_HELP = (
+    "🎨 Display", "💼 Trading", "🏷️ Tags", "🔔 Alerts", "☁️ Data & Sync", "🧾 Log", "❓ Help")
 _SUBPAGES = {
     P_PLAN:     [S_PLAN, S_CALC, S_ALLOC],
     P_PERF:     [S_SUMMARY, S_EQUITY, S_BREAKDOWN, S_BENCH],
     P_DATA:     [S_BROKERS, S_IMPORT, S_BALANCES, S_HEALTH],
-    P_SETTINGS: [S_DISPLAY, S_TRADING, S_TAGS, S_ALERTS, S_SYNC, S_HELP],
+    P_SETTINGS: [S_DISPLAY, S_TRADING, S_TAGS, S_ALERTS, S_SYNC, S_LOG, S_HELP],
 }
 # The nine pages this layout replaced, and where each one lives now.
 _LEGACY_PAGES = {
@@ -15598,6 +15665,9 @@ if _sub in (S_BROKERS, S_HEALTH):
                                 except Exception as _ex:
                                     _errs.append(f"{r['contract']}: {_ex}")
                             st.session_state["_rc_applied"] = {"done": _done, "errors": _errs}
+                            applog("WARNING" if _errs else "INFO", "Reconcile",
+                                   f"Reconcile with {_rcb['label']}: {_done} change(s) applied, "
+                                   f"{len(_errs)} failed", "\n".join(_errs))
                             st.rerun()
 
         # ── Find Duplicate Imports ─────────────────────────────────────────────────
@@ -16648,6 +16718,92 @@ port is 587, and that you used an App Password rather than your login password.
                 if _bc4.button("↩️", key=f"restore_{_bp.name}", help="Restore this backup"):
                     st.session_state["_restore_pending_bp"] = _bp.name
                     st.rerun()
+
+    # ── Log: status and errors ────────────────────────────────────────────────
+    if _sub == S_LOG:
+        st.markdown("#### 🧾  Status & Error Log")
+        st.caption(
+            "Everything the app records while it runs: broker connections, Flex fetches, "
+            "imports, stop and balance syncs, reconciles, and every error shown on screen. "
+            "Newest first. Repeats of the same warning are recorded at most once every "
+            "5 minutes. If something isn't working, **Download** the log and send it "
+            "along with your question."
+        )
+        if _alog is None:
+            st.warning("The log module (app_log.py) is missing. Update the app from "
+                       "Settings → Help to get it back.")
+        else:
+            _lg_all = _alog.read_entries(3000)
+            _lg_n_err = sum(1 for e in _lg_all if e["level"] == "ERROR")
+            _lg_n_warn = sum(1 for e in _lg_all if e["level"] == "WARNING")
+            _lgm1, _lgm2, _lgm3 = st.columns(3)
+            _lgm1.metric("Entries", len(_lg_all))
+            _lgm2.metric("Errors", _lg_n_err)
+            _lgm3.metric("Warnings", _lg_n_warn)
+
+            _lgf1, _lgf2, _lgf3 = st.columns([2, 2, 3])
+            _lg_levels = _lgf1.multiselect(
+                "Level", ["ERROR", "WARNING", "INFO"], default=["ERROR", "WARNING", "INFO"],
+                key="log_levels")
+            _lg_cats = sorted({e["category"] for e in _lg_all})
+            _lg_cat_sel = _lgf2.multiselect("Area", _lg_cats, default=[], key="log_cats",
+                                            placeholder="All areas")
+            _lg_q = _lgf3.text_input("Search", key="log_search", placeholder="e.g. TWS, Flex, AAPL")
+            _lg_rows = [
+                e for e in _lg_all
+                if e["level"] in _lg_levels
+                and (not _lg_cat_sel or e["category"] in _lg_cat_sel)
+                and (not _lg_q or _lg_q.lower() in (e["message"] + " " + e["detail"]).lower())
+            ]
+            _lg_icon = {"ERROR": "🔴", "WARNING": "🟡", "INFO": "🔵", "DEBUG": "⚪"}
+            if not _lg_all:
+                st.info("Nothing logged yet. Entries appear here as you connect to brokers, "
+                        "import, and sync.")
+            elif not _lg_rows:
+                st.info("No entries match these filters.")
+            else:
+                st.dataframe(pd.DataFrame([{
+                    "Time":    e["time"],
+                    "Level":   f"{_lg_icon.get(e['level'], '')} {e['level']}",
+                    "Area":    e["category"],
+                    "Message": e["message"],
+                } for e in _lg_rows[:1000]]), hide_index=True, width="stretch", height=420,
+                    column_config={
+                        "Time":    st.column_config.TextColumn(width="small"),
+                        "Level":   st.column_config.TextColumn(width="small"),
+                        "Area":    st.column_config.TextColumn(width="small"),
+                        "Message": st.column_config.TextColumn(width="large"),
+                    })
+                if len(_lg_rows) > 1000:
+                    st.caption(f"Showing the newest 1,000 of {len(_lg_rows):,} matching entries. "
+                               "Download for the rest.")
+                _lg_detailed = [e for e in _lg_rows[:200] if e["detail"].strip()]
+                if _lg_detailed:
+                    with st.expander(f"🔎  Details ({len(_lg_detailed)} entries with extra info)"):
+                        for e in _lg_detailed[:50]:
+                            st.markdown(f"**{e['time']} · {e['level']} · {e['category']}** — {e['message']}")
+                            st.code(e["detail"][:4000], language=None)
+
+            _lgb1, _lgb2, _ = st.columns([1, 1, 2])
+            _lgb1.download_button(
+                "⬇️  Download log", data=_alog.log_text().encode("utf-8"),
+                file_name=f"tradelog_log_{pd.Timestamp.today().date().isoformat()}.txt",
+                mime="text/plain", width="stretch", key="log_download",
+                disabled=not _lg_all)
+            if st.session_state.get("_log_clear_confirm"):
+                st.warning("Clear the whole log? This can't be undone.")
+                _lcc1, _lcc2, _ = st.columns([1, 1, 2])
+                if _lcc1.button("Yes, clear it", type="primary", key="log_clear_yes", width="stretch"):
+                    _alog.clear()
+                    st.session_state.pop("_log_clear_confirm", None)
+                    st.rerun()
+                if _lcc2.button("Cancel", key="log_clear_no", width="stretch"):
+                    st.session_state.pop("_log_clear_confirm", None)
+                    st.rerun()
+            elif _lgb2.button("🗑️  Clear log", key="log_clear", width="stretch", disabled=not _lg_all):
+                st.session_state["_log_clear_confirm"] = True
+                st.rerun()
+            st.caption(f"Log file: `{_alog.LOG_FILE}`")
 
     # ── Help: tour, changelog, glossary ───────────────────────────────────────
     if _sub == S_HELP:
