@@ -6,6 +6,11 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-04.2
+- Fixed IB connections failing with a blank "Connection failed:" message. Every IB feature (auto-connect, live prices, balance sync, stop sync, Test Connection) uses the same Client ID, and TWS refuses a second connection on an ID that's already connected, so overlapping requests timed out. The app now runs one IB request at a time
+- IB connects in read-only mode, which is quicker and skips TWS's order sync on connect (a common cause of timeouts on accounts with lots of history)
+- Failed IB connections now say why in plain English (TWS API switched off, wrong port, Client ID already in use, unanswered "Accept incoming connection?" pop-up) and what to try
+
 ## 2026-11-04.1
 - Stop Loss Sync (Settings → Brokers → IB): pulls your working stop, stop-limit and trailing-stop orders from TWS/Gateway and saves each as the Current Stop of the open trade it protects. Trades with no stop also get it as their Opening Stop; a stop you already recorded at entry is kept
 - New toggle to run the stop sync automatically once per session when the app opens (needs TWS or Gateway running)

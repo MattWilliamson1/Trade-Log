@@ -8,6 +8,7 @@ available or not configured.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import re
 import threading
@@ -29,7 +30,56 @@ try:
 except ImportError:
     pass
 
-_connect_lock = threading.Lock()
+# Held for a whole IB session (connect -> query -> disconnect), not just the
+# connect. Every feature uses the same Client ID, and TWS refuses a second
+# connection on an ID that's already connected, so two overlapping sessions
+# (live prices still loading while Test Connection is pressed, or the
+# page-load syncs running back to back on a rerun) made the second one time
+# out with a blank error. Re-entrant so a nested session on one thread is fine.
+_session_lock = threading.RLock()
+_SESSION_WAIT_S = 45
+
+# Ports people commonly mix up, for error hints
+_PORT_NAMES = {7496: "TWS live", 7497: "TWS paper", 4001: "Gateway live", 4002: "Gateway paper"}
+
+
+def describe_connect_error(exc: BaseException, host: str, port: int, client_id: int) -> str:
+    """Plain-English reason for a failed IB connection, with what to try.
+    ib_insync's timeouts carry an empty message, which used to show as just
+    "Connection failed:"."""
+    raw = str(exc).strip()
+    kind = type(exc).__name__
+    low = (raw + " " + kind).lower()
+    port_name = _PORT_NAMES.get(int(port), f"port {port}")
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in low:
+        return (
+            f"TWS/Gateway at {host}:{port} ({port_name}) accepted the connection but never "
+            "finished the handshake. Usually one of:\n\n"
+            f"• Client ID {client_id} is already connected (another program, another copy of "
+            "this app, or a stuck session). Change Client ID to an unused number such as 7, "
+            "save, and test again.\n\n"
+            "• TWS is showing an 'Accept incoming connection?' pop-up. Look for it behind other "
+            "windows and click Accept, or add 127.0.0.1 under Trusted IPs in "
+            "TWS → Global Configuration → API → Settings.\n\n"
+            "• TWS is still logging in or busy loading. Wait a moment and try again."
+        )
+    if isinstance(exc, ConnectionRefusedError) or "refused" in low or "1225" in low:
+        return (
+            f"Nothing is accepting API connections at {host}:{port} ({port_name}). Check that "
+            "TWS or IB Gateway is open and logged in, that "
+            "TWS → Global Configuration → API → Settings → 'Enable ActiveX and Socket Clients' "
+            "is ticked, and that the Socket Port shown there matches this Port "
+            "(TWS live 7496, TWS paper 7497, Gateway live 4001, Gateway paper 4002)."
+        )
+    if "event loop" in low:
+        return (
+            f"Python/ib_insync event-loop error ({raw}). This happens on very new Python "
+            "versions; installing Python 3.12 and re-running install.bat fixes it."
+        )
+    if "client id" in low or "326" in low:
+        return (f"Client ID {client_id} is already in use by another connection. "
+                "Pick a different Client ID, save, and test again.")
+    return f"{kind}: {raw}" if raw else f"{kind} (no details from IB)"
 
 
 def is_available() -> bool:
@@ -48,10 +98,23 @@ class IBClient:
     def __enter__(self):
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_insync is not installed")
-        with _connect_lock:
+        if not _session_lock.acquire(timeout=_SESSION_WAIT_S):
+            raise RuntimeError(
+                "Another IB request from this app is still running. "
+                "Wait a few seconds and try again.")
+        try:
             self._ib = IB()
-            self._ib.connect(self.host, self.port, clientId=self.client_id, timeout=10)
+            # readonly: this app never places orders, and it skips TWS's
+            # open/completed-order sync on connect (slow, and a common cause
+            # of handshake timeouts on accounts with lots of history).
+            self._ib.connect(self.host, self.port, clientId=self.client_id,
+                             timeout=15, readonly=True)
             self._ib.sleep(0.5)
+        except BaseException as exc:
+            self._ib = None
+            _session_lock.release()
+            raise ConnectionError(
+                describe_connect_error(exc, self.host, self.port, self.client_id)) from exc
         return self
 
     def __exit__(self, *_):
@@ -60,7 +123,9 @@ class IBClient:
                 self._ib.disconnect()
         except Exception:
             pass
-        self._ib = None
+        finally:
+            self._ib = None
+            _session_lock.release()
 
     # ── Live prices ────────────────────────────────────────────────────────────
 
@@ -1030,7 +1095,8 @@ def test_connection(host: str, port: int, client_id: int = 1) -> tuple[bool, str
         with IBClient(host, port, client_id):
             return True, "Connected to IB Gateway / TWS successfully."
     except Exception as e:
-        return False, f"Connection failed: {e}"
+        return False, f"Connection failed: {e}" if str(e) else (
+            "Connection failed: " + describe_connect_error(e, host, port, client_id))
 
 
 def _to_date(v):
