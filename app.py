@@ -1272,6 +1272,12 @@ NATIVE_CURRENCIES: dict[str, dict] = {
     "EUR": {"symbol": "€",  "pair": "EURUSD=X"},
     "GBP": {"symbol": "£",  "pair": "GBPUSD=X"},
     "NZD": {"symbol": "NZ$", "pair": "NZDUSD=X"},
+    # The other markets in _IB_EXCHANGE_TO_YF (Euro markets are already EUR)
+    "CHF": {"symbol": "CHF ", "pair": "CHFUSD=X"},
+    "HKD": {"symbol": "HK$", "pair": "HKDUSD=X"},
+    "JPY": {"symbol": "¥",  "pair": "JPYUSD=X"},
+    "KRW": {"symbol": "₩",  "pair": "KRWUSD=X"},
+    "SGD": {"symbol": "S$", "pair": "SGDUSD=X"},
 }
 _FX_PAIRS = {k: v["pair"] for k, v in NATIVE_CURRENCIES.items()}
 
@@ -8222,7 +8228,9 @@ if page == P_JOURNAL:
                 display["Entry (Native)"]  = filtered.apply(_native_entry,  axis=1)
                 display["Exit (Native)"]   = filtered.apply(_native_exit,   axis=1)
                 display["FX Rate Entry"]   = filtered["fx_rate_entry"].apply(
-                    lambda v: f"{float(v):.4f}" if v and not pd.isna(v) else "—"
+                    # Significant figures, not fixed decimals: a won or yen rate
+                    # (0.000695 USD) would show as 0.0007 or 0.0000 at .4f.
+                    lambda v: f"{float(v):.6g}" if v and not pd.isna(v) else "—"
                 )
 
             display["Position Value"] = filtered.apply(

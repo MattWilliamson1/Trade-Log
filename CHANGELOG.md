@@ -6,6 +6,11 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-10.2
+- New currencies for logging trades: Korean won (₩), Japanese yen (¥), Hong Kong dollar (HK$), Singapore dollar (S$) and Swiss franc (CHF), covering every non-US market the app knows. Pick them on New Trade, Edit Trade and Settings, or import them from a CSV
+- Trades imported from TWS in these currencies keep their own currency instead of being stored as plain USD
+- The FX Rate Entry column shows significant figures, so small rates like won (0.000744) and yen (0.0063) no longer round to 0.0007 or 0.0063 → 0.0000
+
 ## 2026-11-10.1
 - Clicking a column header in the trade tables now sorts by the actual number or date: "$9.00" no longer sorts above "$10,000.00", and dates sort in date order. What's shown in each cell is unchanged; blanks ("—") sort lowest
 - New Trade: the Trailing Stop checkbox, unit and amount now sit directly under the stop loss, and the Trail Amount accepts four decimals. Ticking Trailing Stop without an amount now shows an error instead of saving a plain stop
