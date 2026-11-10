@@ -12,6 +12,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import warnings as _warnings
+# yfinance still passes inplace=True to pandas; pandas 3 warns on every
+# download and floods the console window. Harmless — hide it.
+_warnings.filterwarnings("ignore", message=r"The inplace keyword", module=r"yfinance(\.|$)")
 import plotly.graph_objects as go
 from pathlib import Path
 from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
@@ -1213,22 +1217,35 @@ def get_live_data(symbols: tuple) -> dict:
         _hit = st.session_state.get(_ck)
         if _hit and (_time.time() - _hit["ts"]) < 60:
             return _hit["data"]
-        try:
-            with _ib_mod.IBClient(ib_cfg["host"], ib_cfg["port"], ib_cfg["cid"]) as ib:
-                ib_result = ib.get_live_prices(list(symbols))
-            if ib_result:
-                # Fall back to Yahoo for symbols IB didn't return OR returned None price for
-                missing_yf = tuple(
-                    s for s in symbols
-                    if (s not in ib_result or ib_result[s].get("price") is None)
-                    and not _is_occ_symbol(s)
-                )
-                if missing_yf:
-                    ib_result.update(_yf_get_live_data(missing_yf))
-                st.session_state[_ck] = {"ts": _time.time(), "data": ib_result}
-                return ib_result
-        except Exception as _lp_e:
-            applog("WARNING", "IB", f"Live prices from IB failed; using Yahoo Finance instead. {_lp_e}")
+        # Only US listings go to IB. A Yahoo-suffixed symbol (EDO.AX, 005930.KS)
+        # isn't an IB symbol, IB's quote would be in the local currency, and
+        # the Yahoo path already converts those to USD — so they skip IB.
+        ib_syms = [s for s in symbols if "." not in s]
+        ib_result: dict = {}
+        if ib_syms:
+            try:
+                with _ib_mod.IBClient(ib_cfg["host"], ib_cfg["port"], ib_cfg["cid"]) as ib:
+                    ib_result = ib.get_live_prices(ib_syms) or {}
+                _priced = sum(1 for v in ib_result.values() if v.get("price") is not None)
+                if _priced < len(ib_syms):
+                    applog("WARNING", "IB",
+                           f"IB priced {_priced} of {len(ib_syms)} symbol(s); the rest come "
+                           "from Yahoo Finance. 0 usually means no market-data subscription "
+                           "in TWS or the market is closed with no snapshot.")
+            except Exception as _lp_e:
+                applog("WARNING", "IB", f"Live prices from IB failed; using Yahoo Finance instead. {_lp_e}")
+        # Yahoo for whatever IB didn't price (it can't price OCC options)
+        missing_yf = tuple(
+            s for s in symbols
+            if (s not in ib_result or ib_result[s].get("price") is None)
+            and not _is_occ_symbol(s)
+        )
+        if missing_yf:
+            ib_result.update(_yf_get_live_data(missing_yf))
+        # Cache even a partial or failed IB result: before, an empty IB answer
+        # skipped the cache, so every click reconnected to TWS and waited again.
+        st.session_state[_ck] = {"ts": _time.time(), "data": ib_result}
+        return ib_result
     # Yahoo Finance path: strip OCC option symbols it cannot price
     yf_symbols = tuple(s for s in symbols if not _is_occ_symbol(s))
     return _yf_get_live_data(yf_symbols)
@@ -3755,9 +3772,18 @@ def replay_ib_fills(records: list[dict], apply: bool = False) -> dict:
                 if _recon.contract_key(r["instrument_type"], r["ticker"], r["expiration"],
                                        r["strike"], r["option_type"]) == key]
         opened: dict = {}   # side → lot opened by this import
+        # IB reports fills in the listing's own currency (AUD on the ASX, KRW in
+        # Seoul). The log stores USD, so convert at today's rate — these are
+        # today's fills — and remember the currency where the app can show it.
+        _ccy = str(td.get("currency") or "USD").upper()
+        _fx = 1.0 if _ccy == "USD" else usd_per_unit(_ccy)
+        _ccy_tag = "" if _ccy == "USD" else f" {_ccy}"
         try:
+            if not _fx:
+                raise ValueError(f"no {_ccy}→USD exchange rate available right now; not imported")
             for f in sorted(fills, key=lambda f: f["time"]):
                 left, px, fd = float(f["quantity"]), float(f["price"]), _to_date_obj(f["date"])
+                px_usd = px * _fx
                 for lot in lots:
                     if left <= 1e-9:
                         break
@@ -3766,30 +3792,36 @@ def replay_ib_fills(records: list[dict], apply: bool = False) -> dict:
                     take = min(left, lot[2])
                     steps.append(f"{label}: close {fmt_qty(take)} of the {lot[1]} "
                                  f"{'from ' + fmt_date(lot[3]) if lot[3] else 'opened above'}"
-                                 f"{' (#' + str(lot[0]) + ')' if lot[0] else ''} @ {px:g}")
+                                 f"{' (#' + str(lot[0]) + ')' if lot[0] else ''} @ {px:g}{_ccy_tag}")
                     if apply:
-                        partial_exit_trade(lot[0], take, px, fd)
+                        partial_exit_trade(lot[0], take, px_usd, fd)
                     lot[2] -= take
                     left -= take
                 if left <= 1e-9:
                     continue
                 if f["side"] in opened:
                     lot = opened[f["side"]]
-                    steps.append(f"{label}: add {fmt_qty(left)} to the new {f['side']} @ {px:g}")
+                    steps.append(f"{label}: add {fmt_qty(left)} to the new {f['side']} @ {px:g}{_ccy_tag}")
                     if apply:
-                        update_position(lot[0], left, px, fd.isoformat())
+                        update_position(lot[0], left, px_usd, fd.isoformat())
                     lot[2] += left
                 else:
-                    steps.append(f"{label}: open {f['side']} {fmt_qty(left)} @ {px:g}")
+                    steps.append(f"{label}: open {f['side']} {fmt_qty(left)} @ {px:g}{_ccy_tag}")
                     tid = None
                     if apply:
+                        # Currencies the app can display natively keep their rate;
+                        # others (KRW, JPY…) are stored as plain USD.
+                        _native = _ccy in NATIVE_CURRENCIES
                         tid = add_trade(**{**{k: td[k] for k in [
                             "notes", "stop_enabled", "opening_stop", "tag_ids", "current_stop",
                             "instrument_type", "expiration", "strike", "option_type",
                             "multiplier", "leg_group", "leg_label",
                         ] if k in td}, "entry_date": fd, "ticker": td["ticker"],
-                            "quantity": left, "entry_price": px, "exit_date": None,
-                            "exit_price": None, "side": f["side"]})
+                            "quantity": left, "entry_price": px_usd, "exit_date": None,
+                            "exit_price": None, "side": f["side"],
+                            "exchange": td.get("exchange") or "",
+                            "native_currency": _ccy if _native else "USD",
+                            "fx_rate_entry": _fx if _native else 1.0})
                     lot = [tid, f["side"], left, None]
                     opened[f["side"]] = lot
                     lots.append(lot)
@@ -15456,6 +15488,12 @@ if _sub in (S_BROKERS, S_HEALTH):
                 _rc_pos = _rcb["positions"]
                 st.caption(f"Broker positions: **{_rcb['label']}**, fetched {_rcb['at']} "
                        f"({len(_rc_pos)} line{'s' if len(_rc_pos) != 1 else ''}).")
+                if not _rc_pos and str(_rcb.get("id", "")).startswith("ib-"):
+                    st.warning(
+                        "TWS / Gateway connected but reported **no open positions**. Check that "
+                        "TWS is logged in to the account that holds the positions (live vs paper: "
+                        "port 7496/4001 is live, 7497/4002 is paper), that TWS has finished loading, "
+                        "and see Settings → Log for which account(s) IB reported.")
                 _rcc1, _rcc2 = st.columns(2)
                 _rc_baccts = sorted({p.get("account") for p in _rc_pos if p.get("account")})
                 if len(_rc_baccts) > 1:

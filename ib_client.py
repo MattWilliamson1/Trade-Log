@@ -49,6 +49,7 @@ except ImportError:
 # out with a blank error. Re-entrant so a nested session on one thread is fine.
 _session_lock = threading.RLock()
 _SESSION_WAIT_S = 45
+_POSITIONS_TIMEOUT_S = 40
 
 # Ports people commonly mix up, for error hints
 _PORT_NAMES = {7496: "TWS live", 7497: "TWS paper", 4001: "Gateway live", 4002: "Gateway paper"}
@@ -151,7 +152,23 @@ class IBClient:
 
         contracts = []
         ticker_map: dict[Any, str] = {}
+        # Stocks are qualified in ONE call: ib_insync sends those requests
+        # together, so a list of N tickers costs one round trip instead of N
+        # back-to-back ones (each unknown symbol used to add a second or so).
+        stock_syms = [s for s in tickers if not re.match(r'^[A-Z]{1,6}\d{6}[CP]\d{8}$', s)]
+        if stock_syms:
+            try:
+                stocks = [Stock(s, 'SMART', 'USD') for s in stock_syms]
+                self._ib.qualifyContracts(*stocks)
+                for s, c in zip(stock_syms, stocks):
+                    if getattr(c, "conId", 0):   # qualified in place; 0 = unknown
+                        ticker_map[id(c)] = s
+                        contracts.append(c)
+            except Exception:
+                pass
         for sym in tickers:
+            if sym in stock_syms:
+                continue
             try:
                 # OCC option symbol: 6+ char root + 6-digit date + C/P + 8-digit strike
                 if re.match(r'^[A-Z]{1,6}\d{6}[CP]\d{8}$', sym):
@@ -242,8 +259,24 @@ class IBClient:
         reconcile.py (signed quantity, per-share/per-contract-unit avg price)."""
         if not self._ib:
             return []
+        # ib.positions() is only the cache filled during connect(). ib_insync
+        # gives that startup request the 15 s connect timeout and, if it runs
+        # out (big accounts, slow TWS, many sub-accounts), just logs "positions
+        # request timed out" and carries on — so the cache comes back empty or
+        # partial with no error. Ask again explicitly with a longer wait.
+        try:
+            raw_positions = self._ib.run(
+                asyncio.wait_for(self._ib.reqPositionsAsync(), _POSITIONS_TIMEOUT_S))
+        except (asyncio.TimeoutError, TimeoutError):
+            raise RuntimeError(
+                f"TWS/Gateway didn't send positions within {_POSITIONS_TIMEOUT_S} s. "
+                "Make sure TWS is fully logged in (not still loading) and try again.")
+        if not raw_positions:
+            raw_positions = self._ib.positions()
+        _alog("INFO", f"IB returned {len(raw_positions)} position line(s) for "
+              f"account(s) {', '.join(self._ib.managedAccounts()) or '(none)'}")
         out: list[dict] = []
-        for pos in self._ib.positions():
+        for pos in raw_positions:
             con = pos.contract
             try:
                 if _is_bag_contract(con) or _is_currency_contract(con):
@@ -275,7 +308,9 @@ class IBClient:
                     "multiplier":      mult,
                     "description":     con.localSymbol or con.symbol,
                 })
-            except Exception:
+            except Exception as exc:
+                _alog("WARNING", f"Skipped IB position {getattr(con, 'localSymbol', '') or getattr(con, 'symbol', '?')}",
+                      f"{type(exc).__name__}: {exc!r}")
                 continue
         return out
 
@@ -354,10 +389,17 @@ class IBClient:
                 if _is_currency_contract(con):
                     continue  # FX conversion (e.g. NZD.USD) — cash, not a position
                 itype = _contract_type(con)
+                # Non-US listings need their exchange (so prices look up as
+                # EDO.AX, not a US "EDO") and their currency (fills are in AUD,
+                # KRW… not dollars). US fills keep a blank exchange, as before.
+                ccy = (con.currency or "USD").upper()
                 rows.append({
                     "time":          str(ex.time),
                     "date":          str(ex.time)[:10],
                     "ticker":        con.symbol,
+                    "exchange":      ((con.primaryExchange or con.exchange or "").upper()
+                                      if ccy != "USD" else ""),
+                    "currency":      ccy,
                     "instrument_type": itype,
                     "side":          "long" if ex.side == "BOT" else "short",
                     "quantity":      abs(float(ex.shares)),
@@ -1212,6 +1254,8 @@ def parse_ib_executions_to_trades(executions: list[dict]) -> list[dict]:
                 "leg_group":       leg_group,
                 "leg_label":       None,   # filled in below for multi-leg groups
                 "side":            side,
+                "exchange":        first.get("exchange", ""),
+                "currency":        first.get("currency", "USD"),
             }
 
         if bot_fills:

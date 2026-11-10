@@ -6,6 +6,13 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-10
+- Live prices with IB are much faster: US stocks are looked up in one batch instead of one at a time, and foreign listings (ASX, Korea, London…) go straight to Yahoo Finance, which prices them in USD, instead of failing in IB every time
+- When IB can't price something, the app stops reconnecting to TWS on every click; it retries after a minute. Settings → Log now says how many symbols IB priced and how many came from Yahoo
+- Import Today's Fills from TWS now keeps a foreign stock's exchange and currency: ASX, Korean and other non-US trades are saved with their exchange so live prices work, and their prices are converted to USD instead of being stored as if they were dollars
+- Reconcile → Fetch positions from IB asks TWS for positions directly and waits up to 40 seconds, instead of reading a list that came back empty when TWS was slow. If IB reports no positions you now get a warning saying what to check
+- Hid the "inplace keyword" warnings that filled the console window on every price download
+
 ## 2026-11-04.4
 - New Settings → 🧾 Log: a status and error log of what the app does while it runs. It covers broker connections, Flex fetches, imports, stop and balance syncs, reconciles, and every error shown on screen, newest first
 - Filter the log by level (error, warning, info) and area (IB, Flex, Import…), search it, and see the full detail behind an entry
