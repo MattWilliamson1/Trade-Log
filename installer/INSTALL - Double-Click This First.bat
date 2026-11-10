@@ -76,10 +76,16 @@ del "%~dp0_write_test.tmp" >nul 2>&1
 
 :: ── Guard: already installed? ─────────────────────────────────────────────────
 if exist "%~dp0.venv\Scripts\python.exe" (
-    echo  [OK] Trade Log is already installed.
+    echo  [OK] Trade Log is already installed in:
     echo.
-    echo       If something is broken, delete the ".venv" folder
-    echo       in this directory and run this installer again.
+    echo         "%~dp0"
+    echo.
+    echo       To open it, double-click the "Trade Log" shortcut on your
+    echo       Desktop, or launch.bat in the folder above.
+    echo.
+    echo       If it will not open, run the DIAGNOSE file in that same
+    echo       folder. If something is broken, delete the ".venv" folder
+    echo       there and run this installer again.
     echo.
     pause & exit /b 0
 )

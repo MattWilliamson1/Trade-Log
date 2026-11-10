@@ -2046,6 +2046,49 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+_SORT_PLACEHOLDERS = {"", "—", "-", "N/A", "n/a", "nan", "None", "<NA>"}
+# Optional sign, up to 4 non-digit currency chars (e.g. "$", "C$", "HK$", "€"),
+# optional sign again, the number, then an optional %, x or R suffix and an
+# optional trailing-stop tag ("$5.00 ▲2%").
+_SORT_NUM_PATTERN = (
+    r"^\s*([+-]?)\s*[^\d\s+\-.,]{0,4}?\s*([+-]?)\s*(\d[\d,]*\.?\d*|\.\d+)\s*(?:%|x|R)?(?:\s*▲.*)?\s*$"
+)
+
+
+def _sortable_values(df: pd.DataFrame, settings: dict):
+    """A copy of df where columns made entirely of formatted numbers (or dates
+    in the user's date format) hold real floats/timestamps, plus the positions
+    of the columns that were converted. Any column with a cell that doesn't
+    parse cleanly is left as text.
+
+    Placeholder cells ("—") get -inf / the earliest timestamp rather than
+    NaN: Arrow turns NaN into null, and st.dataframe draws a null as "None"
+    whatever its display text says. So placeholders sort as the lowest value."""
+    date_pat = DATE_FORMATS[resolve_date_format(settings)][0]
+    out, converted = df.copy(), []
+    for j, col in enumerate(df.columns):
+        vals = df.iloc[:, j].astype(str).str.strip()
+        real = ~vals.isin(_SORT_PLACEHOLDERS)
+        if not real.any():
+            continue
+        m = vals[real].str.extract(_SORT_NUM_PATTERN)
+        if m[2].notna().all():
+            neg = ((m[0] == "-") | (m[1] == "-")).to_numpy()
+            nums = m[2].str.replace(",", "", regex=False).astype(float).to_numpy()
+            col_vals = np.full(len(df), -np.inf)
+            col_vals[real.to_numpy()] = np.where(neg, -nums, nums)
+            out.isetitem(j, col_vals)
+            converted.append(j)
+            continue
+        dates = pd.to_datetime(vals[real], format=date_pat, errors="coerce")
+        if dates.notna().all():
+            col_vals = pd.Series(pd.Timestamp.min, index=df.index, dtype="datetime64[ns]")
+            col_vals[real] = dates
+            out.isetitem(j, col_vals)
+            converted.append(j)
+    return out, converted
+
+
 def _style_table(df: pd.DataFrame, settings: dict, group_keys: "pd.Series | None" = None):
     pct_acct_yellow = float(settings.get("pct_account_yellow", 5))
     pct_acct_red    = float(settings.get("pct_account_red",    10))
@@ -2177,7 +2220,20 @@ def _style_table(df: pd.DataFrame, settings: dict, group_keys: "pd.Series | None
     def _apply_row(row):
         return pd.Series(styles[_pos_map[row.name]], index=row.index)
 
-    styled = df.style.apply(_apply_row, axis=1)
+    # Every cell arrives pre-formatted as text ("$1,234.56", "+12.3%",
+    # "03/14/2025"), and st.dataframe sorts by the underlying value — so a
+    # header click sorted "$9.00" above "$10,000.00". Hand the Styler real
+    # numbers/dates underneath and pin each cell's display back to its
+    # original text: sorting is by value, what's shown is unchanged.
+    sort_df, sort_cols = _sortable_values(df, settings)
+    styled = sort_df.style
+    if sort_cols and isinstance(getattr(styled, "_display_funcs", None), dict):
+        for j in sort_cols:
+            for i, text in enumerate(df.iloc[:, j].astype(str)):
+                styled._display_funcs[(i, j)] = (lambda _v, _s=text: _s)
+    else:
+        styled = df.style
+    styled = styled.apply(_apply_row, axis=1)
 
     if group_keys is not None and len(group_keys):
         _palette   = ["rgba(100,149,237,0.13)", "rgba(144,238,144,0.10)"]
@@ -7128,13 +7184,12 @@ if page == P_JOURNAL:
             _osk2.checkbox("Same underlying for all legs", key="opt_same_under", value=True,
                            help="All legs share the underlying ticker entered above")
 
-        # Ticker + trailing stop — outside form so both react on each keystroke / click
+        # Ticker — outside form so the live price reacts on each keystroke
         _at_inst = st.session_state.get("add_inst_type", "Stock")
         _at_lk_label = "Symbol" if _at_inst == "Future" else "Underlying Ticker" if _at_inst == "Option" else "Ticker"
         with st.container(border=True, key="add_need_ticker"):
             if _at_inst == "Stock":
-                _tlk1, _tlkx, _tlk2, _tlk3 = st.columns([1.5, 1.5, 3, 1])
-                _tlk3.checkbox("Trailing Stop", key="add_trailing_en", value=False)
+                _tlk1, _tlkx, _tlk2 = st.columns([1.5, 1.5, 4])
             else:
                 _tlk1, _tlk2 = st.columns([2, 3])
             _at_tk_key = f"add_ticker_lookup_{st.session_state.get('_add_tk_seed', 0)}"
@@ -7262,19 +7317,25 @@ if page == P_JOURNAL:
                         "at the entry- and exit-date FX rate."
                     )
                     st.markdown("**Stop Loss**")
-                    _trailing_en = st.session_state.get("add_trailing_en", False)
                     sc1, sc2 = st.columns([1, 2])
                     stop_enabled = sc1.checkbox("Enabled", value=True)
                     opening_stop = sc2.number_input("Stop Loss", min_value=0.0, step=0.01, format="%.4f", value=None,
                                                     help="Where you'll get out if the trade goes against you. "
                                                          "Stored as the opening stop and copied to the current "
                                                          "stop, which you can move later.")
-                    if _trailing_en:
-                        _tr1, _tr2 = st.columns(2)
-                        _add_trail_type   = _tr1.selectbox("Trail Unit", ["$", "%", "ATR"], key="add_trail_type")
-                        _add_trail_amount = _tr2.number_input("Trail Amount", min_value=0.0, step=0.01,
-                                                              format="%.2f", value=None, key="add_trail_amount")
-                    else:
+                    # Trailing stop sits directly under the fixed stop. Inside the
+                    # form a checkbox can't show/hide fields until submit, so the
+                    # unit and amount are always visible and only used when ticked.
+                    _tr0, _tr1, _tr2 = st.columns([1, 1, 1])
+                    _trailing_en      = _tr0.checkbox("Trailing Stop", key="add_trailing_en", value=False)
+                    _add_trail_type   = _tr1.selectbox("Trail Unit", ["$", "%", "ATR"], key="add_trail_type",
+                                                       help="Used only while **Trailing Stop** is ticked.")
+                    _add_trail_amount = _tr2.number_input("Trail Amount", min_value=0.0, step=0.01,
+                                                          format="%.4f", value=None, key="add_trail_amount",
+                                                          help="Distance the stop trails price by — dollars, "
+                                                               "percent or ATRs, per Trail Unit. Required while "
+                                                               "**Trailing Stop** is ticked.")
+                    if not _trailing_en:
                         _add_trail_type, _add_trail_amount = "fixed", None
                     sel_tag_names = st.multiselect("Tags", options=list(tag_name_to_id.keys()))
                 c5, c6 = st.columns(2)
@@ -7394,6 +7455,8 @@ if page == P_JOURNAL:
                         st.error(f"Please fill in: {', '.join(missing)}")
                     elif _exit_before_entry(entry_date, exit_date):
                         st.error(_exit_before_entry_msg(entry_date, exit_date))
+                    elif _trailing_en and not _add_trail_amount:
+                        st.error("Enter a **Trail Amount** above zero, or untick **Trailing Stop**.")
                     else:
                         try:
                             t       = s_ticker.upper().strip()

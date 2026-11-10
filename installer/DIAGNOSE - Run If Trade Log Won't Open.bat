@@ -12,7 +12,18 @@ echo  ============================================================
 echo.
 
 :: ── Check .venv exists ────────────────────────────────────────────────────────
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
+:: Normally the venv sits next to this script, but the installer relocates a
+:: fresh install to %LOCALAPPDATA%\TradeLog. If this copy has no venv (e.g. it is
+:: still in the folder the user unzipped), check that per-user install instead,
+:: the same way launch.bat does.
+set "APP_DIR=%~dp0"
+set "PYTHON=%APP_DIR%.venv\Scripts\python.exe"
+if not exist "%PYTHON%" (
+    if exist "%LOCALAPPDATA%\TradeLog\.venv\Scripts\python.exe" (
+        set "APP_DIR=%LOCALAPPDATA%\TradeLog\"
+        set "PYTHON=%LOCALAPPDATA%\TradeLog\.venv\Scripts\python.exe"
+    )
+)
 
 if not exist "%PYTHON%" (
     echo  [PROBLEM] The Trade Log setup is incomplete.
@@ -50,7 +61,8 @@ echo.
 echo  ============================================================
 echo.
 
-"%PYTHON%" -m streamlit run "%~dp0app.py" --server.port 8502 --server.headless true --browser.gatherUsageStats false
+cd /d "%APP_DIR%"
+"%PYTHON%" -m streamlit run "%APP_DIR%app.py" --server.port 8502 --server.headless true --browser.gatherUsageStats false
 
 echo.
 echo  ============================================================

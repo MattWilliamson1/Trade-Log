@@ -6,6 +6,13 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-10.1
+- Clicking a column header in the trade tables now sorts by the actual number or date: "$9.00" no longer sorts above "$10,000.00", and dates sort in date order. What's shown in each cell is unchanged; blanks ("—") sort lowest
+- New Trade: the Trailing Stop checkbox, unit and amount now sit directly under the stop loss, and the Trail Amount accepts four decimals. Ticking Trailing Stop without an amount now shows an error instead of saving a plain stop
+- DIAGNOSE now finds the app when it was installed to your user folder (AppData\Local\TradeLog) rather than reporting the setup as incomplete
+- Running INSTALL again on an installed copy now says where it is installed and how to open it
+- Windows batch files keep Windows line endings in downloads, so the installer and launchers no longer misbehave when unzipped from GitHub
+
 ## 2026-11-10
 - Live prices with IB are much faster: US stocks are looked up in one batch instead of one at a time, and foreign listings (ASX, Korea, London…) go straight to Yahoo Finance, which prices them in USD, instead of failing in IB every time
 - When IB can't price something, the app stops reconnecting to TWS on every click; it retries after a minute. Settings → Log now says how many symbols IB priced and how many came from Yahoo

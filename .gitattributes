@@ -1,0 +1,4 @@
+# Windows cmd misparses batch files with LF endings (labels, goto, multi-byte
+# chars). Force CRLF on checkout and in GitHub zip downloads.
+*.bat text eol=crlf
+*.cmd text eol=crlf
