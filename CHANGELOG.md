@@ -6,6 +6,11 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-10.3
+- Open trades logged in a foreign currency are now marked to market in that currency: P&L is (live price − entry price) in the trade's own currency, converted to USD at today's rate. Before, a move in the exchange rate showed up as trading P&L, so a position whose price hadn't changed could show a profit or loss
+- The Live Price column shows foreign trades in their own currency (A$0.52, ₩71,200), and P&L (Native) now matches the native price move exactly
+- Performance stats and the trade export use the same native-currency P&L. Trades in USD, and closed trades, are unchanged
+
 ## 2026-11-10.2
 - New currencies for logging trades: Korean won (₩), Japanese yen (¥), Hong Kong dollar (HK$), Singapore dollar (S$) and Swiss franc (CHF), covering every non-US market the app knows. Pick them on New Trade, Edit Trade and Settings, or import them from a CSV
 - Trades imported from TWS in these currencies keep their own currency instead of being stored as plain USD

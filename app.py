@@ -869,8 +869,15 @@ def _yf_get_live_data(symbols: tuple) -> dict:
     # distance from stop) subtracts these from stored USD prices and would
     # otherwise be mixing currencies. The single-quote helper below does NOT do
     # this — see its docstring.
+    # The native quote (in the listing's major unit) is kept alongside, so a
+    # trade logged in that currency can be marked to market in it — see
+    # _live_mark_usd.
     for _sym, _row in result.items():
-        if quote_units(_sym) != (1.0, "USD"):
+        _div, _qccy = quote_units(_sym)
+        if (_div, _qccy) != (1.0, "USD"):
+            _row["price_native"] = scale_quote(_row.get("price"), _div)
+            _row["prev_native"]  = scale_quote(_row.get("prev_close"), _div)
+            _row["ccy"]          = _qccy
             _row["price"]      = quote_to_usd(_row.get("price"), _sym)
             _row["prev_close"] = quote_to_usd(_row.get("prev_close"), _sym)
     return result
@@ -2025,6 +2032,46 @@ def _is_open(row) -> bool:
     return pd.isna(row["exit_date"])
 
 
+def _native_quote(row, live_data: dict):
+    """(native live price, USD per 1 native unit) for an open trade logged in
+    the same non-USD currency its listing quotes in; None otherwise."""
+    ccy = trade_currency(row)
+    if ccy == "USD":
+        return None
+    q = live_data.get(_get_live_ticker(row)) or {}
+    lpn, lp = q.get("price_native"), q.get("price")
+    if q.get("ccy") != ccy or not lpn or lp is None:
+        return None
+    return float(lpn), float(lp) / float(lpn)
+
+
+def _live_mark_usd(row, live_data: dict):
+    """The live price to subtract a trade's stored (USD) entry price from.
+
+    A foreign trade is marked to market in its own currency first: its P&L is
+    (live − entry) in that currency, then converted to USD at today's rate. The
+    stored entry price was converted at the entry date's rate, so subtracting
+    it from a USD-converted quote would book every move in the exchange rate
+    as trading P&L — a position whose price hadn't moved would show a profit
+    or loss. This returns the USD price that makes (mark − entry_price) equal
+    the native P&L at today's rate, so every caller's existing arithmetic
+    stays correct. USD trades get the plain quote."""
+    lp = (live_data.get(_get_live_ticker(row)) or {}).get("price")
+    if lp is None:
+        return None
+    nq = _native_quote(row, live_data)
+    ep = row.get("entry_price")
+    try:
+        fx_e = float(row.get("fx_rate_entry") or 0)
+        ep = float(ep)
+    except (TypeError, ValueError):
+        return lp
+    if not nq or not fx_e or pd.isna(ep):
+        return lp
+    lpn, fx_now = nq
+    return ep + (lpn - ep / fx_e) * fx_now
+
+
 def _pnl_numeric(row, live_data: dict):
     qty        = row["quantity"]
     ep         = row["entry_price"]
@@ -2032,9 +2079,8 @@ def _pnl_numeric(row, live_data: dict):
     side       = str(row.get("side") or "long").lower()
     if not qty or not ep:
         return None
-    live_key = _get_live_ticker(row)
     if _is_open(row):
-        lp = live_data.get(live_key, {}).get("price")
+        lp = _live_mark_usd(row, live_data)
         if lp is None:
             return None
         raw = (lp - ep) * qty * multiplier
@@ -4890,7 +4936,7 @@ def _compute_review_rows(df: "pd.DataFrame", live_data: dict, acct_bal: float) -
         sign = -1.0 if str(r.get("side") or "long").lower() == "short" else 1.0
         is_open = _is_open(r)
         live_sym = _get_live_ticker(r)
-        live_px  = _exp_to_float(live_data.get(live_sym, {}).get("price")) if live_sym else None
+        live_px  = _exp_to_float(_live_mark_usd(r, live_data)) if live_sym else None
         price = live_px if is_open else xp
         div_dollars = float(sum((d.get("total_amount") or 0) for d in div_map.get(r.get("id"), [])))
 
@@ -8108,7 +8154,9 @@ if page == P_JOURNAL:
                 lambda v: {"stock": "Stock", "option": "Option", "future": "Future"}.get(str(v or "stock").lower(), "Stock")
             )
             # Vectorised P&L: map live tickers → prices, then compute in one pass
-            _live_prices_ser = live_ticker_ser.map(lambda t: live_data.get(t, {}).get("price") if t else None)
+            # Per row, not per ticker: a foreign trade is marked in its own currency
+            # against its own entry rate (see _live_mark_usd).
+            _live_prices_ser = filtered.apply(lambda r: _live_mark_usd(r, live_data), axis=1)
             _qty   = pd.to_numeric(filtered["quantity"],    errors="coerce")
             _ep    = pd.to_numeric(filtered["entry_price"], errors="coerce")
             _xp    = pd.to_numeric(filtered["exit_price"],  errors="coerce")
@@ -8163,7 +8211,12 @@ if page == P_JOURNAL:
             display["Exit Price"]     = np.where(is_open_mask, "", filtered["exit_price"].apply(fmt_price))
             display["Live Price"]     = np.where(
                 is_open_mask,
-                live_ticker_ser.map(lambda t: fmt_price(live_data.get(t, {}).get("price")) if t else "—"),
+                # Foreign trades show the quote in their own currency (₩71,200,
+                # A$0.52), the price their P&L is marked at.
+                filtered.apply(
+                    lambda r: (lambda nq: f"{currency_symbol(trade_currency(r))}{px_num(nq[0])}" if nq
+                               else fmt_price((live_data.get(_get_live_ticker(r)) or {}).get("price")))
+                              (_native_quote(r, live_data)), axis=1),
                 "—",
             )
             display["P&L"]            = display["_pnl_num"].apply(fmt_pnl)
@@ -8198,7 +8251,12 @@ if page == P_JOURNAL:
                     pnl_usd = row.get("_pnl_num")
                     if pnl_usd is None or pd.isna(pnl_usd):
                         return "—"
-                    fx  = _live_fx_by_ccy.get(ccy) if _is_open(row) else _exit_fx(row, ccy)
+                    if _is_open(row):
+                        # The rate the USD P&L was converted at, so this undoes it exactly
+                        _nq = _native_quote(row, live_data)
+                        fx  = _nq[1] if _nq else _live_fx_by_ccy.get(ccy)
+                    else:
+                        fx  = _exit_fx(row, ccy)
                     val = usd_to_native(pnl_usd, fx)
                     return f"{currency_symbol(ccy)}{val:+,.2f}" if val is not None else "—"
 
