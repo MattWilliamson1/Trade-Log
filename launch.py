@@ -49,8 +49,19 @@ _DEFAULT_THEME = "ocean_dark"
 
 
 def _db_path() -> Path:
-    """The database the app will use (honours the TRADELOG_DB override)."""
-    return Path(os.environ.get("TRADELOG_DB") or (HERE / "tradelog.db"))
+    """The database the app will use (honours the TRADELOG_DB override, and the
+    separate log picked in the app's 📒 menu — see trade_logs.json in db.py)."""
+    main = Path(os.environ.get("TRADELOG_DB") or (HERE / "tradelog.db"))
+    try:
+        import json
+        slug = json.loads((main.parent / "trade_logs.json").read_text(encoding="utf-8")).get("active")
+        if slug:
+            p = main.parent / "trade_logs" / slug / "tradelog.db"
+            if p.exists():
+                return p
+    except Exception:
+        pass
+    return main
 
 
 def _saved_theme() -> str:

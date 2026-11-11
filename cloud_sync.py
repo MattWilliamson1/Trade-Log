@@ -54,7 +54,14 @@ try:
 except Exception:          # pragma: no cover - requests ships in requirements
     requests = None
 
-from db import DB_PATH, BACKUP_DIR
+# Cloud Sync always means the main log. With a second log open, db.DB_PATH
+# points at that one; binding to it here would upload it over the main log's
+# cloud copy (REMOTE_DB is one fixed name). The app hides sync while another
+# log is open, and the background thread keeps syncing the main file.
+try:
+    from db import MAIN_DB_PATH as DB_PATH, MAIN_BACKUP_DIR as BACKUP_DIR
+except ImportError:          # older db.py without separate logs
+    from db import DB_PATH, BACKUP_DIR
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = DB_PATH.parent

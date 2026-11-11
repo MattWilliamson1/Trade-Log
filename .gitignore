@@ -8,6 +8,9 @@ attachments/
 plan_attachments/
 imports/
 logs/
+trade_logs/
+trade_logs.json
+trade_logs.tmp
 
 # ── Build / packaging output ──────────────────────────────────────────────────
 dist/

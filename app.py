@@ -19,6 +19,7 @@ _warnings.filterwarnings("ignore", message=r"The inplace keyword", module=r"yfin
 import plotly.graph_objects as go
 from pathlib import Path
 from db import init_db, get_connection, is_duplicate_trade, find_open_trade_id, find_open_trade_by_ticker_qty
+import db as _db
 import ib_client as _ib_mod
 try:
     import schwab_client as _schwab_mod
@@ -112,7 +113,21 @@ if _alog is not None and not getattr(st.error, "_tradelog_wrapped", False):
     _st_error_logged._tradelog_wrapped = True
     st.error = _st_error_logged
 
-ATTACHMENTS_DIR = Path(__file__).parent / "attachments"
+def _is_main_log() -> bool:
+    """True while the main log is open (an older db.py has only that one)."""
+    return getattr(_db, "is_main_log", lambda: True)()
+
+
+def _cloud_on() -> bool:
+    """Cloud Sync is for the main log only — hidden while another log is open."""
+    return _cloud is not None and _is_main_log()
+
+
+# The main log keeps its files beside the source, as it always has. Another
+# log keeps them in its own folder: names are "<trade id>_<file>", and trade
+# ids restart in every log, so a shared folder would mix them up.
+_LOG_FILES_DIR = Path(__file__).parent if _is_main_log() else _db.data_dir()
+ATTACHMENTS_DIR = _LOG_FILES_DIR / "attachments"
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
 
 DEFAULT_SETTINGS = {
@@ -598,6 +613,37 @@ def _pos_rollup(col: str, vals: list) -> str:
         return ", ".join(tags) or "—"
     uniq = list(dict.fromkeys(str(v) for v in present))
     return uniq[0] if len(uniq) == 1 else "—"
+
+
+def _pos_weighted_stop(grp: pd.DataFrame, which: str) -> str | None:
+    """One stop for a ticker built from several trades whose stops differ.
+
+    Group by ticker rolls each column up to one value per ticker, and a text
+    column whose trades disagree used to collapse to "—" — so a position added
+    to at a higher stop showed no stop at all. The quantity-weighted average is
+    the single stop that carries the same total risk ((entry − stop) × shares
+    summed), and "≈" marks it as averaged. ``which``: "opening", "current", or
+    "effective" (current, else opening — the Stop Loss column). Trades without
+    a stop are left out; None when none of them has one.
+    """
+    num, den = 0.0, 0.0
+    for _, r in grp.iterrows():
+        if which == "effective" and not r.get("stop_enabled"):
+            continue
+        if which == "opening":
+            v = r.get("opening_stop")
+        elif which == "current":
+            v = r.get("current_stop")
+        else:
+            v = r.get("current_stop")
+            if v is None or pd.isna(v):
+                v = r.get("opening_stop")
+        q = r.get("quantity")
+        if v is None or pd.isna(v) or not q or pd.isna(q):
+            continue
+        num += float(v) * abs(float(q))
+        den += abs(float(q))
+    return f"≈{fmt_price(num / den)}" if den else None
 
 
 def fmt_num(v, decimals: int = 2) -> str:
@@ -1742,7 +1788,13 @@ def compute_benchmark_stats(ticker: str, start_date: str, end_date: str) -> dict
         roll_max   = cum.cummax()
         dd         = (roll_max - cum) / roll_max
         max_dd_pct = float(dd.max())
-        ann_ret    = (cum.iloc[-1] - 1) * (252 / max(len(daily), 1))
+        # Compounded over calendar days — the same CAGR the Equity Curve page
+        # uses for your own Calmar. This used to scale the total return
+        # linearly by 252 ÷ trading days, so the benchmark's Calmar and yours
+        # were annualised two different ways and didn't compare like for like.
+        _cal_days  = max(1, (prices.index[-1] - prices.index[0]).days)
+        _growth    = float(cum.iloc[-1])
+        ann_ret    = _growth ** (365.25 / _cal_days) - 1 if _growth > 0 else -1.0
         calmar     = ann_ret / max_dd_pct if max_dd_pct > 0 else float("nan")
         return {"sharpe": sharpe, "sortino": sortino, "calmar": calmar,
                 "max_dd_pct": max_dd_pct * 100}
@@ -2030,6 +2082,39 @@ def equity_period_returns(balance, contributions, withdrawals) -> np.ndarray:
 
 def _is_open(row) -> bool:
     return pd.isna(row["exit_date"])
+
+
+def _annualize_ev(ev, avg_days, mode: str):
+    """EV per trade scaled to a year of back-to-back trades (365 ÷ avg days).
+
+    In % mode each trade's return is on the whole position, so a year of them
+    compounds: (1 + EV)^(trades per year) − 1. Adding them up instead could
+    print a loss worse than −100%. $, R and Acct. % are fixed amounts per
+    trade, so those add up.
+    """
+    if ev is None or not avg_days or avg_days <= 0:
+        return None
+    n = 365 / avg_days
+    if mode == "%":
+        g = 1 + ev / 100
+        return (g ** n - 1) * 100 if g > 0 else -100.0
+    return ev * n
+
+
+def _trade_days_held(df: pd.DataFrame) -> pd.Series:
+    """Calendar days each trade has tied up capital, for Expected Ann. Return.
+
+    An open trade is held until today. Its `_date` is its entry date (that's
+    what places it on the timeline), and measuring from that gave every open
+    trade 0 days, which dragged the average down and inflated the annualised
+    figure whenever open trades were included. A trade opened and closed the
+    same day counts as 1 day: averaging in zeros implied capital that could be
+    turned over endlessly.
+    """
+    _entry = pd.to_datetime(df["entry_date"], errors="coerce")
+    _exit  = pd.to_datetime(df["exit_date"], errors="coerce")
+    _end   = _exit.fillna(pd.Timestamp.today().normalize())
+    return (_end - _entry).dt.days.dropna().clip(lower=1)
 
 
 def _native_quote(row, live_data: dict):
@@ -2351,9 +2436,16 @@ def compute_stats(pnl_tuple: tuple, dates_tuple: tuple, account_balance: float) 
         except Exception:
             pass
     if len(dates_series) > 0:
-        order        = pd.to_datetime(dates_series).argsort()
-        sorted_pnl   = pnl_series.iloc[order].reset_index(drop=True)
-        sorted_dates = pd.to_datetime(dates_series).iloc[order].reset_index(drop=True)
+        # Drawdown runs on *daily* totals. Trade by trade, the legs of a spread
+        # closed the same day (or any same-day trades) were summed in arbitrary
+        # order, so a +$18.9k leg followed by its −$11.6k and −$7.7k legs read
+        # as a $19k drawdown that never happened in the account. Within a day
+        # the order isn't known; the day's net is.
+        _daily       = (pd.Series(pnl_series.values,
+                                  index=pd.to_datetime(dates_series).dt.normalize())
+                        .groupby(level=0).sum().sort_index())
+        sorted_pnl   = pd.Series(_daily.values)
+        sorted_dates = pd.Series(_daily.index)
         cum          = sorted_pnl.cumsum()
         running_max  = cum.cummax()
         drawdown     = running_max - cum
@@ -2375,7 +2467,11 @@ def compute_stats(pnl_tuple: tuple, dates_tuple: tuple, account_balance: float) 
         # Calmar: annualised return / max drawdown (both as fraction of account)
         if account_balance and account_balance > 0 and max_dd > 0:
             date_span_days = max(1, (sorted_dates.iloc[-1] - sorted_dates.iloc[0]).days)
-            ann_ret = (pnl_series.sum() / account_balance) * (365 / date_span_days)
+            # Compounded, like every other annualised return in the app (it was
+            # linear: total ÷ balance × 365 ÷ days, which overstates short spans
+            # and understates long ones next to the Equity Curve's CAGR).
+            _growth = 1 + pnl_series.sum() / account_balance
+            ann_ret = _growth ** (365.25 / date_span_days) - 1 if _growth > 0 else -1.0
             stats["calmar"] = ann_ret / (max_dd / account_balance)
     return stats
 
@@ -2553,7 +2649,7 @@ def clear_equity_entries():
         conn.execute("DELETE FROM equity_entries")
 
 
-PLAN_ATTACHMENTS_DIR = Path(__file__).parent / "plan_attachments"
+PLAN_ATTACHMENTS_DIR = _LOG_FILES_DIR / "plan_attachments"
 PLAN_ATTACHMENTS_DIR.mkdir(exist_ok=True)
 
 
@@ -3501,6 +3597,16 @@ def replace_database(src_path) -> str:
             _staged.unlink()
     _init()
     return str(safety)
+
+
+def _replace_main_db(src_path) -> str:
+    """replace_database for Cloud Sync, which only ever deals in the main log.
+
+    With another log open, replace_database would overwrite *that* log with the
+    main log's cloud copy — refuse instead."""
+    if not _is_main_log():
+        raise RuntimeError("Cloud Sync only works on the main log — switch to it first.")
+    return replace_database(src_path)
 
 
 def add_tag(name: str, description: str):
@@ -5635,7 +5741,7 @@ def _cloud_choice_ui(key: str, reason: str):
                   help="Replace this computer's log with the cloud copy. This computer's "
                        "current log is saved to the backups folder first."):
         try:
-            _cloud.pull(backend, replace_database)
+            _cloud.pull(backend, _replace_main_db)
         except Exception as _e:
             st.error(f"Couldn't load the cloud log — nothing was changed. ({_e})")
         else:
@@ -5657,7 +5763,7 @@ def _cloud_choice_ui(key: str, reason: str):
 
 
 def _render_cloud_banners():
-    if _cloud is None:
+    if not _cloud_on():
         return
     _msg = st.session_state.pop("_cloud_msg", None)
     if _msg:
@@ -5689,7 +5795,7 @@ def _render_cloud_banners():
             )
             if st.button("☁️  Load the newer log", key="cloud_load_newer", type="primary"):
                 try:
-                    _cloud.pull(_cloud.backend_from_state(), replace_database)
+                    _cloud.pull(_cloud.backend_from_state(), _replace_main_db)
                 except Exception as _e:
                     st.error(f"Couldn't load it — nothing was changed. ({_e})")
                 else:
@@ -5715,9 +5821,9 @@ st.set_page_config(page_title="Trade Log", layout="wide")
 # Cloud Sync: once per process, before anything reads the database — a newer
 # copy from another computer is pulled in here, while no page holds old rows.
 _cloud_boot = {}
-if _cloud is not None:
+if _cloud_on():
     try:
-        _cloud_boot = _cloud.startup(replace_database)
+        _cloud_boot = _cloud.startup(_replace_main_db)
     except Exception as _e:
         _cloud_boot = {"action": "error", "message": str(_e)}
     if _cloud_boot.get("action") == "pulled" and not st.session_state.get("_cloud_boot_seen"):
@@ -6562,8 +6668,349 @@ def _trigger_supervised_restart():
         _threading.Thread(target=_delayed_restart, daemon=True).start()
 
 
+# ── Separate logs (📒) + Easy mode ────────────────────────────────────────────
+# A "log" is a whole, separate database: its own trades, tags, settings, equity
+# curve and backups (see db.py). Easy mode is a per-log setting that swaps the
+# full app for one simple page: add a trade, see the open ones, close them.
+
+def _open_log(slug: str, name: str):
+    """Switch to another log and start the page over on it."""
+    try:
+        _db.switch_log(slug)
+    except Exception as _e:
+        st.error(f"Couldn't open {name}: {_e}")
+        return
+    # Every cached frame and most of session state hold the old log's rows,
+    # picks and filters. Wipe the lot; the page rebuilds from the new log.
+    st.cache_data.clear()
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+    st.session_state["_log_msg"] = f"📒 Opened **{name}**."
+    st.rerun()
+
+
+def _render_log_picker():
+    """Sidebar control: which log is open, switch, create, rename, remove."""
+    if not hasattr(_db, "list_logs"):
+        return
+    _logs = _db.list_logs()
+    _cur = next((l for l in _logs if l["active"]), _logs[0])
+    with st.popover(f"📒  {_cur['name']}", width="stretch",
+                    help="Switch to another trading log, or start a new blank one"):
+        st.caption("Each log is completely separate — its own trades, tags, settings, "
+                   "balances and equity curve. Switching never changes another log.")
+        for _l in _logs:
+            _lk = f"log_pick_{_l['slug'] or '_main'}"
+            if _l["active"]:
+                st.button(f"✓  {_l['name']}", key=_lk, width="stretch", disabled=True)
+            elif st.button(_l["name"], key=_lk, width="stretch"):
+                _open_log(_l["slug"], _l["name"])
+
+        st.markdown("---")
+        with st.form("log_new_form", clear_on_submit=True, border=False):
+            _new_nm = st.text_input("New log", placeholder="e.g. Roth IRA, Paper trading")
+            if st.form_submit_button("➕  Create and open", width="stretch"):
+                try:
+                    _new_slug = _db.create_log(_new_nm)
+                except ValueError as _e:
+                    st.error(str(_e))
+                else:
+                    _open_log(_new_slug, _new_nm.strip())
+
+        if _cur["slug"]:
+            with st.expander("Rename this log"):
+                _rn = st.text_input("Name", value=_cur["name"], key="log_rename_val")
+                if st.button("Save name", key="log_rename_btn", width="stretch"):
+                    try:
+                        _db.rename_log(_cur["slug"], _rn)
+                    except ValueError as _e:
+                        st.error(str(_e))
+                    else:
+                        st.rerun()
+        _removable = [l for l in _logs if l["slug"] and not l["active"]]
+        if _removable:
+            with st.expander("Remove a log"):
+                _rm_name = st.selectbox("Log", [l["name"] for l in _removable], key="log_rm_pick")
+                _rm = next(l for l in _removable if l["name"] == _rm_name)
+                st.caption("It's taken off this list and its folder is moved to "
+                           "`trade_logs/_removed` — nothing is deleted, so it can be put back.")
+                _rm_ok = st.checkbox(f"Remove **{_rm_name}**", key="log_rm_confirm")
+                if st.button("Remove", key="log_rm_btn", width="stretch", disabled=not _rm_ok):
+                    try:
+                        _db.archive_log(_rm["slug"])
+                    except Exception as _e:
+                        st.error(str(_e))
+                    else:
+                        st.session_state.pop("log_rm_confirm", None)
+                        st.session_state["_log_msg"] = f"Removed **{_rm_name}** from the list."
+                        st.rerun()
+
+
+def _set_easy_mode():
+    set_setting("easy_mode", "0" if st.session_state.get("easy_mode_full") else "1")
+
+
+def _render_mode_switch(easy: bool):
+    st.toggle("Full app", value=not easy, key="easy_mode_full", on_change=_set_easy_mode,
+              help="Off: Easy mode — just a trade entry form and your open trades. "
+                   "On: every page and tool. Remembered separately for each log.")
+
+
+_log_msg = st.session_state.pop("_log_msg", None)
+if _log_msg:
+    st.toast(_log_msg)
+
+_easy_mode = settings.get("easy_mode", "0") == "1"
+
+
+def _easy_tag_ids(names) -> list[int]:
+    """Tag ids for the names picked in Easy mode, creating any that are new.
+
+    Matched without regard to case, so typing "momentum" picks up an existing
+    "Momentum" instead of making a near-duplicate."""
+    _have = {t["name"].lower(): t["id"] for t in load_tags()}
+    for _n in names:
+        _n = str(_n).strip()
+        if _n and _n.lower() not in _have:
+            add_tag(_n, "")
+    _have = {t["name"].lower(): t["id"] for t in load_tags()}
+    return list(dict.fromkeys(_have[str(n).strip().lower()] for n in names
+                              if str(n).strip().lower() in _have))
+
+
+def _txt_or_blank(v) -> str:
+    """Text for a cell that may be NULL — pandas hands those over as NaN/None,
+    and NaN is truthy, so `v or ""` would print "nan"/"None"."""
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+
+
+def _render_easy_mode():
+    _tag_names = [t["name"] for t in _cached_load_tags(st.session_state["_v_tags"])]
+    st.markdown(f"### 📒 {_db.active_log_name() if hasattr(_db, 'active_log_name') else 'Trade Log'}")
+
+    _em = st.session_state.pop("_easy_msg", None)
+    if _em:
+        st.success(_em)
+
+    # ── New trade ─────────────────────────────────────────────────────────────
+    with st.container(border=True):
+        st.markdown("**➕ New trade**")
+        with st.form("easy_add_form", clear_on_submit=True, border=False):
+            _c = st.columns([1.2, 0.9, 1, 1, 1, 1.1])
+            _e_tk   = _c[0].text_input("Ticker *", placeholder="e.g. AAPL")
+            _e_side = _c[1].selectbox("Side", ["Long", "Short"])
+            _e_qty  = _c[2].number_input("Quantity *", min_value=0.0, step=1.0, format="%.4f", value=None)
+            _e_px   = _c[3].number_input("Entry price *", min_value=0.0, step=0.01, format="%.4f", value=None)
+            _e_stop = _c[4].number_input("Stop (optional)", min_value=0.0, step=0.01, format="%.4f", value=None)
+            _e_dt   = _c[5].date_input("Entry date", value=today_ts.date())
+            _n1, _n2 = st.columns([1, 1])
+            _e_tags  = _n1.multiselect(
+                "Tags (optional)", _tag_names, accept_new_options=True,
+                placeholder="Pick tags, or type a new one",
+                help="Type a name that isn't in the list and press Enter to create it.")
+            _e_notes = _n2.text_input("Notes (optional)")
+            if st.form_submit_button("Add trade", type="primary"):
+                _miss = [n for n, v in (("Ticker", (_e_tk or "").strip()), ("Quantity", _e_qty),
+                                        ("Entry price", _e_px)) if not v]
+                if _miss:
+                    st.error(f"Please fill in: {', '.join(_miss)}")
+                else:
+                    try:
+                        add_trade(
+                            _e_dt, _e_tk.strip().upper(), float(_e_qty), float(_e_px),
+                            None, None, _e_notes or None,
+                            bool(_e_stop), float(_e_stop) if _e_stop else None,
+                            _easy_tag_ids(_e_tags or []),
+                            instrument_type="stock", side=_e_side.lower(),
+                        )
+                    except Exception as _e:
+                        st.error(f"Couldn't save the trade: {_e}")
+                    else:
+                        st.session_state["_easy_msg"] = (
+                            f"Added {_e_side.lower()} {fmt_qty(_e_qty)} {_e_tk.strip().upper()} "
+                            f"@ {fmt_price(_e_px)}.")
+                        st.rerun()
+
+    # ── Open trades ───────────────────────────────────────────────────────────
+    _all = _cached_load_trades(st.session_state["_v_trades"])
+    _open = _all[_all["exit_date"].isna()].copy() if not _all.empty else _all
+    _hc1, _hc2 = st.columns([4, 1], vertical_alignment="bottom")
+    _hc1.markdown(f"**Open trades** · {len(_open)}")
+    if _hc2.button("⚡ Refresh prices", width="stretch", key="easy_refresh",
+                   disabled=_open.empty):
+        _request_live_price_fetch()
+        st.rerun()
+
+    if _open.empty:
+        st.info("No open trades in this log yet — add one above.")
+        return
+
+    _live = {}
+    _syms = tuple(sorted(set(_live_ticker_series(_open).tolist())))
+    try:
+        with st.spinner("Fetching prices…"):
+            _live = get_live_data(_syms) or {}
+    except Exception as _e:
+        st.caption(f"⚠️ Live prices unavailable: {_e}")
+
+    _rows = []
+    for _, _r in _open.iterrows():
+        _r = _r.to_dict()
+        _pnl = _pnl_numeric(_r, _live)
+        _mult = float(_r.get("multiplier") or 1.0)
+        _cost = abs(float(_r["entry_price"] or 0) * float(_r["quantity"] or 0) * _mult)
+        _last = _live_mark_usd(_r, _live)
+        _label = _r["ticker"]
+        if str(_r.get("instrument_type") or "stock").lower() == "option" and _r.get("strike"):
+            _label = f"{_r['ticker']} {px_num(_r['strike'])}{(_r.get('option_type') or '')[:1]}"
+        _days = None
+        try:
+            _days = int((today_ts - pd.Timestamp(_r["entry_date"])).days)
+        except Exception:
+            pass
+        def _px_or_none(v):
+            return float(v) if v is not None and not pd.isna(v) else None
+        _rows.append({
+            "Ticker":   _label,
+            "Side":     str(_r.get("side") or "long").title(),
+            "Tags":     _txt_or_blank(_r.get("tags")),
+            "Opened":   fmt_date(_r["entry_date"], date_fmt),
+            "Days":     _days,
+            "Qty":      float(_r["quantity"]) if _r["quantity"] is not None else None,
+            "Entry":    float(_r["entry_price"]) if _r["entry_price"] is not None else None,
+            "Entry stop":   _px_or_none(_r.get("opening_stop")),
+            "Current stop": _px_or_none(_r.get("current_stop")),
+            "Last":     float(_last) if _last is not None else None,
+            "Open P&L": float(_pnl) if _pnl is not None else None,
+            "P&L %":    (_pnl / _cost * 100) if (_pnl is not None and _cost) else None,
+            "Notes":    _txt_or_blank(_r.get("notes")),
+        })
+    _grid = pd.DataFrame(_rows)
+
+    _tot = _grid["Open P&L"].dropna()
+    _m1, _m2, _m3 = st.columns(3)
+    _m1.metric("Open positions", len(_grid))
+    _m2.metric("Open P&L", fmt_pnl(float(_tot.sum())) if len(_tot) else "—")
+    _m3.metric("Priced", f"{len(_tot)} of {len(_grid)}")
+
+    def _pnl_color(v):
+        if v is None or pd.isna(v):
+            return ""
+        return "color:#2ecc71" if v > 0 else "color:#e74c3c" if v < 0 else ""
+
+    # st.dataframe draws a null cell as "None" whatever the Styler says, so an
+    # empty one (no stop, no live price yet) holds -inf and is shown as "—" —
+    # the same trick as _sortable_values. Cells stay numbers, so columns sort
+    # as numbers, with the blanks at the bottom.
+    def _or_dash(f):
+        return lambda v: "—" if v is None or pd.isna(v) or v == -np.inf else f(v)
+    _num_cols = ["Days", "Qty", "Entry", "Entry stop", "Current stop", "Last", "Open P&L", "P&L %"]
+    _grid[_num_cols] = _grid[_num_cols].astype(float).fillna(-np.inf)
+    st.dataframe(
+        _grid.style.map(lambda v: "" if v == -np.inf else _pnl_color(v),
+                        subset=["Open P&L", "P&L %"]).format({
+            "Days": _or_dash(lambda v: f"{v:.0f}"), "Qty": _or_dash(fmt_qty),
+            "Entry": _or_dash(fmt_price), "Entry stop": _or_dash(fmt_price),
+            "Current stop": _or_dash(fmt_price), "Last": _or_dash(fmt_price),
+            "Open P&L": _or_dash(fmt_pnl), "P&L %": _or_dash(lambda v: f"{v:+.2f}%")}),
+        hide_index=True, width="stretch",
+    )
+
+    # ── Close / tag / delete ──────────────────────────────────────────────────
+    _ids = _open["id"].tolist()
+    _lbl = {int(r["id"]): f"{r['ticker']} · {fmt_qty(r['quantity'])} @ {fmt_price(r['entry_price'])}"
+                          f" · {fmt_date(r['entry_date'], date_fmt)}"
+            for _, r in _open.iterrows()}
+    _cc1, _cct, _cc2 = st.columns(3)
+    with _cc1.container(border=True):
+        st.markdown("**✅ Close a trade**")
+        with st.form("easy_close_form", clear_on_submit=True, border=False):
+            _cl_id = st.selectbox("Trade", _ids, format_func=lambda i: _lbl.get(int(i), str(i)))
+            _x1, _x2 = st.columns(2)
+            _cl_px = _x1.number_input("Exit price *", min_value=0.0, step=0.01, format="%.4f", value=None)
+            _cl_dt = _x2.date_input("Exit date", value=today_ts.date())
+            if st.form_submit_button("Close trade", type="primary"):
+                _row = _open[_open["id"] == _cl_id].iloc[0].to_dict()
+                if not _cl_px:
+                    st.error("Enter the exit price.")
+                elif _row.get("entry_date") and str(_cl_dt) < str(_row["entry_date"])[:10]:
+                    st.error("The exit date is before the entry date.")
+                else:
+                    try:
+                        _ccy = trade_currency(_row)
+                        _fx = get_fx_rate_at_date(_ccy, str(_cl_dt)) if _ccy != "USD" else 1.0
+                        close_open_trade(int(_cl_id), _cl_dt, native_to_usd(float(_cl_px), _fx),
+                                         fx_rate_exit=_fx)
+                    except Exception as _e:
+                        st.error(f"Couldn't close it: {_e}")
+                    else:
+                        st.session_state["_easy_msg"] = f"Closed {_lbl.get(int(_cl_id), '')}."
+                        st.rerun()
+    with _cct.container(border=True):
+        st.markdown("**🏷️ Tag a trade**")
+        _tg_id = st.selectbox("Trade", _ids, format_func=lambda i: _lbl.get(int(i), str(i)),
+                              key="easy_tag_pick")
+        _tg_row = _open[_open["id"] == _tg_id]
+        _tg_cur = ([t.strip() for t in _txt_or_blank(_tg_row["tags"].iloc[0]).split(",") if t.strip()]
+                   if not _tg_row.empty else [])
+        # Keyed by trade id, so picking another trade shows *its* tags rather
+        # than the previous trade's selection carried over.
+        _tg_new = st.multiselect(
+            "Tags", sorted(set(_tag_names) | set(_tg_cur), key=str.lower), default=_tg_cur,
+            accept_new_options=True, key=f"easy_tags_{int(_tg_id)}",
+            placeholder="Pick tags, or type a new one")
+        if st.button("Save tags", key="easy_tag_save", disabled=set(_tg_new) == set(_tg_cur)):
+            try:
+                _want = set(_easy_tag_ids(_tg_new))
+                _had  = set(get_trade_tag_ids(int(_tg_id)))
+                for _t in _had - _want:
+                    remove_tag_from_trade(int(_tg_id), _t)
+                for _t in _want - _had:
+                    add_tag_to_trade(int(_tg_id), _t)
+                _cached_load_trades.clear()
+                _bust("_v_trades")
+            except Exception as _e:
+                st.error(f"Couldn't save the tags: {_e}")
+            else:
+                st.session_state.pop(f"easy_tags_{int(_tg_id)}", None)
+                st.session_state["_easy_msg"] = f"Tags saved for {_lbl.get(int(_tg_id), '')}."
+                st.rerun()
+    with _cc2.container(border=True):
+        st.markdown("**🗑️ Delete a trade**")
+        st.caption("For a trade entered by mistake. To record selling it, close it instead.")
+        _dl_id = st.selectbox("Trade", _ids, format_func=lambda i: _lbl.get(int(i), str(i)),
+                              key="easy_del_pick")
+        _dl_ok = st.checkbox("Yes, delete it — this can't be undone", key="easy_del_ok")
+        if st.button("Delete trade", key="easy_del_btn", disabled=not _dl_ok):
+            try:
+                delete_trade(int(_dl_id))
+            except Exception as _e:
+                st.error(f"Couldn't delete it: {_e}")
+            else:
+                st.session_state.pop("easy_del_ok", None)
+                st.session_state["_easy_msg"] = f"Deleted {_lbl.get(int(_dl_id), '')}."
+                st.rerun()
+
+    st.caption("Need trailing stops, options, imports or stats? Switch on **Full app** in the sidebar — "
+               "everything entered here is there too.")
+
+
+if _easy_mode:
+    with st.sidebar:
+        st.title("Trade Log")
+        _render_log_picker()
+        _render_mode_switch(easy=True)
+        st.caption("Easy mode: a trade form and your open trades. Turn on **Full app** for "
+                   "everything else.")
+    _render_easy_mode()
+    st.stop()
+
+
+
 with st.sidebar:
     st.title("Trade Log")
+    _render_log_picker()
+    _render_mode_switch(easy=False)
 
     # Nav styling: left-aligned page buttons, with indented smaller submenu
     # buttons tucked under the active page.
@@ -6640,7 +7087,7 @@ with st.sidebar:
 
     # ── App updates ────────────────────────────────────────────────────────────
     st.markdown("---")
-    if _cloud is not None:
+    if _cloud_on():
         _cs_sb = _cloud.load_state()
         if _cs_sb.get("mode"):
             if _cs_sb.get("pending") in ("conflict", "choose"):
@@ -8908,6 +9355,13 @@ if page == P_JOURNAL:
                     for _pc in dict.fromkeys(["Ticker", *vis]):
                         _vals = _legs[_pc].tolist() if _pc in _legs.columns else []
                         _pos_row[_pc] = _pos_rollup(_pc, _vals)
+                    # Trades with different stops: show their weighted stop, not "—".
+                    for _sc, _which in (("Opening Stop", "opening"), ("Current Stop", "current"),
+                                        ("Stop Loss", "effective")):
+                        if _pos_row.get(_sc) == "—" and len(_grp) > 1:
+                            _ws = _pos_weighted_stop(_grp, _which)
+                            if _ws:
+                                _pos_row[_sc] = _ws
 
                     _leg_pnl = pd.to_numeric(_legs["_pnl_num"], errors="coerce")
                     _pnl_val = float(_leg_pnl.sum()) if _leg_pnl.notna().any() else None
@@ -13189,11 +13643,9 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                 _ev      = _wr * (_avg_winner_v or 0) + (1 - _wr) * (_avg_loser_v or 0) if _avg_winner_v is not None or _avg_loser_v is not None else None
 
                 # Average days in trade (closed trades only)
-                _pnl_dates = pd.to_datetime(pnl_avail["_date"], errors="coerce")
-                _entry_dts = pd.to_datetime(pnl_avail["entry_date"], errors="coerce")
-                _days_held = (_pnl_dates - _entry_dts).dt.days.dropna()
+                _days_held = _trade_days_held(pnl_avail)
                 _avg_days  = float(_days_held.mean()) if not _days_held.empty else None
-                _ann_ev    = _ev * (365 / _avg_days) if _ev is not None and _avg_days and _avg_days > 0 else None
+                _ann_ev    = _annualize_ev(_ev, _avg_days, _pnl_mode)
 
                 _mode_label = {"$": "", "%": "· % returns", "Acct. %": "· Acct. % returns",
                                "R": "· R multiples (P&L ÷ risk at entry)"}.get(_pnl_mode, "")
@@ -13340,7 +13792,7 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                     _ev_cols[2].metric(
                         "Expected Ann. Return",
                         _mv(_ann_ev) if _ann_ev is not None else "N/A",
-                        help="EV per trade × (365 ÷ avg days in trade). Uses calendar days.",
+                        help="EV per trade × (365 ÷ avg days in trade), in calendar days — compounded in % mode. Assumes one trade at a time, back to back — a projection of your edge, not your account's return (that is the Annualized Return on 📈 Equity Curve). Open trades count as held until today; same-day trades as 1 day.",
                     )
                     _total_comm = float(pnl_avail["commission"].fillna(0).sum()) if "commission" in pnl_avail.columns else 0.0
                     _ev_cols[3].metric(
@@ -13873,16 +14325,9 @@ if _sub in (S_SUMMARY, S_BREAKDOWN, S_BENCH):
                                 _t_wr * (_t_aw or 0) + (1 - _t_wr) * (_t_al or 0)
                                 if _t_aw is not None or _t_al is not None else None
                             )
-                            _t_days = (
-                                pd.to_datetime(_t_df["_date"], errors="coerce")
-                                - pd.to_datetime(_t_df["entry_date"], errors="coerce")
-                            ).dt.days.dropna()
+                            _t_days = _trade_days_held(_t_df)
                             _t_avg_days_v = float(_t_days.mean()) if not _t_days.empty else None
-                            _t_ann_ev     = (
-                                _t_ev * (365 / _t_avg_days_v)
-                                if _t_ev is not None and _t_avg_days_v and _t_avg_days_v > 0
-                                else None
-                            )
+                            _t_ann_ev     = _annualize_ev(_t_ev, _t_avg_days_v, _pnl_mode)
                             _t_total_raw  = float(_t_raw.sum())
                             _t_gb, _, _t_gb_cap, _ = _gb_summary(_t_df)
                             _t_mop_hi, _t_mop_avg, _ = _mop_summary(_t_df)
@@ -16553,6 +16998,11 @@ port is 587, and that you used an App Password rather than your login password.
         )
         if _cloud is None:
             st.warning("The Cloud Sync module (cloud_sync.py) is missing. Install the latest update.")
+        elif not _is_main_log():
+            st.info(f"📒 You're in **{_db.active_log_name()}**. Cloud Sync works on the "
+                    f"**{_db.MAIN_LOG_NAME}** only — switch to it (sidebar → 📒) to set up or "
+                    "manage sync. This log stays on this computer; its daily backups are in "
+                    f"`{_db.BACKUP_DIR}`.")
         else:
             _cst = _cloud.load_state()
 
@@ -16602,7 +17052,7 @@ port is 587, and that you used an App Password rather than your login password.
                             elif _state == "done":
                                 st.session_state.pop("_gd_url", None)
                                 try:
-                                    _act = _cloud.connect("gdrive", replace_database)
+                                    _act = _cloud.connect("gdrive", _replace_main_db)
                                 except Exception as _e:
                                     st.session_state["_cloud_msg"] = f"Signed in, but the first sync failed: {_e}"
                                 else:
@@ -16666,7 +17116,7 @@ port is 587, and that you used an App Password rather than your login password.
                             "current log is saved to the backups folder first.")
                     if st.button("Load it", key="cloud_pull_confirm", type="primary"):
                         try:
-                            _cloud.pull(_cb, replace_database)
+                            _cloud.pull(_cb, _replace_main_db)
                         except Exception as _e:
                             st.error(f"Couldn't load it — nothing was changed. ({_e})")
                         else:

@@ -1,21 +1,216 @@
 import atexit
+import json
 import os
+import re
 import shutil
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # Override with TRADELOG_DB env var to point at a different database
 # (used by launch_demo.bat to run against demo/tradelog_demo.db)
-DB_PATH = Path(os.environ.get("TRADELOG_DB", Path(__file__).parent / "tradelog.db"))
+MAIN_DB_PATH = Path(os.environ.get("TRADELOG_DB", Path(__file__).parent / "tradelog.db"))
+MAIN_BACKUP_DIR = MAIN_DB_PATH.parent / "backups"
+
+# ── Separate trading logs ─────────────────────────────────────────────────────
+# Besides the main log (MAIN_DB_PATH) the user can keep any number of extra,
+# completely separate logs — each its own database with its own trades, tags,
+# settings, equity curve and backups. Each lives in its own folder,
+# trade_logs/<slug>/tradelog.db, so its daily backups (backups/backup-DATE.db)
+# never land in another log's slot. Which one is open, and the display names,
+# are kept in trade_logs.json beside the main database — deliberately outside
+# every database, since the choice has to be read before one is opened.
+LOGS_DIR = MAIN_DB_PATH.parent / "trade_logs"
+LOGS_REGISTRY = MAIN_DB_PATH.parent / "trade_logs.json"
+MAIN_LOG_NAME = "Main log"
+
+
+def _read_registry() -> dict:
+    try:
+        reg = json.loads(LOGS_REGISTRY.read_text(encoding="utf-8"))
+        if isinstance(reg, dict):
+            reg.setdefault("active", "")
+            reg.setdefault("names", {})
+            return reg
+    except Exception:
+        pass
+    return {"active": "", "names": {}}
+
+
+def _write_registry(reg: dict) -> None:
+    tmp = LOGS_REGISTRY.with_suffix(".tmp")
+    tmp.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+    os.replace(tmp, LOGS_REGISTRY)
+
+
+def _log_db_path(slug: str) -> Path:
+    return MAIN_DB_PATH if not slug else LOGS_DIR / slug / "tradelog.db"
+
+
+def _resolve_active_slug() -> str:
+    slug = _read_registry().get("active") or ""
+    # A registry pointing at a log whose folder has gone falls back to main
+    # rather than silently creating an empty database in its place.
+    if slug and not (LOGS_DIR / slug).is_dir():
+        return ""
+    return slug
+
+
+ACTIVE_LOG = _resolve_active_slug()
+DB_PATH = _log_db_path(ACTIVE_LOG)
 # Backups belong beside the database they came from, not beside the source.
 # When TRADELOG_DB points elsewhere — demo mode, a second log, a test run — a
 # shared folder means that run's daily copy lands in the main install's slot
 # and overwrites the real backup for that date.
 BACKUP_DIR = DB_PATH.parent / "backups"
-BACKUP_DIR.mkdir(exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
+
+
+def is_main_log() -> bool:
+    return not ACTIVE_LOG
+
+
+def data_dir() -> Path:
+    """Folder that holds the open log's database (attachments for an extra log go here)."""
+    return DB_PATH.parent
+
+
+def list_logs() -> list[dict]:
+    """[{slug, name, active}] — the main log first, then the rest by name."""
+    reg = _read_registry()
+    names = reg.get("names", {})
+    out = [{"slug": "", "name": MAIN_LOG_NAME, "active": not ACTIVE_LOG}]
+    extra = []
+    if LOGS_DIR.is_dir():
+        for d in LOGS_DIR.iterdir():
+            if d.is_dir() and not d.name.startswith("_") and (d / "tradelog.db").exists():
+                extra.append({"slug": d.name, "name": names.get(d.name) or d.name,
+                              "active": d.name == ACTIVE_LOG})
+    out += sorted(extra, key=lambda x: x["name"].lower())
+    return out
+
+
+def active_log_name() -> str:
+    return next((l["name"] for l in list_logs() if l["active"]), MAIN_LOG_NAME)
+
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "log"
+    base, n = s, 2
+    while (LOGS_DIR / s).exists():
+        s = f"{base}-{n}"
+        n += 1
+    return s
+
+
+# Carried from the open log into a new one so it looks and reads the same.
+# Nothing about trading (balances, commissions, broker logins) is copied —
+# a new log starts blank.
+_CARRY_SETTINGS = ("app_theme", "date_format", "euro_dates", "compact_mode", "easy_mode")
+
+
+def switch_log(slug: str) -> None:
+    """Point every later get_connection() at another log and remember the choice.
+
+    Caches and session state belong to the caller: anything still holding rows
+    came from the log that was just closed.
+    """
+    global ACTIVE_LOG, DB_PATH, BACKUP_DIR
+    if slug and not (LOGS_DIR / slug / "tradelog.db").exists():
+        raise ValueError(f"No log named '{slug}'.")
+    _do_backup()   # leave a copy of the log being closed
+    ACTIVE_LOG = slug or ""
+    DB_PATH = _log_db_path(ACTIVE_LOG)
+    BACKUP_DIR = DB_PATH.parent / "backups"
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    reg = _read_registry()
+    reg["active"] = ACTIVE_LOG
+    _write_registry(reg)
+    init_db()
+
+
+def create_log(name: str) -> str:
+    """Make a new, empty log and return its slug (does not switch to it)."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Give the new log a name.")
+    if any(l["name"].lower() == name.lower() for l in list_logs()):
+        raise ValueError(f"There's already a log called '{name}'.")
+    carry = {}
+    try:
+        with get_connection() as conn:
+            for k in _CARRY_SETTINGS:
+                row = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+                if row is not None:
+                    carry[k] = row[0]
+    except Exception:
+        pass
+    slug = _slugify(name)
+    folder = LOGS_DIR / slug
+    (folder / "backups").mkdir(parents=True, exist_ok=True)
+    path = folder / "tradelog.db"
+    conn = sqlite3.connect(path, timeout=15)
+    try:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    # Columns, indexes and the carried preferences go in through the normal
+    # path, pointed at the new file for the moment.
+    global DB_PATH
+    _prev = DB_PATH
+    DB_PATH = path
+    try:
+        init_db(backup=False)
+        with get_connection() as c2:
+            for k, v in carry.items():
+                c2.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, v))
+            # It's a new log, not a new user: skip the first-run tour.
+            c2.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('onboarding_done', '1')")
+    finally:
+        DB_PATH = _prev
+    reg = _read_registry()
+    reg["names"][slug] = name
+    _write_registry(reg)
+    return slug
+
+
+def rename_log(slug: str, new_name: str) -> None:
+    new_name = (new_name or "").strip()
+    if not slug:
+        raise ValueError("The main log can't be renamed.")
+    if not new_name:
+        raise ValueError("Give the log a name.")
+    if any(l["name"].lower() == new_name.lower() and l["slug"] != slug for l in list_logs()):
+        raise ValueError(f"There's already a log called '{new_name}'.")
+    reg = _read_registry()
+    reg["names"][slug] = new_name
+    _write_registry(reg)
+
+
+def archive_log(slug: str) -> Path:
+    """Take a log out of the list without destroying it.
+
+    The folder moves to trade_logs/_removed/<slug>-<stamp>, from where it can be
+    moved back by hand. The open log can't be removed. Returns the new path.
+    """
+    if not slug:
+        raise ValueError("The main log can't be removed.")
+    if slug == ACTIVE_LOG:
+        raise ValueError("Switch to another log before removing this one.")
+    src = LOGS_DIR / slug
+    if not src.is_dir():
+        raise ValueError(f"No log named '{slug}'.")
+    dest_root = LOGS_DIR / "_removed"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    dest = dest_root / f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    shutil.move(str(src), str(dest))
+    reg = _read_registry()
+    reg["names"].pop(slug, None)
+    _write_registry(reg)
+    return dest
 
 
 def _do_backup():
@@ -231,7 +426,7 @@ def get_connection():
         conn.close()
 
 
-def init_db():
+def init_db(backup: bool = True):
     with get_connection() as conn:
         conn.executescript(SCHEMA)
         # Add any columns that don't exist yet (idempotent)
@@ -261,7 +456,7 @@ def init_db():
         """)
     # Startup backup: once per calendar day if DB is under size limit
     today_backup = BACKUP_DIR / f"backup-{date.today().isoformat()}.db"
-    if not today_backup.exists():
+    if backup and not today_backup.exists():
         _do_backup()
 
 
