@@ -55,6 +55,15 @@ UV_MAC_CACHE = DIST_DIR / "_uv_mac"   # local cache dir (dist/ is gitignored)
 # venv into Contents/Resources there fails with "Read-only file system (os error
 # 30)". Keeping it in $HOME works whether the bundle is translocated, sitting on
 # a read-only volume, or in a locked-down /Applications.
+#
+# The app code and the user's data live in ~/.tradelog/app for the same reason.
+# Everything the app writes sits next to its source (tradelog.db, attachments,
+# logs, backups, broker tokens), and the in-app updater rewrites the source in
+# place. Run from the bundle, those writes either fail (translocated) or are
+# wiped when the user downloads a new copy — so updates never stuck and Mac
+# users stayed on whatever code shipped in their download. The bundle is now
+# only an installer: its source is copied into ~/.tradelog/app when it is newer
+# than what is there, and the user's data is never touched.
 LAUNCHER = r"""#!/bin/bash
 # Trade Log — Mac launcher
 MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -81,6 +90,9 @@ VENV_DIR="$HOME/.tradelog/venv"
 # Copy of the requirements.txt the venv was last built from. When a new version
 # of the app ships different requirements, deps get re-installed.
 VENV_STAMP="$VENV_DIR/requirements.installed"
+
+# Where the app actually runs from, and where its data lives (see header).
+APP_HOME="$HOME/.tradelog/app"
 
 # Force copy instead of hardlink. If the install path sits under a cloud-synced
 # folder (iCloud Drive, OneDrive, Dropbox), hardlinking from the cache can fail;
@@ -151,10 +163,77 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
 
 fi
 
+# ── Install / refresh the app in $APP_HOME ──────────────────────────────────
+mkdir -p "$APP_HOME" || fail "Could not create $APP_HOME."
+
+# Copy a Resources folder's contents (minus the bundled uv) into $APP_HOME.
+# -n never overwrites a file already there.
+copy_resources() {
+    local item
+    for item in "$1"/* "$1"/.streamlit; do
+        [ -e "$item" ] || continue
+        [ "$(basename "$item")" = "_uv" ] && continue
+        cp -Rn "$item" "$APP_HOME/" >>"$LOG" 2>&1 || return 1
+    done
+}
+
+# Versions before this layout kept the database inside the .app bundle. A user
+# upgrading runs the NEW download, so their data is in the OLD bundle somewhere
+# else. Find the most recently used one in the usual places.
+find_old_resources() {
+    local root
+    for root in "$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents" \
+                "$HOME/Applications" /Applications; do
+        [ -d "$root" ] && find "$root" -maxdepth 6 \
+            -path '*.app/Contents/Resources/tradelog.db' -size +0 -print0 2>/dev/null
+    done | "$VENV_DIR/bin/python" -I -c '
+import os, sys
+dbs = [p for p in sys.stdin.buffer.read().decode("utf-8", "replace").split("\0") if p]
+dbs = [p for p in dbs if os.path.dirname(p) != sys.argv[1]]
+if dbs:
+    sys.stdout.write(os.path.dirname(max(dbs, key=os.path.getmtime)))
+' "$RESOURCES_DIR" 2>>"$LOG"
+}
+
+if [ ! -f "$APP_HOME/VERSION" ]; then
+    # First launch of this layout: install this bundle's code, then bring over
+    # the data an older in-bundle install left behind (this bundle's first —
+    # it holds the data if the user kept running the same old copy — else the
+    # newest old bundle we can find), so upgrading Mac users keep their trades.
+    echo "=== Installing app into $APP_HOME: $(date) ===" >>"$LOG"
+    copy_resources "$RESOURCES_DIR" || fail "Could not copy Trade Log into $APP_HOME."
+    if [ ! -s "$APP_HOME/tradelog.db" ]; then
+        OLD_RES="$(find_old_resources)"
+        if [ -n "$OLD_RES" ]; then
+            echo "Bringing over data from $OLD_RES" >>"$LOG"
+            copy_resources "$OLD_RES" \
+                || fail "Could not copy your existing trade log from $OLD_RES."
+        fi
+    fi
+elif "$VENV_DIR/bin/python" -I -c '
+import re, sys
+def key(v):
+    m = re.match(r"\s*(\d{4}-\d{2}-\d{2})(?:\.(\d+))?", v or "")
+    return (m.group(1), int(m.group(2) or 0)) if m else ("", 0)
+new, old = (open(p).read() for p in sys.argv[1:3])
+sys.exit(0 if key(new) > key(old) else 1)
+' "$RESOURCES_DIR/VERSION" "$APP_HOME/VERSION" 2>>"$LOG"; then
+    # This download is newer than the installed code (which the in-app updater
+    # may already have moved past — then we leave it alone). Replace the source
+    # files only; data next to them is left as is.
+    echo "=== Updating app in $APP_HOME to $(cat "$RESOURCES_DIR/VERSION"): $(date) ===" >>"$LOG"
+    for name in __SOURCE_FILES__; do
+        [ -f "$RESOURCES_DIR/$name" ] && cp -f "$RESOURCES_DIR/$name" "$APP_HOME/$name" >>"$LOG" 2>&1
+    done
+    mkdir -p "$APP_HOME/.streamlit"
+    cp -f "$RESOURCES_DIR/.streamlit/config.toml" "$APP_HOME/.streamlit/config.toml" 2>>"$LOG" || true
+fi
+
 # ── Install / update dependencies ───────────────────────────────────────────
-# Runs on first launch, and again whenever the shipped requirements.txt differs
-# from the one the venv was last built against (i.e. a new app version).
-if ! cmp -s "$RESOURCES_DIR/requirements.txt" "$VENV_STAMP" 2>/dev/null; then
+# Runs on first launch, and again whenever the installed requirements.txt
+# differs from the one the venv was last built against (a new app version,
+# from either a new download or the in-app updater).
+if ! cmp -s "$APP_HOME/requirements.txt" "$VENV_STAMP" 2>/dev/null; then
 
     prepare_uv
 
@@ -163,11 +242,11 @@ if ! cmp -s "$RESOURCES_DIR/requirements.txt" "$VENV_STAMP" 2>/dev/null; then
     # toolchain + OpenSSL, which end-user Macs don't have — without this, the
     # install fails with a confusing build error (surfaced as "check your
     # internet connection"). Every Mac we support has a matching wheel.
-    "$UV_BIN" pip install -r "$RESOURCES_DIR/requirements.txt" \
+    "$UV_BIN" pip install -r "$APP_HOME/requirements.txt" \
         --only-binary=cryptography \
         --python "$VENV_DIR/bin/python" >>"$LOG" 2>&1 \
         || { rm -rf "$VENV_DIR"; fail "Could not install dependencies.\n\nPlease check your internet connection and try again."; }
-    cp "$RESOURCES_DIR/requirements.txt" "$VENV_STAMP" 2>/dev/null || true
+    cp "$APP_HOME/requirements.txt" "$VENV_STAMP" 2>/dev/null || true
 
 fi
 
@@ -177,8 +256,10 @@ lsof -ti ":$PORT" | xargs kill -9 2>/dev/null || true
 # ── Launch Streamlit via the supervisor (background) ─────────────────────────
 # launch.py picks a light/dark theme base matching the saved theme and relaunches
 # Streamlit when the app requests a restart. On Quit we send it SIGTERM (below)
-# and it tears down its Streamlit child.
-"$VENV_DIR/bin/python" "$RESOURCES_DIR/launch.py" --port "$PORT" --no-browser &
+# and it tears down its Streamlit child. Run from $APP_HOME so Streamlit finds
+# .streamlit/config.toml in its working directory.
+cd "$APP_HOME" || fail "Could not open $APP_HOME."
+"$VENV_DIR/bin/python" "$APP_HOME/launch.py" --port "$PORT" --no-browser &
 STREAMLIT_PID=$!
 
 # ── Open browser once Streamlit is ready ─────────────────────────────────────
@@ -374,7 +455,8 @@ def build() -> None:
         print("  + (bundle directory entries)")
 
         # Launcher — executable
-        add_str(tf, f"{BUNDLE}/MacOS/launcher", LAUNCHER, mode=0o755)
+        launcher = LAUNCHER.replace("__SOURCE_FILES__", " ".join(SOURCE_FILES))
+        add_str(tf, f"{BUNDLE}/MacOS/launcher", launcher, mode=0o755)
         print("  + MacOS/launcher")
 
         # Primary .command launcher next to the .app — the recommended,
