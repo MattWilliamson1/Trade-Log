@@ -48,7 +48,7 @@ Two-file app: `db.py` handles all persistence, `app.py` is the entire UI.
 
 - **Logs (📒 in the sidebar)** are whole separate databases. The main log is `tradelog.db`; each extra one is `trade_logs/<slug>/tradelog.db` with its own `backups/`, `attachments/` and `plan_attachments/`. `trade_logs.json` (beside the main DB) records the open log and display names. `db.switch_log()` repoints the module-level `db.DB_PATH`, so always read it as `db.DB_PATH` / via `get_connection()`, never `from db import DB_PATH` at module level. After switching, app.py clears `st.cache_data` and all session state (`_open_log`).
 - Cloud Sync covers the **main log only**: `cloud_sync` binds `MAIN_DB_PATH`, the UI hides it in other logs (`_cloud_on()`), and its pulls go through `_replace_main_db`, which refuses outside the main log.
-- **Easy mode** is the per-log setting `easy_mode` ("Full app" toggle). When on, app.py draws a minimal sidebar plus `_render_easy_mode()` (add trade · open-trades grid · close · delete) and calls `st.stop()` just before the full sidebar, so anything it uses must be defined above that point.
+- **Easy mode** is the per-log setting `easy_mode` ("Full app" toggle), and the default: a log with no `easy_mode` row opens in Easy mode. When on, app.py draws a minimal sidebar plus `_render_easy_mode()` (add trade · open-trades grid · close · delete) and calls `st.stop()` just before the full sidebar, so anything it uses must be defined above that point.
 
 ## Schema
 

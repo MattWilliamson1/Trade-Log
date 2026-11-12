@@ -6,6 +6,10 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-11.1
+- Trade Log now opens in Easy mode. Turn on "Full app" in the sidebar to get every page back; each log remembers your choice, so if you've switched once it stays the way you left it
+- Easy mode's open-trades table now shows Entry Date, Ticker, Price, Q, Tag, Open PnL, Stop and Distance from Stop, then Notes. Shorts show a negative quantity. Distance from Stop is how far the live price is from your stop as a % of the price: positive while there's room left, negative once it's through
+
 ## 2026-11-11
 - Separate trading logs: the new 📒 button at the top of the sidebar switches between logs, each a completely blank, separate journal with its own trades, tags, settings, balances, equity curve and backups. Create, rename or remove logs there; removing one only moves it aside, nothing is deleted. Your existing journal is the "Main log". Cloud Sync covers the Main log only
 - Easy mode: turn off "Full app" in the sidebar for one simple page with a trade entry form, your open trades with live P&L and stops, and boxes to close, tag or delete a trade. Tags can be picked or created as you type. Each log remembers its own mode

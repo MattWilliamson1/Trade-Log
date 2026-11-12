@@ -6760,7 +6760,9 @@ _log_msg = st.session_state.pop("_log_msg", None)
 if _log_msg:
     st.toast(_log_msg)
 
-_easy_mode = settings.get("easy_mode", "0") == "1"
+# Easy mode is the default: a log that has never been switched to the full
+# app (no easy_mode setting yet) opens in Easy mode.
+_easy_mode = settings.get("easy_mode", "1") == "1"
 
 
 def _easy_tag_ids(names) -> list[int]:
@@ -6857,37 +6859,41 @@ def _render_easy_mode():
     for _, _r in _open.iterrows():
         _r = _r.to_dict()
         _pnl = _pnl_numeric(_r, _live)
-        _mult = float(_r.get("multiplier") or 1.0)
-        _cost = abs(float(_r["entry_price"] or 0) * float(_r["quantity"] or 0) * _mult)
         _last = _live_mark_usd(_r, _live)
         _label = _r["ticker"]
         if str(_r.get("instrument_type") or "stock").lower() == "option" and _r.get("strike"):
             _label = f"{_r['ticker']} {px_num(_r['strike'])}{(_r.get('option_type') or '')[:1]}"
-        _days = None
-        try:
-            _days = int((today_ts - pd.Timestamp(_r["entry_date"])).days)
-        except Exception:
-            pass
         def _px_or_none(v):
             return float(v) if v is not None and not pd.isna(v) else None
+        _short = str(_r.get("side") or "long").lower() == "short"
+        # The stop in force: the current stop, else the opening one; none when
+        # stops are switched off for the trade.
+        _stop = None
+        if _r.get("stop_enabled"):
+            _stop = _px_or_none(_r.get("current_stop"))
+            if _stop is None:
+                _stop = _px_or_none(_r.get("opening_stop"))
+        # Room left before the stop, as a % of the live price. Positive while
+        # price is on the safe side of the stop, for longs and shorts alike.
+        _dist = None
+        if _stop is not None and _last:
+            _dist = ((_stop - _last) if _short else (_last - _stop)) / _last * 100
+        _q = _px_or_none(_r.get("quantity"))
         _rows.append({
-            "Ticker":   _label,
-            "Side":     str(_r.get("side") or "long").title(),
-            "Tags":     _txt_or_blank(_r.get("tags")),
-            "Opened":   fmt_date(_r["entry_date"], date_fmt),
-            "Days":     _days,
-            "Qty":      float(_r["quantity"]) if _r["quantity"] is not None else None,
-            "Entry":    float(_r["entry_price"]) if _r["entry_price"] is not None else None,
-            "Entry stop":   _px_or_none(_r.get("opening_stop")),
-            "Current stop": _px_or_none(_r.get("current_stop")),
-            "Last":     float(_last) if _last is not None else None,
-            "Open P&L": float(_pnl) if _pnl is not None else None,
-            "P&L %":    (_pnl / _cost * 100) if (_pnl is not None and _cost) else None,
-            "Notes":    _txt_or_blank(_r.get("notes")),
+            "Entry Date":         pd.to_datetime(_r.get("entry_date"), errors="coerce"),
+            "Ticker":             _label,
+            "Price":              _px_or_none(_r.get("entry_price")),
+            # Shorts show as a negative quantity, since there's no Side column.
+            "Q":                  (-_q if _short else _q) if _q is not None else None,
+            "Tag":                _txt_or_blank(_r.get("tags")),
+            "Open PnL":           float(_pnl) if _pnl is not None else None,
+            "Stop":               _stop,
+            "Distance from Stop": _dist,
+            "Notes":              _txt_or_blank(_r.get("notes")),
         })
     _grid = pd.DataFrame(_rows)
 
-    _tot = _grid["Open P&L"].dropna()
+    _tot = _grid["Open PnL"].dropna()
     _m1, _m2, _m3 = st.columns(3)
     _m1.metric("Open positions", len(_grid))
     _m2.metric("Open P&L", fmt_pnl(float(_tot.sum())) if len(_tot) else "—")
@@ -6904,16 +6910,25 @@ def _render_easy_mode():
     # as numbers, with the blanks at the bottom.
     def _or_dash(f):
         return lambda v: "—" if v is None or pd.isna(v) or v == -np.inf else f(v)
-    _num_cols = ["Days", "Qty", "Entry", "Entry stop", "Current stop", "Last", "Open P&L", "P&L %"]
+    _num_cols = ["Price", "Q", "Open PnL", "Stop", "Distance from Stop"]
     _grid[_num_cols] = _grid[_num_cols].astype(float).fillna(-np.inf)
+    _grid = _grid.sort_values("Entry Date", ascending=False, na_position="last")
     st.dataframe(
         _grid.style.map(lambda v: "" if v == -np.inf else _pnl_color(v),
-                        subset=["Open P&L", "P&L %"]).format({
-            "Days": _or_dash(lambda v: f"{v:.0f}"), "Qty": _or_dash(fmt_qty),
-            "Entry": _or_dash(fmt_price), "Entry stop": _or_dash(fmt_price),
-            "Current stop": _or_dash(fmt_price), "Last": _or_dash(fmt_price),
-            "Open P&L": _or_dash(fmt_pnl), "P&L %": _or_dash(lambda v: f"{v:+.2f}%")}),
+                        subset=["Open PnL"]).format({
+            "Entry Date": lambda d: fmt_date(d.date().isoformat(), date_fmt) if pd.notna(d) else "—",
+            "Price": _or_dash(fmt_price), "Q": _or_dash(fmt_qty),
+            "Open PnL": _or_dash(fmt_pnl), "Stop": _or_dash(fmt_price),
+            "Distance from Stop": _or_dash(lambda v: f"{v:+.2f}%")}),
         hide_index=True, width="stretch",
+        column_config={
+            "Price": st.column_config.Column(help="Entry price"),
+            "Q": st.column_config.Column(help="Quantity — negative for a short"),
+            "Stop": st.column_config.Column(help="Current stop (the opening stop if none was set since)"),
+            "Distance from Stop": st.column_config.Column(
+                help="How far the live price is from the stop, as a % of the live price. "
+                     "Positive = room left before it's hit; negative = through it."),
+        },
     )
 
     # ── Close / tag / delete ──────────────────────────────────────────────────
