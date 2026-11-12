@@ -6,6 +6,15 @@ bullet: CI refuses the push otherwise, and the in-app update prompt shows
 these bullets to anyone updating. Entries before 2026-09-24 were rebuilt
 from the commit history.
 
+## 2026-11-11
+- Separate trading logs: the new 📒 button at the top of the sidebar switches between logs, each a completely blank, separate journal with its own trades, tags, settings, balances, equity curve and backups. Create, rename or remove logs there; removing one only moves it aside, nothing is deleted. Your existing journal is the "Main log". Cloud Sync covers the Main log only
+- Easy mode: turn off "Full app" in the sidebar for one simple page with a trade entry form, your open trades with live P&L and stops, and boxes to close, tag or delete a trade. Tags can be picked or created as you type. Each log remembers its own mode
+- Group by ticker now shows a stop for tickers with several open trades at different stops: their share-weighted stop, marked "≈", instead of "—"
+- Performance → Summary: Max Drawdown is now measured on daily totals. Before, trades closed the same day (such as the legs of a spread) were added one at a time, which could show a large drawdown that never happened. Calmar, Recovery Time and the review PDF follow suit
+- Expected Ann. Return compounds in % mode (it could show a loss worse than −100%), counts open trades as held until today and same-day trades as one day
+- Calmar on Summary and Benchmarks now uses a compounded annual return, matching the Equity Curve, so your Calmar and the benchmarks' compare like for like
+- Mac: the app now runs from ~/.tradelog/app, so in-app updates stick instead of being lost when the app is downloaded again
+
 ## 2026-11-10.3
 - Open trades logged in a foreign currency are now marked to market in that currency: P&L is (live price − entry price) in the trade's own currency, converted to USD at today's rate. Before, a move in the exchange rate showed up as trading P&L, so a position whose price hadn't changed could show a profit or loss
 - The Live Price column shows foreign trades in their own currency (A$0.52, ₩71,200), and P&L (Native) now matches the native price move exactly
